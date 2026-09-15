@@ -61,11 +61,11 @@ for path in "${tracked_files[@]}"; do
 done
 
 # Check 1: every Go file stays gofmt clean.
-header "1/8 gofmt"
+header "1/9 gofmt"
 unformatted=$(gofmt -l .)
 if [ -n "$unformatted" ]; then
     printf '%s\n' "$unformatted"
-    fail "1/8 gofmt" "files above need gofmt -w"
+    fail "1/9 gofmt" "files above need gofmt -w"
 fi
 passed
 
@@ -75,33 +75,33 @@ packages=$(go list ./... 2>/dev/null || true)
 
 if [ -n "$packages" ]; then
     # Check 2: the Go vet suite passes.
-    header "2/8 go vet"
-    go vet ./... || fail "2/8 go vet" "go vet found problems"
+    header "2/9 go vet"
+    go vet ./... || fail "2/9 go vet" "go vet found problems"
     passed
 
     # Check 3: staticcheck passes at the pinned version.
-    header "3/8 staticcheck"
+    header "3/9 staticcheck"
     go run "honnef.co/go/tools/cmd/staticcheck@${staticcheck_version}" ./... \
-        || fail "3/8 staticcheck" "staticcheck found problems"
+        || fail "3/9 staticcheck" "staticcheck found problems"
     passed
 
     # Check 4: every package builds without cgo.
-    header "4/8 build"
+    header "4/9 build"
     # A cgo-only directory vanishes from ./... under CGO_ENABLED=0.
     # go build then warns and exits 0, so compare the package lists as well.
     packages_cgo=$(CGO_ENABLED=1 go list ./... 2>/dev/null || true)
     packages_nocgo=$(CGO_ENABLED=0 go list ./... 2>/dev/null || true)
     missing_packages=$(comm -23 <(sort <<<"$packages_cgo") <(sort <<<"$packages_nocgo"))
-    CGO_ENABLED=0 go build ./... || fail "4/8 build" "build failed with CGO disabled"
+    CGO_ENABLED=0 go build ./... || fail "4/9 build" "build failed with CGO disabled"
     if [ -n "$missing_packages" ]; then
         printf '%s\n' "$missing_packages"
-        fail "4/8 build" "packages above disappear when cgo is disabled"
+        fail "4/9 build" "packages above disappear when cgo is disabled"
     fi
     passed
 
     # Check 5: the test suite passes under the race detector.
-    header "5/8 test"
-    go test -race ./... || fail "5/8 test" "tests failed under the race detector"
+    header "5/9 test"
+    go test -race ./... || fail "5/9 test" "tests failed under the race detector"
     passed
 else
     echo "== checks 2 to 5 (go vet, staticcheck, build, test) =="
@@ -113,29 +113,29 @@ fi
 # The binary fixtures carry every short byte sequence by chance, and chance is not a citation.
 # A text file named *.bin holds real words, and grep still scans it.
 # Check 6: no consumer name in a tracked file.
-header "6/8 consumer names"
+header "6/9 consumer names"
 if [ "${#scanned_files[@]}" -gt 0 ]; then
     hits=$(grep -l -i -E -I -e "$consumer_re" -- "${scanned_files[@]}" || true)
     if [ -n "$hits" ]; then
         printf '%s\n' "$hits"
-        fail "6/8 consumer names" "tracked files above name a consumer"
+        fail "6/9 consumer names" "tracked files above name a consumer"
     fi
 fi
 passed
 
 # Check 7: no planning reference in a tracked file.
-header "7/8 plan references"
+header "7/9 plan references"
 if [ "${#scanned_files[@]}" -gt 0 ]; then
     hits=$(grep -l -i -E -I -e "$plan_re" -- "${scanned_files[@]}" || true)
     if [ -n "$hits" ]; then
         printf '%s\n' "$hits"
-        fail "7/8 plan references" "tracked files above cite planning"
+        fail "7/9 plan references" "tracked files above cite planning"
     fi
 fi
 passed
 
 # Check 8: only packages built to wrap sqlite may depend on its driver.
-header "8/8 sqlite edge"
+header "8/9 sqlite edge"
 if [ -z "$packages" ]; then
     echo "no packages yet, skipping"
 else
@@ -146,12 +146,17 @@ else
         # grep -q can end the pipe early, which kills go list with SIGPIPE
         # under pipefail, so a real hit would read as clean.
         # Capture the list first and match it without an early exit.
-        deps=$(go list -deps "$pkg") || fail "8/8 sqlite edge" "go list -deps ${pkg} failed"
+        deps=$(go list -deps "$pkg") || fail "8/9 sqlite edge" "go list -deps ${pkg} failed"
         case $'\n'"${deps}"$'\n' in
-            *$'\n'modernc.org/sqlite$'\n'*) fail "8/8 sqlite edge" "package ${pkg} depends on modernc.org/sqlite" ;;
+            *$'\n'modernc.org/sqlite$'\n'*) fail "8/9 sqlite edge" "package ${pkg} depends on modernc.org/sqlite" ;;
         esac
     done <<< "$packages"
     passed
 fi
+
+# Check 9: the three Go conventions that gofmt, vet and staticcheck cannot see.
+header "9/9 conventions"
+go run ./tools/conventions || fail "9/9 conventions" "the convention breaches above must be fixed"
+passed
 
 echo "all checks passed"
