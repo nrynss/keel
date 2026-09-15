@@ -158,7 +158,8 @@ type Config struct {
 	// MaxClients bounds the per-client bucket table. Zero means
 	// defaultMaxClients.
 	MaxClients int
-	// Now is the clock, injected for tests. Nil means time.Now.
+	// Now supplies the clock the token buckets refill from. Nil means
+	// time.Now.
 	Now func() time.Time
 	// Log receives one line per refusal. Nil discards.
 	Log *slog.Logger
@@ -253,7 +254,7 @@ func (g *Gate) Protect(rule Rule, next http.Handler) (http.Handler, error) {
 			g.refuse(w, http.StatusForbidden, "passcode_required", "a shared passcode is required", 0)
 			return
 		}
-		key := g.ClientKey(r)
+		key := g.clientKey(r)
 		wait, ok := g.allow(rule, key)
 		if !ok {
 			g.log.Warn("gate: rate limited", "rule", rule.Name, "client", key, "retry_after", wait.String())

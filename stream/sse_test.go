@@ -178,7 +178,7 @@ func TestDefaultHeartbeatReachesTheWire(t *testing.T) {
 		t.Fatalf("first traffic = %q, want a : ping", got)
 	}
 	if elapsed < 14*time.Second || elapsed > 22*time.Second {
-		t.Errorf("first ping after %v, want ~15s (the DefaultHeartbeat, on the wire)", elapsed)
+		t.Errorf("first ping after %v, want ~15s (the defaultHeartbeat, on the wire)", elapsed)
 	}
 }
 
@@ -202,7 +202,7 @@ func TestServeTopicClientDisconnectRemovesSubscriber(t *testing.T) {
 	resp.Body.Close()
 
 	deadline := time.Now().Add(2 * time.Second)
-	for b.Subscribers("disc") != 0 {
+	for b.subscribers("disc") != 0 {
 		if time.Now().After(deadline) {
 			t.Fatal("subscriber still registered 2s after the client disconnected")
 		}

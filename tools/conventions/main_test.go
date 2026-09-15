@@ -11,14 +11,15 @@ import (
 	"testing"
 )
 
-// TestCheckFile pins all three rules against representative sources. The cases
+// TestCheckFile pins all four rules against representative sources. The cases
 // cover the exemptions the checker must honour and the breaches it must catch.
 func TestCheckFile(t *testing.T) {
 	cases := []struct {
-		name   string
-		src    string
-		isTest bool
-		want   []string
+		name     string
+		src      string
+		isTest   bool
+		excluded bool
+		want     []string
 	}{
 		{
 			name: "env read in code",
@@ -115,6 +116,17 @@ func TestCheckFile(t *testing.T) {
 			src:    "package p\n\nfunc TestF(t *testing.T) {}\n",
 			isTest: true,
 		},
+		{
+			name:     "exported function outside the build context",
+			src:      "package p\n\n// F does.\nfunc F() {}\n",
+			excluded: true,
+			want:     []string{ruleBuild},
+		},
+		{
+			name:     "unexported declarations outside the build context",
+			src:      "package p\n\ntype t struct{}\n\nfunc f() {}\n\nfunc (t) m() {}\n",
+			excluded: true,
+		},
 	}
 
 	for _, tc := range cases {
@@ -124,7 +136,7 @@ func TestCheckFile(t *testing.T) {
 			if err != nil {
 				t.Fatalf("parse source: %v", err)
 			}
-			got := rules(checkFile(fset, "src.go", file, tc.isTest))
+			got := rules(checkFile(fset, "src.go", file, tc.isTest, tc.excluded))
 			if !slices.Equal(got, tc.want) {
 				t.Fatalf("rules = %v, want %v", got, tc.want)
 			}
@@ -209,6 +221,56 @@ func TestCheckReportsExcludedPackage(t *testing.T) {
 		}
 	}
 	t.Fatalf("check reported %v, want a %s breach in only_windows.go", rules(violations), ruleEnv)
+}
+
+// TestCheckBuildContext pins the exported-API rule end to end. A file the
+// frozen linux/amd64 context excludes reports every exported identifier it
+// declares, while a platform seam with unexported declarations only, an
+// in-context file, a test file and an underscore file stay clean.
+func TestCheckBuildContext(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "go.mod"), "module example.com/scratch\n\ngo 1.27.1\n")
+	writeFile(t, filepath.Join(root, "foreign", "edge_windows.go"),
+		"//go:build windows\n\npackage foreign\n\n// W runs on Windows only.\nfunc W() {}\n")
+	writeFile(t, filepath.Join(root, "arch", "edge_arm64.go"),
+		"//go:build arm64\n\npackage arch\n\n// N counts.\nconst N = 1\n")
+	writeFile(t, filepath.Join(root, "seam", "seam_windows.go"),
+		"//go:build windows\n\npackage seam\n\ntype t struct{}\n\nfunc f() {}\n\nfunc (t) m() {}\n")
+	writeFile(t, filepath.Join(root, "plain", "plain.go"),
+		"package plain\n\n// P runs here.\nfunc P() {}\n")
+	writeFile(t, filepath.Join(root, "scoped", "scoped.go"), "package scoped\n")
+	writeFile(t, filepath.Join(root, "scoped", "edge_windows_test.go"),
+		"//go:build windows\n\npackage scoped\n\nfunc TestW(t *testing.T) {}\n")
+	writeFile(t, filepath.Join(root, "scoped", "_edge_windows.go"),
+		"//go:build windows\n\npackage scoped\n\n// U is ignored.\nfunc U() {}\n")
+	t.Chdir(root)
+
+	violations, err := check(context.Background())
+	if err != nil {
+		t.Fatalf("check: %v", err)
+	}
+	var got []string
+	for _, v := range violations {
+		if v.rule != ruleBuild {
+			t.Fatalf("unexpected %s breach: %v", v.rule, v)
+		}
+		if !strings.Contains(v.detail, "linux/amd64") {
+			t.Fatalf("breach %q does not name the frozen context", v.detail)
+		}
+		got = append(got, filepath.Base(v.path)+" "+v.detail)
+	}
+	if len(got) != 2 {
+		t.Fatalf("build-context breaches = %v, want two", got)
+	}
+	slices.Sort(got)
+	for _, want := range []string{
+		"edge_arm64.go exported const N",
+		"edge_windows.go exported function W",
+	} {
+		if !slices.ContainsFunc(got, func(s string) bool { return strings.HasPrefix(s, want) }) {
+			t.Fatalf("breaches %v do not hold %q", got, want)
+		}
+	}
 }
 
 // writeFile writes content to path and creates any missing parent directory.

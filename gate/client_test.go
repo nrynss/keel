@@ -109,8 +109,8 @@ func TestClientKeyTrustBoundary(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := g.ClientKey(request(tc.peer, tc.headers)); got != tc.want {
-				t.Fatalf("ClientKey = %q, want %q", got, tc.want)
+			if got := g.clientKey(request(tc.peer, tc.headers)); got != tc.want {
+				t.Fatalf("clientKey = %q, want %q", got, tc.want)
 			}
 		})
 	}
@@ -124,12 +124,12 @@ func TestClientKeyUnparseableRemoteAddr(t *testing.T) {
 	g := mustGate(t, Config{})
 	r := httptest.NewRequest(http.MethodPost, "/interviews", nil)
 	r.RemoteAddr = "@"
-	if got := g.ClientKey(r); got != "peer:@" {
-		t.Fatalf("ClientKey = %q, want %q", got, "peer:@")
+	if got := g.clientKey(r); got != "peer:@" {
+		t.Fatalf("clientKey = %q, want %q", got, "peer:@")
 	}
 	r.RemoteAddr = ""
-	if got := g.ClientKey(r); got != "peer:" {
-		t.Fatalf("ClientKey = %q, want %q", got, "peer:")
+	if got := g.clientKey(r); got != "peer:" {
+		t.Fatalf("clientKey = %q, want %q", got, "peer:")
 	}
 }
 
@@ -138,13 +138,13 @@ func TestClientKeyUnparseableRemoteAddr(t *testing.T) {
 func TestClientKeyCustomTrustedProxies(t *testing.T) {
 	g := mustGate(t, Config{TrustedProxies: []netip.Prefix{netip.MustParsePrefix("203.0.113.0/24")}})
 	headers := map[string]string{cloudflareClientHeader: "198.51.100.1"}
-	if got := g.ClientKey(request("203.0.113.9:1", headers)); got != "198.51.100.1" {
-		t.Fatalf("ClientKey from the configured proxy = %q, want the forwarded address", got)
+	if got := g.clientKey(request("203.0.113.9:1", headers)); got != "198.51.100.1" {
+		t.Fatalf("clientKey from the configured proxy = %q, want the forwarded address", got)
 	}
 	// The default private ranges are NOT trusted once the caller
 	// supplies its own set.
-	if got := g.ClientKey(request("10.0.0.2:1", headers)); got != "10.0.0.2" {
-		t.Fatalf("ClientKey from an unlisted peer = %q, want the peer address", got)
+	if got := g.clientKey(request("10.0.0.2:1", headers)); got != "10.0.0.2" {
+		t.Fatalf("clientKey from an unlisted peer = %q, want the peer address", got)
 	}
 }
 

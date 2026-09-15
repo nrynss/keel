@@ -517,9 +517,9 @@ func assertErrorBody(t *testing.T, w *httptest.ResponseRecorder, want string) {
 // a nil TrustedProxies (the default set) and an explicitly empty one.
 func TestTrustedProxiesEmptySliceTrustsNothing(t *testing.T) {
 	g := mustGate(t, Config{TrustedProxies: []netip.Prefix{}})
-	key := g.ClientKey(request("10.0.0.2:1", map[string]string{cloudflareClientHeader: "198.51.100.7"}))
+	key := g.clientKey(request("10.0.0.2:1", map[string]string{cloudflareClientHeader: "198.51.100.7"}))
 	if key != "10.0.0.2" {
-		t.Fatalf("ClientKey = %q, want the peer address (headers untrusted)", key)
+		t.Fatalf("clientKey = %q, want the peer address (headers untrusted)", key)
 	}
 }
 

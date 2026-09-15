@@ -34,5 +34,7 @@ jobs:
       # Tests that shell out to ffmpeg read KEEL_REQUIRE_FFMPEG.
       # An unset variable makes those tests skip when a binary is missing.
       # CI sets the variable here so a missing binary fails the run instead.
+      # The gate also diffs the exported API against the frozen records under
+      # api/, so a signature change fails this run and prints the difference.
       - name: Run every quality gate
         run: KEEL_REQUIRE_FFMPEG=1 tools/check.sh

@@ -1,11 +1,12 @@
 // Package main checks the Keel Go conventions that gofmt and go vet cannot see.
 //
-// Three rules are enforced and each breach prints one FAIL line that names the
+// Four rules are enforced and each breach prints one FAIL line that names the
 // rule and the file position:
 //
 //   - no call to os.Getenv, os.LookupEnv or os.Environ outside test files
 //   - no panic or log.Fatal call outside test files
 //   - every exported identifier carries a doc comment naming it
+//   - no exported identifier in a file the linux/amd64 build context excludes
 //
 // The checker walks every package under the module root. It exits 1 when it
 // finds any breach and stays silent when the tree is clean.
@@ -15,6 +16,7 @@ import (
 	"context"
 	"fmt"
 	"go/ast"
+	"go/build"
 	"go/parser"
 	"go/token"
 	"io/fs"
@@ -24,12 +26,30 @@ import (
 	"strings"
 )
 
-// Rule names head each FAIL line and name the convention that broke.
 const (
 	ruleEnv   = "no-env-outside-tests"
 	ruleFatal = "no-panic-or-log-fatal-outside-tests"
 	ruleDoc   = "exported-doc-comment"
+	ruleBuild = "exported-api-outside-build-context"
 )
+
+// frozenGOOS and frozenGOARCH name the one build context the two records under
+// api/ are generated for. It is also the context CI runs on, so every exported
+// identifier a consumer can reach must be declared inside it.
+const (
+	frozenGOOS   = "linux"
+	frozenGOARCH = "amd64"
+)
+
+// frozenContext is the build context the api/ records are taken from. MatchFile
+// reads each file against it to decide whether that file compiles into those
+// records, so a file from another context cannot grow the API surface unseen.
+var frozenContext = build.Context{
+	GOOS:        frozenGOOS,
+	GOARCH:      frozenGOARCH,
+	Compiler:    "gc",
+	ReleaseTags: build.Default.ReleaseTags,
+}
 
 // envReads holds the os functions that read the process environment.
 var envReads = map[string]bool{
@@ -179,18 +199,38 @@ func checkDir(ctx context.Context, wd, dir string) ([]violation, error) {
 	fset := token.NewFileSet()
 	var violations []violation
 	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".go") {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") {
 			continue
 		}
-		path := filepath.Join(dir, entry.Name())
+		path := filepath.Join(dir, name)
 		file, err := parser.ParseFile(fset, path, nil, parser.ParseComments|parser.SkipObjectResolution)
 		if err != nil {
 			return nil, fmt.Errorf("parse %s: %w", path, err)
 		}
-		isTest := strings.HasSuffix(entry.Name(), "_test.go")
-		violations = append(violations, checkFile(fset, relPath(wd, path), file, isTest)...)
+		isTest := strings.HasSuffix(name, "_test.go")
+		excluded, err := outsideBuildContext(dir, name, isTest)
+		if err != nil {
+			return nil, err
+		}
+		violations = append(violations, checkFile(fset, relPath(wd, path), file, isTest, excluded)...)
 	}
 	return violations, nil
+}
+
+// outsideBuildContext reports whether the frozen context excludes a file, so the
+// file compiles on another platform only. A test file and a file whose name
+// starts with an underscore or a dot stay out of scope and are never excluded.
+// MatchFile reads the file, so a read error is an error rather than a pass.
+func outsideBuildContext(dir, name string, isTest bool) (bool, error) {
+	if isTest || strings.HasPrefix(name, "_") || strings.HasPrefix(name, ".") {
+		return false, nil
+	}
+	match, err := frozenContext.MatchFile(dir, name)
+	if err != nil {
+		return false, fmt.Errorf("match %s: %w", filepath.Join(dir, name), err)
+	}
+	return !match, nil
 }
 
 // relPath shortens an absolute path against the working directory.
@@ -206,7 +246,10 @@ func relPath(wd, path string) string {
 }
 
 // checkFile reports every convention breach inside one parsed Go file.
-func checkFile(fset *token.FileSet, path string, file *ast.File, isTest bool) []violation {
+//
+// A file the frozen build context excludes is checked for exported identifiers,
+// since those declarations reach another platform while the records miss them.
+func checkFile(fset *token.FileSet, path string, file *ast.File, isTest, excluded bool) []violation {
 	var violations []violation
 	add := func(rule string, pos token.Pos, detail string) {
 		violations = append(violations, violation{
@@ -215,6 +258,9 @@ func checkFile(fset *token.FileSet, path string, file *ast.File, isTest bool) []
 			line:   fset.Position(pos).Line,
 			detail: detail,
 		})
+	}
+	if excluded {
+		checkExcludedExports(file, add)
 	}
 	if !isTest {
 		checkCalls(file, importNames(file), add)
@@ -325,6 +371,60 @@ func checkGenDeclDoc(decl *ast.GenDecl, add func(string, token.Pos, string)) {
 			}
 		}
 	}
+}
+
+// checkExcludedExports reports every exported package-level identifier declared
+// in a file the frozen build context excludes. The identifier compiles on
+// another platform, so it reaches that platform's consumers, while the records
+// under api/ never list it. A file whose declarations are all unexported stays
+// clean, because a platform implementation seam is legitimate.
+func checkExcludedExports(file *ast.File, add func(string, token.Pos, string)) {
+	for _, decl := range file.Decls {
+		switch d := decl.(type) {
+		case *ast.FuncDecl:
+			checkExcludedFunc(d, add)
+		case *ast.GenDecl:
+			checkExcludedGenDecl(d, add)
+		}
+	}
+}
+
+// checkExcludedFunc reports one exported function or method declared outside
+// the frozen build context. A method on an unexported receiver is not part of
+// the exported surface, so it is skipped.
+func checkExcludedFunc(fn *ast.FuncDecl, add func(string, token.Pos, string)) {
+	if !fn.Name.IsExported() {
+		return
+	}
+	if fn.Recv != nil && !ast.IsExported(receiverName(fn.Recv)) {
+		return
+	}
+	addExcludedExport(add, fn.Name.Pos(), "function", fn.Name.Name)
+}
+
+// checkExcludedGenDecl reports exported types, consts and vars declared outside
+// the frozen build context.
+func checkExcludedGenDecl(decl *ast.GenDecl, add func(string, token.Pos, string)) {
+	for _, spec := range decl.Specs {
+		switch s := spec.(type) {
+		case *ast.TypeSpec:
+			if s.Name.IsExported() {
+				addExcludedExport(add, s.Name.Pos(), "type", s.Name.Name)
+			}
+		case *ast.ValueSpec:
+			for _, name := range s.Names {
+				if name.IsExported() {
+					addExcludedExport(add, name.Pos(), decl.Tok.String(), name.Name)
+				}
+			}
+		}
+	}
+}
+
+// addExcludedExport records one exported identifier declared outside the frozen
+// build context. The detail names the consequence and the way out.
+func addExcludedExport(add func(string, token.Pos, string), pos token.Pos, kind, name string) {
+	add(ruleBuild, pos, fmt.Sprintf("exported %s %s is excluded from the %s/%s build context, so the records under api/ never cover it. Compile it inside that context or unexport it.", kind, name, frozenGOOS, frozenGOARCH))
 }
 
 // docForSpec returns the comment that documents one spec. A declaration that

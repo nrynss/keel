@@ -8,21 +8,21 @@ import (
 )
 
 // TestSubscribeDefaultConfigSubstituted pins the zero-Config defaults:
-// New(Config{}) must substitute DefaultHeartbeat, DefaultBuffer and
-// DefaultRetain. A default nobody executes is a default nobody tests.
+// New(Config{}) must substitute defaultHeartbeat, defaultBuffer and
+// defaultRetain. A default nobody executes is a default nobody tests.
 func TestSubscribeDefaultConfigSubstituted(t *testing.T) {
 	b := New(Config{})
-	if b.cfg.Heartbeat != DefaultHeartbeat {
-		t.Errorf("heartbeat = %v, want %v (the default must be substituted, not zero)", b.cfg.Heartbeat, DefaultHeartbeat)
+	if b.cfg.Heartbeat != defaultHeartbeat {
+		t.Errorf("heartbeat = %v, want %v (the default must be substituted, not zero)", b.cfg.Heartbeat, defaultHeartbeat)
 	}
-	if b.cfg.Buffer != DefaultBuffer {
-		t.Errorf("buffer = %d, want %d", b.cfg.Buffer, DefaultBuffer)
+	if b.cfg.Buffer != defaultBuffer {
+		t.Errorf("buffer = %d, want %d", b.cfg.Buffer, defaultBuffer)
 	}
-	if b.cfg.Retain != DefaultRetain {
-		t.Errorf("retain = %v, want %v", b.cfg.Retain, DefaultRetain)
+	if b.cfg.Retain != defaultRetain {
+		t.Errorf("retain = %v, want %v", b.cfg.Retain, defaultRetain)
 	}
 	neg := Config{Heartbeat: -1, Buffer: -5, Retain: -1}
-	if got := neg.withDefaults(); got.Heartbeat != DefaultHeartbeat || got.Buffer != DefaultBuffer || got.Retain != DefaultRetain {
+	if got := neg.withDefaults(); got.Heartbeat != defaultHeartbeat || got.Buffer != defaultBuffer || got.Retain != defaultRetain {
 		t.Errorf("withDefaults on negative values = %+v, want the defaults", got)
 	}
 }
@@ -133,8 +133,8 @@ func TestSubscribeAfterTerminalReplaysIt(t *testing.T) {
 	if _, ok := <-sub.Events; ok {
 		t.Error("a replay subscription delivered more than the terminal")
 	}
-	if got := b.Subscribers("t"); got != 0 {
-		t.Errorf("Subscribers = %d, want 0 (a replay registers no subscriber)", got)
+	if got := b.subscribers("t"); got != 0 {
+		t.Errorf("subscribers = %d, want 0 (a replay registers no subscriber)", got)
 	}
 }
 
@@ -154,8 +154,8 @@ func TestTerminalReplayExpires(t *testing.T) {
 		t.Fatalf("replayed a terminal past its retention: %+v", ev)
 	case <-time.After(50 * time.Millisecond):
 	}
-	if got := b.Subscribers("t"); got != 1 {
-		t.Errorf("Subscribers = %d, want 1 (a live subscription, not a replay)", got)
+	if got := b.subscribers("t"); got != 1 {
+		t.Errorf("subscribers = %d, want 1 (a live subscription, not a replay)", got)
 	}
 }
 
@@ -166,8 +166,8 @@ func TestCancelRemovesSubscriberAndClosesEvents(t *testing.T) {
 	sub := b.Subscribe(context.Background(), "t")
 
 	sub.Cancel()
-	if got := b.Subscribers("t"); got != 0 {
-		t.Errorf("Subscribers after Cancel = %d, want 0", got)
+	if got := b.subscribers("t"); got != 0 {
+		t.Errorf("subscribers after Cancel = %d, want 0", got)
 	}
 	for range sub.Events {
 		t.Error("Events received a value after Cancel")
@@ -191,7 +191,7 @@ func TestSubscribeCtxDoneRemovesSubscriber(t *testing.T) {
 
 	cancel()
 	deadline := time.Now().Add(time.Second)
-	for b.Subscribers("t") != 0 {
+	for b.subscribers("t") != 0 {
 		if time.Now().After(deadline) {
 			t.Fatal("subscriber still registered 1s after its context ended")
 		}
@@ -209,8 +209,8 @@ func TestSubscribeNilCtxUsesBackground(t *testing.T) {
 	//lint:ignore SA1012 the nil context pins the documented background default
 	sub := b.Subscribe(nil, "t")
 	sub.Cancel()
-	if got := b.Subscribers("t"); got != 0 {
-		t.Errorf("Subscribers = %d, want 0", got)
+	if got := b.subscribers("t"); got != 0 {
+		t.Errorf("subscribers = %d, want 0", got)
 	}
 }
 
@@ -219,8 +219,8 @@ func TestSubscribeNilCtxUsesBackground(t *testing.T) {
 func TestNilBrokerIsUsable(t *testing.T) {
 	var b *Broker
 	b.Publish("t", Event{Name: "progress", Data: "x", Terminal: true})
-	if got := b.Subscribers("t"); got != 0 {
-		t.Errorf("Subscribers on a nil Broker = %d, want 0", got)
+	if got := b.subscribers("t"); got != 0 {
+		t.Errorf("subscribers on a nil Broker = %d, want 0", got)
 	}
 }
 

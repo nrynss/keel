@@ -13,47 +13,47 @@ import (
 	"time"
 )
 
-// DefaultHeartbeat is the quiet period after which a stream writes a ping
+// defaultHeartbeat is the quiet period after which a stream writes a ping
 // comment. It is short enough that an intermediary keeps the connection
 // open and long enough that a ping rarely joins real traffic.
-const DefaultHeartbeat = 15 * time.Second
+const defaultHeartbeat = 15 * time.Second
 
-// DefaultBuffer is the per-subscriber event buffer a Broker built from the
+// defaultBuffer is the per-subscriber event buffer a Broker built from the
 // zero Config gets. It holds a burst of progress events without dropping.
-const DefaultBuffer = 16
+const defaultBuffer = 16
 
-// DefaultRetain is how long a Broker built from the zero Config keeps a
+// defaultRetain is how long a Broker built from the zero Config keeps a
 // topic's last terminal event for a late subscriber. It is long enough for
 // a page reload to reconnect and short enough to release the topic soon.
-const DefaultRetain = time.Minute
+const defaultRetain = time.Minute
 
 // Config carries the Broker's knobs. The zero value is usable and means
-// DefaultHeartbeat, DefaultBuffer and DefaultRetain.
+// defaultHeartbeat, defaultBuffer and defaultRetain.
 type Config struct {
 	// Heartbeat is the quiet period between ping comments on an open
-	// connection. Zero or negative means DefaultHeartbeat.
+	// connection. Zero or negative means defaultHeartbeat.
 	Heartbeat time.Duration
 
 	// Buffer is the per-subscriber event buffer. Zero or negative means
-	// DefaultBuffer.
+	// defaultBuffer.
 	Buffer int
 
 	// Retain is how long a topic keeps its last terminal event for
 	// replay to a subscriber that joins late. Zero or negative means
-	// DefaultRetain.
+	// defaultRetain.
 	Retain time.Duration
 }
 
 // withDefaults returns cfg with its zero and negative fields substituted.
 func (cfg Config) withDefaults() Config {
 	if cfg.Heartbeat <= 0 {
-		cfg.Heartbeat = DefaultHeartbeat
+		cfg.Heartbeat = defaultHeartbeat
 	}
 	if cfg.Buffer <= 0 {
-		cfg.Buffer = DefaultBuffer
+		cfg.Buffer = defaultBuffer
 	}
 	if cfg.Retain <= 0 {
-		cfg.Retain = DefaultRetain
+		cfg.Retain = defaultRetain
 	}
 	return cfg
 }
@@ -305,10 +305,10 @@ func (b *Broker) unsubscribe(topic string, id uint64) {
 	close(sub.gone)
 }
 
-// Subscribers reports how many live subscriptions topic has. It serves
+// subscribers reports how many live subscriptions topic has. It serves
 // lifecycle tests and diagnostics, and it says nothing about subscriber
 // identities.
-func (b *Broker) Subscribers(topic string) int {
+func (b *Broker) subscribers(topic string) int {
 	if b == nil {
 		return 0
 	}

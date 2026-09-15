@@ -102,7 +102,8 @@ type Config struct {
 	UploadTTL time.Duration
 	// SweepInterval is how often Start's loop sweeps. Zero means one hour.
 	SweepInterval time.Duration
-	// Now is the clock, injected for tests. Nil means time.Now.
+	// Now supplies the clock the handler stamps and expires uploads
+	// with. Nil means time.Now.
 	Now func() time.Time
 	// Log receives one line per server fault and one per staging file the
 	// sweep cannot remove. Nil discards.

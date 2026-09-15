@@ -44,16 +44,15 @@ func defaultTrustedProxies() []netip.Prefix {
 	}
 }
 
-// ClientKey returns the rate-limit key for r. It is exported so an
-// operator-facing test can assert the trust boundary directly rather
-// than inferring it from a refusal.
+// clientKey returns the rate-limit key for r. It names the per-client
+// bucket one caller draws from.
 //
 // Forwarding headers are consulted only when the direct peer is a
 // trusted proxy. Otherwise the peer address alone is the key and every
 // header is ignored. See the package doc for the full trust argument,
 // including why the Global limit and not this key is what actually
 // bounds spend.
-func (g *Gate) ClientKey(r *http.Request) string {
+func (g *Gate) clientKey(r *http.Request) string {
 	peer, ok := peerAddr(r.RemoteAddr)
 	if !ok {
 		// An unparseable RemoteAddr is not a client we can distinguish,

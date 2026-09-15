@@ -44,37 +44,37 @@ import (
 // its own expiry nor this veto, and the veto is the stronger of the
 // two.
 
-// DefaultMaxBytes is the default byte budget for the blob directory. A
+// defaultMaxBytes is the default byte budget for the blob directory. A
 // few hundred groups fit in six GiB, which still leaves most of a small
 // disk free.
-const DefaultMaxBytes int64 = 6 << 30
+const defaultMaxBytes int64 = 6 << 30
 
-// DefaultUnplacedAge is how long a blob with no group may live before
+// defaultUnplacedAge is how long a blob with no group may live before
 // the sweep removes it. A clip is worthless the moment its request is
 // answered, so two hours is generous by a wide margin while still
 // leaving an in-flight persist far outside the window.
-const DefaultUnplacedAge = 2 * time.Hour
+const defaultUnplacedAge = 2 * time.Hour
 
-// DefaultOrphanFileAge is how long a file with no row may live. It is
-// longer than DefaultUnplacedAge on purpose, because a blob is written
+// defaultOrphanFileAge is how long a file with no row may live. It is
+// longer than defaultUnplacedAge on purpose, because a blob is written
 // before its row, so "no row" is briefly the normal state of a healthy
 // persist. The age is what tells a crash leftover apart from a write in
 // progress.
-const DefaultOrphanFileAge = 6 * time.Hour
+const defaultOrphanFileAge = 6 * time.Hour
 
-// DefaultMinGroupAge is the youngest a group may be and still be
+// defaultMinGroupAge is the youngest a group may be and still be
 // evicted for the byte budget. It keeps a group whose work is still
 // running, or whose reader is still on the page, out of the candidate
 // set entirely.
-const DefaultMinGroupAge = 24 * time.Hour
+const defaultMinGroupAge = 24 * time.Hour
 
-// DefaultMinGroups is how many of the newest groups the byte budget
+// defaultMinGroups is how many of the newest groups the byte budget
 // never evicts, whatever the arithmetic says. Emptying the directory to
 // satisfy a budget is a worse outcome than being over it.
-const DefaultMinGroups = 3
+const defaultMinGroups = 3
 
-// DefaultSweepInterval is how often Start's loop sweeps.
-const DefaultSweepInterval = 10 * time.Minute
+// defaultSweepInterval is how often Start's loop sweeps.
+const defaultSweepInterval = 10 * time.Minute
 
 // Unbounded is the MaxBytes value that turns group eviction off and
 // leaves the other two sweeps running. It is a named constant rather
@@ -91,20 +91,20 @@ var ErrInvalidRetention = errors.New("mediastore: invalid retention config")
 // means every default above.
 type RetentionConfig struct {
 	// UnplacedAge is how old a blob with no group must be before the
-	// sweep removes it. Zero means DefaultUnplacedAge.
+	// sweep removes it. Zero means defaultUnplacedAge.
 	UnplacedAge time.Duration
 	// OrphanFileAge is how old a file with no row must be before the
-	// sweep removes it. Zero means DefaultOrphanFileAge.
+	// sweep removes it. Zero means defaultOrphanFileAge.
 	OrphanFileAge time.Duration
 	// MaxBytes is the byte budget for the blob directory. Zero means
-	// DefaultMaxBytes, and a negative value is ErrInvalidRetention. Set
+	// defaultMaxBytes, and a negative value is ErrInvalidRetention. Set
 	// it to Unbounded to sweep orphans only and never evict a group.
 	MaxBytes int64
 	// MinGroupAge is the youngest a group may be and still be evicted
-	// for the byte budget. Zero means DefaultMinGroupAge.
+	// for the byte budget. Zero means defaultMinGroupAge.
 	MinGroupAge time.Duration
 	// MinGroups is how many of the newest groups are never evicted.
-	// Zero means DefaultMinGroups.
+	// Zero means defaultMinGroups.
 	MinGroups int
 	// Protected lists group ids the byte budget must never evict, such
 	// as the prewarmed groups a first visitor lands on.
@@ -115,9 +115,10 @@ type RetentionConfig struct {
 	// set.
 	Retain func(id string) bool
 	// Interval is how often Start's loop sweeps. Zero means
-	// DefaultSweepInterval.
+	// defaultSweepInterval.
 	Interval time.Duration
-	// Now is the clock, injected for tests. Nil means time.Now.
+	// Now supplies the clock the sweep judges ages against. Nil means
+	// time.Now.
 	Now func() time.Time
 }
 
@@ -182,23 +183,23 @@ func (s *Store) NewSweeper(cfg RetentionConfig) (*Sweeper, error) {
 	}
 	w := &Sweeper{
 		store:         s,
-		unplacedAge:   orDuration(cfg.UnplacedAge, DefaultUnplacedAge),
-		orphanFileAge: orDuration(cfg.OrphanFileAge, DefaultOrphanFileAge),
+		unplacedAge:   orDuration(cfg.UnplacedAge, defaultUnplacedAge),
+		orphanFileAge: orDuration(cfg.OrphanFileAge, defaultOrphanFileAge),
 		maxBytes:      cfg.MaxBytes,
-		minGroupAge:   orDuration(cfg.MinGroupAge, DefaultMinGroupAge),
+		minGroupAge:   orDuration(cfg.MinGroupAge, defaultMinGroupAge),
 		minGroups:     cfg.MinGroups,
 		protected:     make(map[string]bool, len(cfg.Protected)),
 		retain:        cfg.Retain,
-		interval:      orDuration(cfg.Interval, DefaultSweepInterval),
+		interval:      orDuration(cfg.Interval, defaultSweepInterval),
 		now:           cfg.Now,
 		stop:          make(chan struct{}),
 		done:          make(chan struct{}),
 	}
 	if cfg.MaxBytes == 0 {
-		w.maxBytes = DefaultMaxBytes
+		w.maxBytes = defaultMaxBytes
 	}
 	if cfg.MinGroups == 0 {
-		w.minGroups = DefaultMinGroups
+		w.minGroups = defaultMinGroups
 	}
 	if w.now == nil {
 		w.now = time.Now

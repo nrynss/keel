@@ -1,0 +1,1830 @@
+########## github.com/nrynss/keel/cost
+package cost // import "github.com/nrynss/keel/cost"
+
+Package cost records what paid API calls spend. A Price counts nanodollars in
+an int64, so sums stay exact to the cent. A Ledger keeps charges and totals
+them by kind and by reference. A Budget bounds the spend of a sequence of calls.
+Rate cards stay in each application.
+
+VARIABLES
+
+var ErrNegativeEstimate = errors.New("cost: negative reservation estimate")
+    ErrNegativeEstimate reports a reservation with an estimate below zero.
+
+var ErrNegativeLimit = errors.New("cost: negative budget limit")
+    ErrNegativeLimit reports a budget built with a limit below zero.
+
+var ErrOverBudget = errors.New("cost: reservation exceeds budget")
+    ErrOverBudget reports a reservation that would push committed spend past the
+    budget limit.
+
+var ErrOverflow = errors.New("cost: price overflows int64")
+    ErrOverflow reports a price product, sum, or difference that falls outside
+    the int64 range.
+
+
+TYPES
+
+type Budget struct {
+	// Has unexported fields.
+}
+    Budget bounds the total spend of a sequence of paid calls. Reserve commits
+    an estimate before a call and fails when the estimate would pass the limit.
+    Settle books the price the call actually cost and frees its reservation.
+    Release frees a reservation the caller never spent. Build one with
+    NewBudget. Every method is safe for concurrent use.
+
+func NewBudget(limit Price) (*Budget, error)
+    NewBudget returns a Budget that never lets a reservation push spend past
+    limit. It reports ErrNegativeLimit when limit is below zero, because a
+    negative ceiling admits no spend and only creates misleading headroom.
+
+func (b *Budget) Limit() Price
+    Limit returns the ceiling the budget was built with.
+
+func (b *Budget) Release(reserved Price)
+    Release returns a reservation the caller never spent. A value larger than
+    the outstanding total frees only what remains.
+
+func (b *Budget) Remaining() (Price, error)
+    Remaining returns the headroom left for new reservations. It is the limit
+    minus booked spend minus outstanding reservations. A booking that overshoots
+    the limit can push it below zero. It reports ErrOverflow when that
+    difference falls outside the int64 range.
+
+func (b *Budget) Reserve(estimate Price) error
+    Reserve commits estimate against the budget. It reports ErrNegativeEstimate
+    when estimate is below zero. It fails with ErrOverBudget when spent,
+    outstanding reservations and estimate together would pass the limit, and it
+    commits nothing in that case. It reports ErrOverflow when the headroom or
+    the committed total leaves the int64 range. The check and the commit share
+    one critical section, so concurrent callers never overspend.
+
+func (b *Budget) Reserved() Price
+    Reserved returns the sum of the reservations that are still outstanding.
+
+func (b *Budget) Settle(reserved, actual Price) error
+    Settle books the price a paid call actually cost and releases the
+    reservation the caller made for it. reserved is the estimate Reserve
+    committed and actual is the true price. A reserved value larger than the
+    outstanding total frees only what remains, so the budget never reports a
+    negative reservation. It reports ErrOverflow and commits nothing when actual
+    would push spent outside the int64 range.
+
+func (b *Budget) Spent() Price
+    Spent returns the sum of the prices that Settle booked.
+
+type Charge struct {
+	// Kind names the billed operation.
+	Kind string
+	// Units counts the billed units.
+	Units int
+	// UnitPrice is the price of one unit.
+	UnitPrice Price
+	// Ref ties the charge to the caller's own record.
+	Ref string
+}
+    Charge is one billed operation. Kind names the operation, Units counts the
+    billed units, UnitPrice prices one unit, and Ref ties the charge back to the
+    caller's own record, for example a job or a request id.
+
+func (c Charge) Total() (Price, error)
+    Total returns the price of the charge. It reports ErrOverflow when Units
+    times UnitPrice falls outside the int64 range. A ledger total sums the
+    charges' exact products, so it can still fit when one charge alone does not.
+
+type Ledger struct {
+	// Has unexported fields.
+}
+    Ledger records charges and totals them by kind and by reference. Every
+    method is safe for concurrent use.
+
+func NewLedger() *Ledger
+    NewLedger returns an empty Ledger ready for use.
+
+func (l *Ledger) Add(c Charge)
+    Add appends c to the ledger.
+
+func (l *Ledger) Charges() []Charge
+    Charges returns a copy of every recorded charge. A later Add never changes
+    the returned slice.
+
+func (l *Ledger) Total() (Price, error)
+    Total returns the sum of every charge in the ledger. Each charge contributes
+    its exact product, so a charge whose own price overflows is still summed
+    exactly. It reports ErrOverflow only when that exact sum falls outside the
+    int64 range, never for a running partial sum that leaves the range on the
+    way.
+
+func (l *Ledger) TotalByKind(kind string) (Price, error)
+    TotalByKind returns the sum of the charges whose Kind equals kind. Each
+    matching charge contributes its exact product, so it reports ErrOverflow
+    under the same rule as Total.
+
+func (l *Ledger) TotalForRef(ref string) (Price, error)
+    TotalForRef returns the sum of the charges whose Ref equals ref. Each
+    matching charge contributes its exact product, so it reports ErrOverflow
+    under the same rule as Total.
+
+type Price int64
+    Price represents a cost in nanodollars (billionths of a dollar).
+
+const (
+	// Nanodollar is one billionth of a dollar.
+	Nanodollar Price = 1
+	// Microdollar is one millionth of a dollar.
+	Microdollar Price = 1_000
+	// Millicent is one thousandth of a cent.
+	Millicent Price = 10_000
+	// Cent is one hundredth of a dollar.
+	Cent Price = 10_000_000
+	// Dollar is one dollar.
+	Dollar Price = 1_000_000_000
+)
+func USD(dollars float64) Price
+    USD converts a dollar amount into a Price in nanodollars.
+
+func (p Price) Dollars() float64
+    Dollars converts a Price in nanodollars back into a dollar amount.
+
+func (p Price) String() string
+    String formats the Price as a dollar amount. Non-zero costs never display as
+    $0.00.
+
+
+########## github.com/nrynss/keel/cost/sqlitestore
+package sqlitestore // import "github.com/nrynss/keel/cost/sqlitestore"
+
+Package sqlitestore persists the cost ledger and the spend budget over SQLite.
+
+The package owns one schema, applied through the sqlite package's migration
+runner under its own namespace, so the ledger records what ran and a second open
+changes nothing. A charge is written through as it arrives, because a crash must
+not lose the record of a call that already spent money. A budget reservation
+carries an expiry, so a process that dies mid call stops holding budget when the
+expiry passes.
+
+A cancelled context stops a call before it commits. The call fails and stores
+nothing, so a caller may retry it, and a read returns no result rather than the
+rows it had already decoded. Open is the exception. It writes the schema and
+the ceiling before it returns. A cancelled open can therefore leave the schema,
+its migration ledger row and the ceiling on disk, even though it returns no
+store. Those bytes are inert, so a caller may retry the open and a second
+open on the same file is unaffected. The failure wraps context.Canceled or
+context.DeadlineExceeded unless the database refused the statement for a reason
+of its own first.
+
+The store enforces the ceiling when it reserves, so concurrent callers never
+hold more than the headroom, and it does not enforce it when it settles,
+because a booking records what a call actually cost. A booking that overshoots
+can therefore push booked spend past the ceiling, exactly as the in-memory
+cost.Budget does.
+
+This package is one of the few allowed to import the SQLite driver. The ledger
+arithmetic itself stays in the cost package, and every total is summed through a
+cost.Ledger so the overflow rule never drifts.
+
+VARIABLES
+
+var ErrInvalid = errors.New("sqlitestore: invalid config")
+    ErrInvalid is returned for an argument this package cannot honour, such as a
+    nil database.
+
+
+TYPES
+
+type Config struct {
+	// DB is the open database. It must not be nil, and this package never
+	// closes it.
+	DB *sqlite.DB
+
+	// Namespace overrides the migration ledger namespace. Empty means the
+	// one this package owns.
+	Namespace string
+
+	// Limit is the budget ceiling. It must not be below zero. The store
+	// writes it on every open, so a redeploy can raise or lower the
+	// ceiling and the stored spend stays.
+	Limit cost.Price
+
+	// ReservationTTL is how long a reservation holds budget before the
+	// store treats it as expired. Zero means ten minutes.
+	ReservationTTL time.Duration
+
+	// Now supplies the clock that stamps charges and judges expiry. Nil
+	// means time.Now.
+	Now func() time.Time
+
+	// Logger receives the open record. Nil means slog.Default.
+	Logger *slog.Logger
+}
+    Config configures Open.
+
+type Reservation struct {
+	// ID identifies the reservation.
+	ID string
+
+	// Amount is the price Reserve committed.
+	Amount cost.Price
+
+	// ExpiresAt is the instant after which the store stops counting the
+	// hold.
+	ExpiresAt time.Time
+}
+    Reservation is one outstanding budget hold. Reserve returns it and the
+    caller passes it back to Settle or Release.
+
+type Store struct {
+	// Has unexported fields.
+}
+    Store persists the cost ledger and the spend budget over one database.
+    Create it with Open, because the zero value has no database. Store is safe
+    for concurrent use.
+
+func Open(ctx context.Context, cfg Config) (*Store, error)
+    Open applies the cost schema to cfg.DB and returns the store. It writes
+    the configured ceiling and purges reservations that already expired, so a
+    restart frees the budget a dead process was holding. A cancelled context
+    stops the open and no store comes back, but the schema, its migration ledger
+    row and the ceiling may already have landed. Those bytes are inert, so a
+    caller may retry the open and a second open on the same file is unaffected.
+
+func (s *Store) Add(ctx context.Context, c cost.Charge) error
+    Add records c in the ledger. It writes the row before it returns,
+    so a charge for a call that already happened survives a crash. A cancelled
+    context stops the write, so no charge is recorded.
+
+func (s *Store) Charges(ctx context.Context) ([]cost.Charge, error)
+    Charges returns every recorded charge in insertion order.
+
+func (s *Store) Limit(ctx context.Context) (cost.Price, error)
+    Limit returns the ceiling the store was opened with.
+
+func (s *Store) Release(ctx context.Context, r Reservation) error
+    Release frees a hold the caller never spent. A hold that already expired
+    or was already settled frees nothing, and that is not an error. A cancelled
+    context stops the release, so the hold stays until its expiry frees it.
+
+func (s *Store) Remaining(ctx context.Context) (cost.Price, error)
+    Remaining returns the headroom left for new reservations. It is the ceiling
+    minus booked spend minus unexpired holds. It reports an error matching
+    cost.ErrOverflow when that difference leaves the int64 range.
+
+func (s *Store) Reserve(ctx context.Context, estimate cost.Price) (Reservation, error)
+    Reserve commits estimate against the durable budget and returns the hold.
+    It fails with an error matching cost.ErrOverBudget when the ceiling,
+    the booked spend and the unexpired holds leave less than estimate,
+    and it commits nothing then. The check and the insert share one transaction,
+    so concurrent callers never overspend. The hold expires after the configured
+    TTL, so a caller that dies still returns its budget. A cancelled context
+    stops the reserve, so no hold is taken.
+
+func (s *Store) Reserved(ctx context.Context) (cost.Price, error)
+    Reserved returns the sum of the reservations that are still holding budget.
+    An expired reservation never counts, so a dead process stops holding budget
+    when its hold expires.
+
+func (s *Store) Settle(ctx context.Context, r Reservation, actual cost.Price) error
+    Settle books the price a paid call actually cost and releases the hold. It
+    books actual even when the hold already expired, because the call happened
+    and the charge is a fact. It reports an error matching cost.ErrOverflow
+    and commits nothing when actual would push the booked spend past the int64
+    range. A cancelled context stops the settle, so nothing is booked.
+
+func (s *Store) Spent(ctx context.Context) (cost.Price, error)
+    Spent returns the sum of the prices Settle has booked.
+
+func (s *Store) Total(ctx context.Context) (cost.Price, error)
+    Total returns the sum of every charge in the ledger. It reports an error
+    matching cost.ErrOverflow when the exact sum leaves the int64 range.
+
+func (s *Store) TotalByKind(ctx context.Context, kind string) (cost.Price, error)
+    TotalByKind returns the sum of the charges whose Kind equals kind.
+    It reports an error matching cost.ErrOverflow when the exact sum leaves the
+    int64 range.
+
+func (s *Store) TotalForRef(ctx context.Context, ref string) (cost.Price, error)
+    TotalForRef returns the sum of the charges whose Ref equals ref. It reports
+    an error matching cost.ErrOverflow when the exact sum leaves the int64
+    range.
+
+
+########## github.com/nrynss/keel/ffmpeg
+package ffmpeg // import "github.com/nrynss/keel/ffmpeg"
+
+Package ffmpeg runs the ffmpeg and ffprobe binaries and reads what they report
+about an audio file.
+
+ffmpeg is a runtime binary rather than a Go dependency, so a Tools value
+names the two executables. An empty field resolves the bare name on the PATH,
+which suits a host that installed ffmpeg in the usual place.
+
+Every command is bound to a context. The context kills the child when it ends,
+and a short wait delay bounds how long Wait then blocks on an inherited pipe
+that a killed child left open. Without that bound a kill could still hang the
+caller.
+
+VARIABLES
+
+var ErrFailed = errors.New("ffmpeg: command failed")
+    ErrFailed reports that the binary ran and exited non-zero. The captured
+    standard error travels in the returned message.
+
+var ErrNotFound = errors.New("ffmpeg: binary not found")
+    ErrNotFound reports that the configured binary is missing. A caller that
+    wants a fallback matches it with errors.Is.
+
+
+FUNCTIONS
+
+func Command(ctx context.Context, bin string, args ...string) *exec.Cmd
+    Command builds a command for the executable at bin bound to ctx. bin is an
+    absolute path or a bare name that the PATH lookup resolves. The context
+    kills the child when it ends, and waitDelay bounds how long Wait then blocks
+    on an inherited pipe.
+
+func Duration(ctx context.Context, tools Tools, path string) (time.Duration, error)
+    Duration reports the length of the media at path as measured by ffprobe.
+    The container duration is used when it exists. When the container reports
+    none, the first audio stream stands in. The result rounds to the nearest
+    millisecond.
+
+func Run(ctx context.Context, tools Tools, args ...string) error
+    Run executes ffmpeg with args and discards standard output. A missing binary
+    returns ErrNotFound, a non-zero exit returns ErrFailed, and a cancelled
+    context returns the context error.
+
+
+TYPES
+
+type Format struct {
+	SampleRate    int
+	Channels      int
+	ChannelLayout string
+	Codec         string
+	BitRate       int64
+}
+    Format reports the audio stream properties that ffprobe measures.
+
+func AudioFormat(ctx context.Context, tools Tools, path string) (Format, error)
+    AudioFormat reports the first audio stream at path as measured by ffprobe.
+    A stream without a channel layout falls back to mono or stereo by channel
+    count. A stream without a bit rate falls back to the sample layout and then
+    to the container bit rate.
+
+type Tools struct {
+	FFmpeg  string
+	FFprobe string
+}
+    Tools names the ffmpeg and ffprobe executables. The zero value looks both up
+    on the PATH. Set a field to pin an absolute path or a specific build.
+
+
+########## github.com/nrynss/keel/gate
+package gate // import "github.com/nrynss/keel/gate"
+
+Package gate stands in front of the routes that spend money.
+
+A protected route may cost real money and take minutes of model time, and the
+process often listens on a public URL. An ungated button is therefore an open
+wallet, so the gate exists to be in place before a URL goes public.
+
+# Both a passcode and a per-client cap
+
+The gate enforces two things at once, and the cap is always on:
+
+  - Every protected route carries a two-level token bucket: one bucket per
+    client key, and one process-wide bucket the whole route shares. This needs
+    no configuration and keeps a demo a single tap for a visitor.
+  - A shared passcode is enforced on the same routes when, and only when,
+    Config.Passcode is set. An operator flips it with one setting and a restart
+    if the URL is found and abused.
+
+The passcode is deliberately not an HTTP authentication scheme. It is read
+from a configurable header or cookie and answered with 403, never 401 with
+WWW-Authenticate, because a browser basic-auth prompt is worse than a 403 that a
+page already knows how to render.
+
+# Which routes the caller guards
+
+Protect wraps individual handlers, never the mux, so nothing is gated by
+accident. The caller decides which routes stay ungated.
+
+# The client key, behind a proxy
+
+Behind a reverse proxy the direct peer is always the proxy and never a client.
+Forwarded headers are therefore the only source of a client address, and they
+are attacker-controlled input:
+
+  - Headers are read only when the direct peer is inside Config.TrustedProxies
+    (loopback and the private ranges by default). From an untrusted peer the
+    peer address itself is the key and every forwarding header is ignored.
+  - From a trusted peer, CF-Connecting-IP wins, because Cloudflare sets it
+    and overwrites whatever the client sent. X-Forwarded-For is the fallback,
+    and the rightmost entry is used, not the leftmost: the leftmost is whatever
+    the client chose to send, since each proxy appends rather than replaces.
+  - IPv4 keys are the address. IPv6 keys are the /64, so one delegated prefix is
+    one client rather than a full address space of them.
+
+The per-client key is fairness, not security, and the doc says so plainly.
+Anyone who reaches the origin directly, bypassing Cloudflare, can put any
+CF-Connecting-IP they like on each request and mint a fresh bucket every time.
+That is why every Rule also carries a process-wide Global bucket that no client
+key can widen. The spoofable header can cost an honest client their share,
+but it cannot raise the total spend of the route above Global. Bucket memory is
+bounded too (Config.MaxClients, with full and debt-free buckets evicted first),
+so header spoofing is not a memory sink either.
+
+Configuration arrives through Config. This package never reads the environment,
+and its errors are sentinels matched with errors.Is.
+
+VARIABLES
+
+var ErrInvalidConfig = errors.New("gate: invalid config")
+    ErrInvalidConfig is returned by New for unusable configuration.
+
+var ErrInvalidRule = errors.New("gate: invalid rule")
+    ErrInvalidRule is returned by Protect's construction path for a rule with
+    an empty name, a non-positive burst, or a non-positive refill interval.
+    A rule that cannot be enforced must not silently pass traffic, so Protect
+    returns the error rather than degrading.
+
+
+TYPES
+
+type Config struct {
+	// Passcode, when non-empty, is required on every protected route.
+	// Empty (the default) means rate limits alone.
+	Passcode string
+	// PasscodeHeader names the header a caller supplies the shared
+	// passcode in. Empty means defaultPasscodeHeader.
+	PasscodeHeader string
+	// PasscodeCookie names the cookie the shared passcode may also
+	// arrive in. Empty means defaultPasscodeCookie.
+	PasscodeCookie string
+	// TrustedProxies lists the peer prefixes whose forwarding headers
+	// are believed. Nil means loopback plus the private ranges, which a
+	// reverse proxy on the same private network presents as. An
+	// explicitly empty slice trusts nothing and keys every request on
+	// its peer address.
+	TrustedProxies []netip.Prefix
+	// MaxClients bounds the per-client bucket table. Zero means
+	// defaultMaxClients.
+	MaxClients int
+	// Now supplies the clock the token buckets refill from. Nil means
+	// time.Now.
+	Now func() time.Time
+	// Log receives one line per refusal. Nil discards.
+	Log *slog.Logger
+}
+    Config configures New. The zero value is usable: no passcode, the default
+    trusted-proxy set, the default client-table bound, and the neutral passcode
+    header and cookie names.
+
+type Gate struct {
+	// Has unexported fields.
+}
+    Gate holds the buckets and the passcode shared by every route it protects.
+    Create it with New. The zero value is not usable. A Gate is safe for
+    concurrent use.
+
+func New(cfg Config) (*Gate, error)
+    New returns a Gate from cfg. It fails only on a configuration that cannot
+    be honoured. An empty Config is valid and yields the default posture (rate
+    limits on, no passcode).
+
+func (g *Gate) Protect(rule Rule, next http.Handler) (http.Handler, error)
+    Protect wraps next with rule. It returns an error rather than an unenforced
+    handler when the rule is unusable, so a typo in a limit cannot quietly
+    reopen the wallet.
+
+    The wrapped handler refuses with 403 and the passcode_required envelope
+    when a passcode is configured and absent or wrong, and with 429 and the
+    rate_limited envelope when either bucket is empty. A refusal consumes no
+    tokens from either bucket: a client that is already over its limit cannot
+    also drain the global budget.
+
+func (g *Gate) ProtectFunc(rule Rule, next http.HandlerFunc) (http.Handler, error)
+    ProtectFunc is Protect over an http.HandlerFunc.
+
+type Limit struct {
+	// Burst is the bucket's capacity: how many requests may arrive back
+	// to back from cold.
+	Burst int
+	// Every is the refill interval: one token per Every.
+	Every time.Duration
+}
+    Limit is one token bucket's shape: Burst tokens are available at
+    once and one token is restored every Every. A zero Limit is invalid,
+    see ErrInvalidRule, because "no limit" must be spelled by not protecting the
+    route at all.
+
+type Rule struct {
+	// Name identifies the rule's bucket family. Two routes sharing a
+	// name share their buckets, which is how a retry path and its
+	// original can be made to draw on one budget.
+	Name string
+	// PerClient is the budget one client key gets.
+	PerClient Limit
+	// Global is the budget the whole route gets, across every client.
+	Global Limit
+}
+    Rule is what one protected route costs. Both limits are enforced and both
+    must be valid: PerClient is fairness between callers, Global is the ceiling
+    on the route as a whole and the only half a forged client key cannot widen.
+
+
+########## github.com/nrynss/keel/id
+package id // import "github.com/nrynss/keel/id"
+
+Package id generates and validates the unguessable public ids that Keel puts in
+URLs and storage names.
+
+An id is 128 bits of crypto/rand hex-encoded to 32 lowercase characters.
+Guessing one id reveals nothing about any other, so a resource named by id is
+shareable without being enumerable. The bits carry no timestamp and no counter.
+
+FUNCTIONS
+
+func New() (string, error)
+    New returns a fresh id drawn from crypto/rand. An entropy failure returns an
+    error and never panics.
+
+func Valid(s string) bool
+    Valid reports whether s has exactly the shape New produces: 32 lowercase hex
+    characters. A caller runs it before it looks an id up by name.
+
+
+########## github.com/nrynss/keel/job
+package job // import "github.com/nrynss/keel/job"
+
+Package job runs long work off the request path.
+
+A short request starts the work and returns a job id at once. The work itself
+runs on a goroutine the Runner owns. Progress streams over the job's topic
+as server-sent events, and the terminal state is retrievable by id, so a page
+reload can catch up.
+
+A job outlives its request. The context the work receives keeps the request's
+values and drops its cancellation, so a client that goes away does not kill the
+work. Only Runner.Cancel stops a job.
+
+Jobs are durable behind a Store. The Runner records each job's state, its latest
+progress snapshot and its terminal result, so a restart reports what happened.
+On startup every unfinished job becomes interrupted, and a kind that declares
+itself idempotent may run again.
+
+The stream carries the event vocabulary of the wire package. A client subscribes
+to the job's topic first, then fetches the job's state, then deduplicates the
+terminal event on the job id. The fetched state carries a terminal a client
+missed, because the Store keeps it.
+
+Panic policy: a job's function is caller supplied and may panic. The Runner
+recovers at the job boundary, the one place a panic is a data point rather than
+a corrupted process, and converts it to an error terminal with ErrPanic in its
+chain. The process keeps serving.
+
+CONSTANTS
+
+const TopicPrefix = "job:"
+    TopicPrefix is the broker topic namespace every job publishes on. A job's
+    topic is TopicPrefix + its id. The subscriber side hardcodes the convention,
+    so it is pinned here and by TestTopicFormat.
+
+const Unbounded = -1
+    Unbounded disables the result cap when it is set as Config.MaxResultBytes.
+
+
+VARIABLES
+
+var (
+	// ErrUnknownJob is returned by Result, Cancel, or a Store for an id
+	// that has no record.
+	ErrUnknownJob = errors.New("job: unknown id")
+	// ErrLimit is returned by Start when the job's kind is already at its
+	// concurrency limit. Start never blocks for a slot, so saturation
+	// surfaces here.
+	ErrLimit = errors.New("job: kind at capacity")
+	// ErrPanic wraps the value a job function panicked with. The terminal
+	// status is StatusError like any other failure.
+	ErrPanic = errors.New("job: panicked")
+	// ErrNoBroker is returned by Open when no broker is configured.
+	// Progress and terminal events are the product, so a Runner that
+	// cannot publish them refuses to start.
+	ErrNoBroker = errors.New("job: nil broker")
+	// ErrInvalid is returned by Open for unusable configuration, such as a
+	// nil store.
+	ErrInvalid = errors.New("job: invalid config")
+	// ErrResultTooLarge is returned to the work when its result is over
+	// the configured cap. The terminal status is StatusError.
+	ErrResultTooLarge = errors.New("job: result exceeds cap")
+	// ErrInterrupted is carried by the terminal Result of a job a restart
+	// ended.
+	ErrInterrupted = errors.New("job: interrupted")
+)
+    Sentinel errors. Every failure path this package produces wraps one of
+    these, so callers branch with errors.Is.
+
+
+FUNCTIONS
+
+func Topic(id string) string
+    Topic is the broker topic a job publishes on.
+
+
+TYPES
+
+type Config struct {
+	// Broker carries progress and terminal events. It must not be nil.
+	Broker *stream.Broker
+	// Store records job state, progress snapshots and results. It must not
+	// be nil.
+	Store Store
+	// Kinds configures the named kinds. A kind absent from the map gets
+	// the zero Kind, so it runs defaultLimit jobs at once and is never
+	// resumed.
+	Kinds map[string]Kind
+	// Log receives one line per recorded fault, such as a store write that
+	// failed. Nil means slog.Default.
+	Log *slog.Logger
+	// Now stamps each record's UpdatedAt. Nil means time.Now.
+	Now func() time.Time
+	// MaxResultBytes caps the inline result size. A larger result fails
+	// the job with ErrResultTooLarge. Zero means defaultMaxResultBytes,
+	// and Unbounded disables the cap.
+	MaxResultBytes int
+}
+    Config configures Open. Broker and Store must both be set, because the
+    Runner cannot publish without the first or remember without the second.
+
+type Func func(ctx context.Context, progress func(Progress)) ([]byte, error)
+    Func is the work one job runs. It receives a context that is not cancelled
+    when the starting request ends, because a job outlives its request. The
+    context carries the request's values, and Runner.Cancel is the only handle
+    that cancels it. A Func that returns promptly on ctx.Done() frees its slot
+    and lands the cancelled terminal.
+
+    progress reports a step to the job's topic. The Runner stamps the job id and
+    publishes the wire progress payload. An empty report is dropped.
+
+    Func owns its own deadlines. A long job must bound itself, because the
+    Runner does not second-guess how long the work may take.
+
+type Kind struct {
+	// Limit is the number of jobs of this kind that run at once. Zero or
+	// negative means defaultLimit.
+	Limit int
+	// Idempotent reports that running a job of this kind a second time is
+	// safe, so the Runner may resume it after a restart. The zero value
+	// refuses resumption, because a rerun of a paid call spends money
+	// twice.
+	Idempotent bool
+	// MaxAttempts caps the attempts a job of this kind may make. Zero or
+	// negative means one attempt, so nothing is resumed.
+	MaxAttempts int
+	// Resume rebuilds the work for a job of this kind that a restart left
+	// unfinished. It receives the interrupted record, whose RootID names
+	// the logical job. Nil means the kind cannot be resumed, even when it
+	// is idempotent.
+	Resume func(rec Record) (Func, error)
+}
+    Kind configures one class of job. Each kind runs under its own concurrency
+    limit, so a heavy kind can run one at a time while a light kind runs
+    several. The zero Kind runs defaultLimit jobs at once and is never resumed.
+
+type Progress struct {
+	// Stage names the step the work reached.
+	Stage string `json:"stage,omitempty"`
+	// Current is the work done so far, when the step counts.
+	Current *int64 `json:"current,omitempty"`
+	// Total is the work the step must do, when the step counts.
+	Total *int64 `json:"total,omitempty"`
+	// Detail is raw JSON the application attaches. The Runner passes it
+	// through unchanged.
+	Detail json.RawMessage `json:"detail,omitempty"`
+}
+    Progress is one progress report a job publishes. The Runner adds the job id,
+    so the report carries only what the work knows. Current and Total are
+    optional, and Detail is optional raw JSON the application alone reads.
+
+type Record struct {
+	// ID is the job id.
+	ID string
+	// Kind is the kind the job runs under.
+	Kind string
+	// Status is the job's current state.
+	Status Status
+	// Attempt counts the attempt within the logical job, starting at 1.
+	Attempt int
+	// ParentID is the id of the attempt this one replaced. Empty on a
+	// first attempt.
+	ParentID string
+	// RootID is the id of the logical job's first attempt.
+	RootID string
+	// Progress is the latest progress snapshot. The zero value means none
+	// was recorded.
+	Progress Progress
+	// Data is the terminal result bytes.
+	Data []byte
+	// Err is the terminal error. A durable store keeps its text, not its
+	// chain, so a reader classifies on Status and reads Err for its
+	// message.
+	Err error
+	// UpdatedAt is when the record last changed.
+	UpdatedAt time.Time
+}
+    Record is one job's storable state. A store keeps the current status,
+    the latest progress snapshot and the terminal result.
+
+    Attempt, ParentID and RootID record an attempt's lineage. The first attempt
+    of a logical job has Attempt 1 and its own id as RootID. A rerun gets a
+    fresh id, a ParentID naming the attempt it replaced, and the same RootID,
+    so a restarted application can walk the chain with Store.Attempts.
+
+type Result struct {
+	// ID is the job id.
+	ID string
+	// Status is the job's state at the time of the read.
+	Status Status
+	// Data is the bytes the work returned. A failed job keeps them, and a result over the cap drops them.
+	Data []byte
+	// Err is the terminal error, nil for a done job.
+	Err error
+}
+    Result is one job's state at the time of a read. StatusQueued means the
+    attempt has not started, StatusRunning means its work is on a goroutine,
+    and the rest are terminal. Err is non-nil only for a failed, cancelled
+    or interrupted job. Data carries the bytes the function returned, which a
+    failed job keeps unless its result was over the cap.
+
+type Runner struct {
+	// Has unexported fields.
+}
+    Runner starts jobs, publishes their progress and terminal events, and
+    records their state behind a Store. One per process.
+
+func Open(ctx context.Context, cfg Config) (*Runner, error)
+    Open returns a Runner that publishes to cfg.Broker and records through
+    cfg.Store. It interrupts every job a previous process left running and
+    publishes the interrupted terminal. It queues every queued attempt again
+    and resumes the idempotent kinds that declare resume work and have attempts
+    left.
+
+func (r *Runner) Attempts(ctx context.Context, id string) ([]Record, error)
+    Attempts returns every recorded attempt of the logical job that id belongs
+    to, oldest first. It lets a caller walk from an interrupted attempt to the
+    attempt that replaced it.
+
+func (r *Runner) Cancel(id string) error
+    Cancel asks a running job to stop: it cancels the Runner-owned context fn
+    was handed. Cancellation is cooperative, because Go cannot kill a goroutine.
+    A Func that returns promptly on ctx.Done() frees its slot, and one that
+    ignores its context keeps going until it returns.
+
+    When the error fn returned carries context.Canceled, the terminal is
+    StatusCancelled instead of StatusError.
+
+    Cancel is safe to call twice on a running job, and the second call is a
+    no-op returning nil. An id this Runner never started, one that already
+    terminated, or one from another process reports ErrUnknownJob.
+
+func (r *Runner) Result(ctx context.Context, id string) (Result, error)
+    Result returns a job's state by id: StatusQueued for a replacement whose
+    attempt has not started, StatusRunning while fn is on its goroutine,
+    and the terminal Result afterwards. A client subscribes to Topic(id) first,
+    then calls Result, then deduplicates the terminal event on the job id.
+    A terminal the subscriber missed is found here, because the Store keeps it.
+
+func (r *Runner) Start(ctx context.Context, fn Func) (string, error)
+    Start runs fn as a job of the default kind and returns the job id at once.
+    See StartKind.
+
+func (r *Runner) StartKind(ctx context.Context, kind string, fn Func) (string, error)
+    StartKind runs fn as a job of the named kind and returns the job id at once.
+    It never blocks for a slot, so a kind at its limit returns ErrLimit without
+    starting anything.
+
+    ctx is the starting request's context. Only its values are inherited, and
+    its cancellation is dropped, because a client that goes away must not kill
+    the work. The context fn receives is a Runner-owned child, and Runner.Cancel
+    is the only handle that cancels it.
+
+type Status string
+    Status is a job's current or terminal state.
+
+const (
+	// StatusRunning marks a job whose work is still on its goroutine.
+	StatusRunning Status = "running"
+	// StatusQueued marks a replacement attempt whose record is durable but
+	// whose work has not started, because its kind is at its limit. It is
+	// not terminal, and a restart starts it again rather than interrupting
+	// it.
+	StatusQueued Status = "queued"
+	// StatusDone marks a job that finished on its own.
+	StatusDone Status = "done"
+	// StatusError marks a job that failed, panicked, or returned a result
+	// over the configured cap.
+	StatusError Status = "error"
+	// StatusCancelled marks a job that ended because its context was
+	// cancelled. Only Cancel holds a cancel handle, so this is the
+	// cancelled terminal, not a failure.
+	StatusCancelled Status = "cancelled"
+	// StatusInterrupted marks a job that a restart ended before it
+	// finished.
+	StatusInterrupted Status = "interrupted"
+)
+    Status values. A terminal status is published as the event name of the
+    terminal event and carried in Result.
+
+type Store interface {
+	// Create stores a new record. It is called once, before the work
+	// starts, so a racing Result finds the record.
+	Create(ctx context.Context, rec Record) error
+	// Begin marks a queued record as running. It updates Status and
+	// UpdatedAt, called once when the attempt starts, so a process death
+	// during the work leaves a running row. An id it does not hold
+	// reports ErrUnknownJob.
+	Begin(ctx context.Context, rec Record) error
+	// SetProgress records the job's latest progress snapshot. It reads
+	// ID, Progress and UpdatedAt.
+	SetProgress(ctx context.Context, rec Record) error
+	// Finish records the job's terminal state. It updates Status, Data, Err
+	// and UpdatedAt, and keeps the Kind and lineage Create stored.
+	Finish(ctx context.Context, rec Record) error
+	// Get returns the record stored under id, or ErrUnknownJob.
+	Get(ctx context.Context, id string) (Record, error)
+	// Unfinished returns every record that has not reached a terminal
+	// state, oldest first. Open interrupts a running record and queues a
+	// queued one again.
+	Unfinished(ctx context.Context) ([]Record, error)
+	// Attempts returns every recorded attempt of the logical job that id
+	// belongs to, oldest first. It lets a caller walk from an interrupted
+	// attempt to the attempt that replaced it. An unknown id is
+	// ErrUnknownJob.
+	Attempts(ctx context.Context, id string) ([]Record, error)
+}
+    Store records job state durably. This package declares the interface,
+    and implementations live in their own package. An implementation must be
+    safe for concurrent use, and must return an error matching ErrUnknownJob for
+    an id it does not hold.
+
+
+########## github.com/nrynss/keel/job/sqlitestore
+package sqlitestore // import "github.com/nrynss/keel/job/sqlitestore"
+
+Package sqlitestore implements the job store over SQLite.
+
+The package owns one schema, applied through the sqlite package's migration
+runner, so the ledger records what ran and a second run changes nothing. Reads
+go through the read pool and every write through the single write connection,
+so concurrent jobs queue rather than race for the file lock.
+
+VARIABLES
+
+var ErrInvalid = errors.New("sqlitestore: invalid config")
+    ErrInvalid is returned by Open for unusable configuration, such as a nil
+    database.
+
+
+TYPES
+
+type Config struct {
+	// DB is the open database the store writes through. It must not be
+	// nil, and this package never closes it.
+	DB *sqlite.DB
+	// Namespace overrides the migration ledger namespace. Empty means the
+	// one this package owns, which lets two stores share one file.
+	Namespace string
+}
+    Config configures Open.
+
+type Store struct {
+	// Has unexported fields.
+}
+    Store is the job store over one database. Create it with Open, because the
+    zero value has no database. Store is safe for concurrent use.
+
+func Open(ctx context.Context, cfg Config) (*Store, error)
+    Open applies the job schema to cfg.DB and returns the store. The schema
+    arrives as ordered SQL files, so the migration runner owns what ran and
+    records each file once.
+
+func (s *Store) Attempts(ctx context.Context, id string) ([]job.Record, error)
+    Attempts returns every recorded attempt of the logical job id belongs to,
+    oldest first. An unknown id reports ErrUnknownJob.
+
+func (s *Store) Begin(ctx context.Context, rec job.Record) error
+    Begin marks a queued record as running. It updates Status and UpdatedAt,
+    called once when the attempt starts, and reports ErrUnknownJob for an id it
+    does not hold.
+
+func (s *Store) Create(ctx context.Context, rec job.Record) error
+    Create stores rec. It records the job's identity, its lineage, its status
+    and its latest progress snapshot, so a racing read finds the record.
+
+func (s *Store) Finish(ctx context.Context, rec job.Record) error
+    Finish records the job's terminal state. It updates Status, Data,
+    Err and UpdatedAt, keeps the Kind and lineage Create stored, and reports
+    ErrUnknownJob for an id it does not hold.
+
+func (s *Store) Get(ctx context.Context, id string) (job.Record, error)
+    Get returns the record stored under id. A missing row reports ErrUnknownJob,
+    which a caller classifies with errors.Is.
+
+func (s *Store) SetProgress(ctx context.Context, rec job.Record) error
+    SetProgress records the job's latest progress snapshot. It reads ID,
+    Progress and UpdatedAt, and reports ErrUnknownJob for an id it does not
+    hold.
+
+func (s *Store) Unfinished(ctx context.Context) ([]job.Record, error)
+    Unfinished returns every record that has not reached a terminal state,
+    oldest first, so a restart can interrupt a running record and queue a queued
+    one again.
+
+
+########## github.com/nrynss/keel/mediastore
+package mediastore // import "github.com/nrynss/keel/mediastore"
+
+Package mediastore persists media bytes on disk and serves them back over HTTP.
+
+A store owns one directory and one metadata index. Each blob is one file named
+by its id, opened and created through an os.Root confined to that directory.
+The metadata row lives behind the BlobIndex interface, which this package
+declares and the caller supplies.
+
+Store is an http.Handler. Register it at "GET /media/{id}". It answers through
+http.ServeContent, so a Range request returns 206 with exactly the requested
+bytes. The content types it stores are a closed set, because the handler serves
+the stored type verbatim.
+
+Configuration arrives through Config, and the package reads no environment.
+Errors are sentinels matched with errors.Is. Every Persist that returns without
+error survives a process restart, because the bytes are fsynced before the row
+is written. A Persist that fails removes only the file it created, so bytes
+already stored under an id are never truncated or removed.
+
+CONSTANTS
+
+const Unbounded int64 = -1
+    Unbounded is the MaxBytes value that turns group eviction off and leaves the
+    other two sweeps running. It is a named constant rather than the zero value,
+    because zero has to mean "not configured", and a field that silently means
+    "no disk cap" is how a disk fills up.
+
+
+VARIABLES
+
+var ErrAlreadyExists = errors.New("mediastore: id already exists")
+    ErrAlreadyExists is returned by a BlobIndex that is asked to create a
+    row for an id it already holds, and by PersistWithID when the id's name
+    is already occupied on disk. The interface documents it, so a caller of
+    PersistWithID can classify a taken id.
+
+var ErrInvalid = errors.New("mediastore: invalid config")
+    ErrInvalid is returned for unusable configuration: a missing directory,
+    a missing index, or a content type entry that normalizes to nothing.
+
+var ErrInvalidContentType = errors.New("mediastore: invalid content type")
+    ErrInvalidContentType is returned by Persist for an empty or unsupported
+    content type. The set is closed on purpose, because the handler serves the
+    stored type verbatim, so bytes with an unvetted type must never reach disk.
+
+var ErrInvalidRetention = errors.New("mediastore: invalid retention config")
+    ErrInvalidRetention is returned by NewSweeper for a configuration it cannot
+    honour: a negative age, a negative budget, or a negative group floor.
+
+var ErrNotFound = errors.New("not found")
+    ErrNotFound is returned when an id has no stored blob: an unknown id,
+    a malformed one, or a row whose file has vanished. The index wraps it for
+    a missing row, so one sentinel covers every absent-blob shape and a caller
+    matches it with errors.Is. A server fault, such as a cancelled context,
+    never matches it, so "already gone" and "broken now" stay distinguishable.
+
+
+TYPES
+
+type Blob struct {
+	// ID is the blob's name on disk and in the index. It comes from the
+	// id package, which makes it unguessable.
+	ID string
+	// Owner is the caller's name for whoever owns the blob. The store
+	// never interprets it.
+	Owner string
+	// Group is the eviction unit the blob belongs to. A group goes as a
+	// whole, because half a group is worse than none of it. An empty
+	// group leaves the blob unplaced and the retention sweep removes it
+	// by age.
+	Group string
+	// ContentType is the type the blob is served as, already normalized.
+	ContentType string
+	// SizeBytes is the blob's size on disk.
+	SizeBytes int64
+	// Visibility is who may read the blob. The zero value is private.
+	Visibility Visibility
+	// CreatedAt is when the store accepted the blob.
+	CreatedAt time.Time
+}
+    Blob is the metadata of one stored blob. The bytes live in the store's
+    directory under a file named by ID.
+
+type BlobIndex interface {
+	// Create stores b. It returns ErrAlreadyExists when the id is taken.
+	Create(ctx context.Context, b Blob) error
+	// Get returns the blob stored under id, or ErrNotFound.
+	Get(ctx context.Context, id string) (Blob, error)
+	// Delete removes the blob stored under id, or returns ErrNotFound.
+	Delete(ctx context.Context, id string) error
+	// DeleteGroup removes every blob in group, or returns ErrNotFound.
+	DeleteGroup(ctx context.Context, group string) error
+	// Groups lists every group with its blobs.
+	Groups(ctx context.Context) ([]Group, error)
+}
+    BlobIndex stores blob metadata. Implementations live in their own package,
+    which is why this package declares the interface and never the storage.
+    Implementations must be safe for concurrent use, must return an error
+    matching ErrNotFound for a missing row, and may return an error matching
+    ErrAlreadyExists when an id is taken.
+
+    Get and Delete must never return ErrNotFound for a fault. A closed database
+    or a cancelled context is a different error, so a server fault can never be
+    mistaken for a blob that is already gone.
+
+type Config struct {
+	// Dir is the directory blob files are written under. Open creates
+	// it when it is absent.
+	Dir string
+	// Index stores the metadata rows. It must not be nil.
+	Index BlobIndex
+	// Log receives one line per server fault, such as a row whose file
+	// cannot be opened. Nil discards.
+	Log *slog.Logger
+	// Now is the clock the store stamps CreatedAt from. Nil means
+	// time.Now.
+	Now func() time.Time
+	// ContentTypes is the set Persist accepts. Nil or empty means the
+	// default set of image, audio, video and subtitle types. Each entry
+	// normalizes the same way a stored type does, and an entry that
+	// normalizes to nothing is ErrInvalid.
+	ContentTypes []string
+	// Authorize reports whether a request may read a private blob. It
+	// receives the live request and the blob's metadata. Nil refuses
+	// every private blob, so a store with no authorizer serves public
+	// blobs only.
+	Authorize func(*http.Request, Blob) bool
+}
+    Config configures Open.
+
+type Group struct {
+	// ID is the group id shared by Blobs.
+	ID string
+	// CreatedAt is the creation time of the group's earliest blob.
+	CreatedAt time.Time
+	// Blobs holds every blob in the group, earliest first.
+	Blobs []Blob
+}
+    Group is one eviction unit: every blob that shares a group id, and the time
+    the group first appeared. The retention sweep evicts a group as a unit and
+    never splits one.
+
+type Put struct {
+	// ContentType is the type the blob is served as. It must normalize
+	// to one of the store's accepted types.
+	ContentType string
+	// Owner is the caller's name for the blob's owner.
+	Owner string
+	// Group is the eviction unit the blob belongs to. An empty group
+	// leaves the blob unplaced.
+	Group string
+	// Visibility is who may read the blob. The zero value is private.
+	Visibility Visibility
+}
+    Put describes a blob before its bytes are written.
+
+type RetentionConfig struct {
+	// UnplacedAge is how old a blob with no group must be before the
+	// sweep removes it. Zero means defaultUnplacedAge.
+	UnplacedAge time.Duration
+	// OrphanFileAge is how old a file with no row must be before the
+	// sweep removes it. Zero means defaultOrphanFileAge.
+	OrphanFileAge time.Duration
+	// MaxBytes is the byte budget for the blob directory. Zero means
+	// defaultMaxBytes, and a negative value is ErrInvalidRetention. Set
+	// it to Unbounded to sweep orphans only and never evict a group.
+	MaxBytes int64
+	// MinGroupAge is the youngest a group may be and still be evicted
+	// for the byte budget. Zero means defaultMinGroupAge.
+	MinGroupAge time.Duration
+	// MinGroups is how many of the newest groups are never evicted.
+	// Zero means defaultMinGroups.
+	MinGroups int
+	// Protected lists group ids the byte budget must never evict, such
+	// as the prewarmed groups a first visitor lands on.
+	Protected []string
+	// Retain reports whether an id belongs to another lifetime owner
+	// and must be left alone. Nil retains nothing. See the package
+	// comment above for why a consumer wires this to its own tracking
+	// set.
+	Retain func(id string) bool
+	// Interval is how often Start's loop sweeps. Zero means
+	// defaultSweepInterval.
+	Interval time.Duration
+	// Now supplies the clock the sweep judges ages against. Nil means
+	// time.Now.
+	Now func() time.Time
+}
+    RetentionConfig configures NewSweeper. The zero value is usable and means
+    every default above.
+
+type Store struct {
+	// Has unexported fields.
+}
+    Store persists blobs on disk, records their metadata through a BlobIndex,
+    and serves them over HTTP. Create it with Open, because the zero value has
+    no directory, no index and no clock. Store is safe for concurrent use.
+
+func Open(ctx context.Context, cfg Config) (*Store, error)
+    Open creates the blob directory when it is absent, resolves the
+    configuration, and returns the Store. The directory handle is an os.Root,
+    so every blob open and create is confined to Dir even if a crafted id ever
+    reached it.
+
+func (s *Store) Delete(ctx context.Context, blobID string) error
+    Delete removes the blob's metadata row and then its file. The row goes
+    first, so a crash between the two leaves an unreferenced file, which is the
+    shape the retention sweep removes by age. An unknown or malformed id returns
+    an error matching ErrNotFound.
+
+func (s *Store) DeleteIfPresent(ctx context.Context, blobID string) error
+    DeleteIfPresent removes a blob when it exists and succeeds when the id is
+    already absent. A caller that reserved an id before its row existed needs
+    the second case, because a crash may land between the two.
+
+func (s *Store) NewSweeper(cfg RetentionConfig) (*Sweeper, error)
+    NewSweeper returns the retention sweeper for s.
+
+func (s *Store) Persist(ctx context.Context, src io.Reader, p Put) (string, error)
+    Persist writes src as a new blob and returns its unguessable id.
+
+    The content type must be one of the store's accepted types. Anything else,
+    including empty, is ErrInvalidContentType. A type with parameters such as
+    "image/png; charset=binary" is accepted and stored as its bare media type.
+    The blob is fsynced before the metadata row is inserted, so a Persist that
+    returns without error survives a process restart. The copy reads only from
+    src, and ctx bounds the metadata write.
+
+func (s *Store) PersistWithID(ctx context.Context, blobID string, src io.Reader, p Put) error
+    PersistWithID is the caller supplied id variant of Persist. It lets a
+    consumer reserve the id before the blob and its row become reachable,
+    so a separate ownership record can cover an interrupted persist. A chunked
+    upload assembles its parts and lands them through here. The id must have the
+    shape the id package produces, and anything else is ErrNotFound, the same
+    answer an unknown id gets.
+
+    An id whose row the index already holds is refused with ErrAlreadyExists,
+    and so is one whose name is already occupied on disk. The file is created
+    exclusively, so a call refused this way writes nothing and the blob stored
+    under the id keeps its bytes.
+
+func (s *Store) ServeHTTP(w http.ResponseWriter, r *http.Request)
+    ServeHTTP serves one stored blob at GET or HEAD /media/{id}.
+    http.ServeContent does the protocol work, so a Range request returns 206,
+    a matching ETag returns 304, and HEAD sends no body.
+
+    An unknown, malformed or file-less id is 404. A blob that exists but cannot
+    be opened is 500 and one log line. A private blob is served only when
+    Config.Authorize allows the request, and a refusal answers the same 404 as
+    an unknown id, so the response never confirms that a private blob exists.
+
+type SweepResult struct {
+	// UnplacedDeleted and UnplacedBytes count sweep A: aged-out rows
+	// with no group, row and file.
+	UnplacedDeleted int
+	UnplacedBytes   int64
+	// OrphanFilesDeleted and OrphanFileBytes count sweep B: files with
+	// no row at all.
+	OrphanFilesDeleted int
+	OrphanFileBytes    int64
+	// GroupsEvicted and GroupBytes count sweep C: whole groups dropped
+	// to get back under the byte budget.
+	GroupsEvicted int
+	GroupBytes    int64
+	// Retained counts candidates another owner vetoed through Retain. A
+	// non-zero value here is two mechanisms staying out of each other's
+	// way, not a failure.
+	Retained int
+	// BytesBefore and BytesAfter are the blob directory's measured size
+	// at the start and end of the pass.
+	BytesBefore int64
+	BytesAfter  int64
+}
+    SweepResult is what one pass did. It is returned for logging, and so a test
+    can assert on the specific class of thing that went rather than on a total
+    several causes could produce.
+
+type Sweeper struct {
+	// Has unexported fields.
+}
+    Sweeper enforces the retention policy over one Store. Create it with
+    NewSweeper, because the zero value has no store. Sweep is safe to call
+    concurrently with the store's own traffic.
+
+func (w *Sweeper) Close()
+    Close stops Start's loop and waits for it to exit. It is safe on a Sweeper
+    that was never started, because there is no goroutine to wait for, and safe
+    to call more than once.
+
+func (w *Sweeper) Start()
+    Start runs Sweep on a ticker until Close. It sweeps once immediately,
+    so a process that has been down long enough to accumulate orphans does not
+    wait a full interval to clean them. A second Start is a no-op.
+
+func (w *Sweeper) Sweep(ctx context.Context) (SweepResult, error)
+    Sweep runs one retention pass: aged-out unplaced rows, then unreferenced
+    files, then whole groups when the directory is still over budget, oldest
+    first.
+
+    It returns what it did. A failure to remove one file is logged and the pass
+    continues, because a sweep that stops at the first stubborn file leaves the
+    rest of the disk uncollected, which is the failure it exists to prevent.
+    A failure to read the directory or the index is returned, because nothing
+    after it can be trusted.
+
+type Visibility string
+    Visibility says who may read a blob.
+
+const Private Visibility = ""
+    Private is a blob only Config.Authorize may serve. It is the zero value,
+    so a Blob that does not set Visibility is private and the default answer to
+    "who may read this" is "not everyone".
+
+const Public Visibility = "public"
+    Public is a blob anyone may read. It is served with a one-year immutable
+    cache header, because its id names exactly these bytes.
+
+
+########## github.com/nrynss/keel/mediastore/sqlitestore
+package sqlitestore // import "github.com/nrynss/keel/mediastore/sqlitestore"
+
+Package sqlitestore implements the media index over SQLite.
+
+The package owns one schema, applied through the sqlite package's migration
+runner, so the ledger records what ran and a second run changes nothing.
+Every statement goes through the shared handle: reads on the read pool and every
+write on the write pool.
+
+VARIABLES
+
+var ErrInvalid = errors.New("sqlitestore: invalid row")
+    ErrInvalid is returned for input this package cannot store: a nil database,
+    an empty id, an empty content type, or a negative size.
+
+
+TYPES
+
+type Config struct {
+	// DB is the open database. It must not be nil, and this package
+	// never closes it.
+	DB *sqlite.DB
+	// Namespace overrides the migration ledger namespace. Empty means
+	// the one this package owns.
+	Namespace string
+}
+    Config configures Open.
+
+type Store struct {
+	// Has unexported fields.
+}
+    Store is the media index over one database. Create it with Open, because the
+    zero value has no database. Store is safe for concurrent use.
+
+func Open(ctx context.Context, cfg Config) (*Store, error)
+    Open applies the media schema to cfg.DB and returns the index. The schema
+    arrives as ordered SQL files, so the migration runner owns what ran and
+    records each file once.
+
+func (s *Store) Create(ctx context.Context, b mediastore.Blob) error
+    Create stores b. An id already in the table returns an error matching
+    mediastore.ErrAlreadyExists, and a row this package cannot store returns one
+    matching ErrInvalid.
+
+func (s *Store) Delete(ctx context.Context, id string) error
+    Delete removes the row stored under id. A missing row returns an error
+    matching mediastore.ErrNotFound.
+
+func (s *Store) DeleteGroup(ctx context.Context, group string) error
+    DeleteGroup removes every row in group. A group with no rows returns an
+    error matching mediastore.ErrNotFound, and an empty group id is ErrInvalid,
+    because an empty id names nothing to evict.
+
+func (s *Store) Get(ctx context.Context, id string) (mediastore.Blob, error)
+    Get returns the blob stored under id. A missing row returns an error
+    matching mediastore.ErrNotFound, which is the sentinel a mediastore caller
+    classifies. Any other failure keeps its own cause, so a broken database
+    never reads as a blob that is already gone.
+
+func (s *Store) Groups(ctx context.Context) ([]mediastore.Group, error)
+    Groups returns every group with its blobs, ordered by group id. A blob with
+    no group is unplaced and is not listed. Each group carries the creation time
+    of its earliest blob.
+
+
+########## github.com/nrynss/keel/sqlite
+package sqlite // import "github.com/nrynss/keel/sqlite"
+
+Package sqlite opens the SQLite databases that every Keel store and every
+consumer share.
+
+One database file serves both Keel and the application that embeds it, so every
+handle carries the same pragmas. Foreign keys are on, so a delete cascades
+to its children. The busy timeout rides out a lock held by another process.
+WAL mode keeps a crash mid-write from corrupting the last committed transaction,
+and synchronous NORMAL is safe under WAL.
+
+A handle holds two pools over the one file. The writer pool holds a single
+connection, because SQLite admits one writer at a time and a second connection
+could only ever return SQLITE_BUSY. The reader pool holds several connections,
+each opened with query_only so a read can never write.
+
+Migrations are namespaced. Each namespace keeps its own version table, so Keel
+stores and the embedding application share one database file without colliding.
+
+This package is one of the few allowed to import the SQLite driver. Everything
+else reaches SQLite through it.
+
+VARIABLES
+
+var (
+	// ErrInvalidConfig is returned by Open, Migrate and Backup for an argument
+	// they cannot honour.
+	ErrInvalidConfig = errors.New("sqlite: invalid config")
+
+	// ErrInvalidNamespace is returned by Migrate when a namespace cannot
+	// name a SQL identifier.
+	ErrInvalidNamespace = errors.New("sqlite: invalid namespace")
+
+	// ErrMigration is returned by Migrate when a migration file cannot be
+	// read, staged, or applied.
+	ErrMigration = errors.New("sqlite: migration")
+
+	// ErrBackup is returned by Backup when the copy cannot be written.
+	ErrBackup = errors.New("sqlite: backup")
+)
+
+FUNCTIONS
+
+func Backup(ctx context.Context, db *DB, dest string) error
+    Backup writes a consistent copy of the database at db to dest. It stages the
+    copy with VACUUM INTO a temporary file beside dest, syncs it, then renames
+    it into place, so a reader of dest never observes a half written file.
+    Backup uses the write connection, so it serialises with live writes.
+
+func Migrate(ctx context.Context, db *DB, namespace string, fsys fs.FS) error
+    Migrate applies every .sql file in fsys, in filename order, to db. Each
+    namespace keeps its own version table, so two namespaces share one database
+    file without colliding. A file already recorded in the table is skipped,
+    so a second run changes nothing.
+
+    Each file runs in its own transaction together with its version row,
+    so a file that fails partway leaves nothing behind. A file must not contain
+    its own BEGIN or COMMIT.
+
+
+TYPES
+
+type Config struct {
+	// Path is the database file. Open creates the file when absent and
+	// creates its parent directory when missing.
+	Path string
+
+	// BusyTimeout is how long a statement waits for a lock before it fails
+	// with SQLITE_BUSY. Zero means five seconds.
+	BusyTimeout time.Duration
+
+	// MaxReaders caps the read pool. Zero means four connections. The
+	// writer pool always holds one connection.
+	MaxReaders int
+
+	// Logger receives one record per applied migration. Nil means
+	// slog.Default.
+	Logger *slog.Logger
+
+	// Now supplies the applied time a migration records. Nil means
+	// time.Now.
+	Now func() time.Time
+}
+    Config configures Open. The zero value is usable except that Path must be
+    set: an empty Path is rejected rather than opening a file named "".
+
+type DB struct {
+	// Has unexported fields.
+}
+    DB is an open database. It holds one write connection and a read pool over
+    the same file. Create it with Open and release it with Close. A DB is safe
+    for concurrent use.
+
+func Open(ctx context.Context, cfg Config) (*DB, error)
+    Open opens, creating if absent, the SQLite database at cfg.Path. It returns
+    a handle with one write connection and a read pool, both carrying the
+    pragmas this package documents. The caller closes the handle with Close.
+
+func (db *DB) Close() error
+    Close closes both pools. It returns the joined error of the two closes,
+    or nil when both succeed.
+
+func (db *DB) Reader() *sql.DB
+    Reader returns the read pool. Every connection carries query_only, so a
+    statement sent here can never write.
+
+func (db *DB) Writer() *sql.DB
+    Writer returns the write pool. It holds one connection, so concurrent
+    writers queue rather than race for the file lock.
+
+
+########## github.com/nrynss/keel/stream
+package stream // import "github.com/nrynss/keel/stream"
+
+Package stream fans server-sent events out to topic subscribers.
+
+Long work is started by a short request and observed over a stream. A producer
+publishes an Event to a topic, and every subscriber joined to that topic
+receives it framed as a server-sent event. Cloudflare ends a proxied request at
+100 seconds, so nothing may hold a response open while work computes.
+
+TYPES
+
+type Broker struct {
+	// Has unexported fields.
+}
+    Broker fans events out to topic subscribers without ever blocking on a slow
+    one.
+
+    A subscriber has a bounded buffer. When it is full, the OLDEST buffered
+    event is dropped to make room for the new one, so Publish never blocks and
+    never disconnects the subscriber. The newest event always fits, because
+    progress supersedes its own earlier reports. A subscriber that must not miss
+    an event reads the authoritative state instead of the stream.
+
+func New(cfg Config) *Broker
+    New returns an empty Broker. The zero Config means the package defaults for
+    heartbeat, buffer and retention.
+
+func (b *Broker) Publish(topic string, event Event)
+    Publish delivers event to every current subscriber on topic without
+    blocking. A subscriber whose buffer is full has its oldest buffered event
+    dropped, per the Broker policy.
+
+    A terminal event is retained on its topic so a later subscriber still
+    receives it. Publishing a non-terminal event to a topic with no subscribers
+    is a no-op. Publishing on a nil Broker is always a no-op.
+
+func (b *Broker) ServeTopic(w http.ResponseWriter, r *http.Request, topic string)
+    ServeTopic writes topic to w as a server-sent-events stream and returns
+    when the response ends. The response ends on a write error, on the request
+    context ending, or on the subscription ending.
+
+    Headers are set once, before the first byte, and every frame is flushed as
+    it is written. During a quiet period a ping comment keeps an intermediary
+    from reaping the connection. The heartbeat timer resets on every real event,
+    so pings appear only between events.
+
+func (b *Broker) Subscribe(ctx context.Context, topic string) *Subscription
+    Subscribe registers a subscriber on topic. Events receives every event
+    published to the topic from now on.
+
+    When the topic already holds a live terminal event, Subscribe returns a
+    subscription that carries that one event and then closes, so a late reader
+    learns the outcome without waiting. The retained event keeps the id it was
+    published under, so a client can still deduplicate it.
+
+    The subscription ends when ctx is done or Cancel runs. Both paths remove
+    the subscriber, so a topic holds no writer for a closed connection.
+    Pass a context that ends with the connection, such as a request context.
+    A caller that does not cancel must still let that context end.
+
+type Config struct {
+	// Heartbeat is the quiet period between ping comments on an open
+	// connection. Zero or negative means defaultHeartbeat.
+	Heartbeat time.Duration
+
+	// Buffer is the per-subscriber event buffer. Zero or negative means
+	// defaultBuffer.
+	Buffer int
+
+	// Retain is how long a topic keeps its last terminal event for
+	// replay to a subscriber that joins late. Zero or negative means
+	// defaultRetain.
+	Retain time.Duration
+}
+    Config carries the Broker's knobs. The zero value is usable and means
+    defaultHeartbeat, defaultBuffer and defaultRetain.
+
+type Event struct {
+	Name     string
+	Data     any
+	Terminal bool
+	ID       uint64
+}
+    Event is one server-sent event. Name is the frame's event field. Data is the
+    payload, which the frame writer encodes as one compact JSON line.
+
+    Terminal marks an event that ends the topic's work. The Broker keeps the
+    last terminal event for its configured retention, so a subscriber that joins
+    after it still receives it.
+
+    ID is assigned by the Broker at publish time and increases per topic.
+    A publisher leaves it at zero, and the Broker overwrites any value.
+
+type Subscription struct {
+	Events <-chan Event
+
+	// Has unexported fields.
+}
+    Subscription is one consumer's registration on one topic. Events is closed
+    when the subscription ends, so a range loop over it terminates. Cancel is
+    safe to call more than once and safe on a nil Subscription.
+
+func (s *Subscription) Cancel()
+    Cancel removes the subscription. A stream calls it when the response ends,
+    and the context watcher calls it on disconnect. Either path removes the
+    subscriber exactly once.
+
+
+########## github.com/nrynss/keel/tools/conventions
+Package main checks the Keel Go conventions that gofmt and go vet cannot see.
+
+Four rules are enforced and each breach prints one FAIL line that names the rule
+and the file position:
+
+  - no call to os.Getenv, os.LookupEnv or os.Environ outside test files
+  - no panic or log.Fatal call outside test files
+  - every exported identifier carries a doc comment naming it
+  - no exported identifier in a file the linux/amd64 build context excludes
+
+The checker walks every package under the module root. It exits 1 when it finds
+any breach and stays silent when the tree is clean.
+
+########## github.com/nrynss/keel/upload
+package upload // import "github.com/nrynss/keel/upload"
+
+Package upload accepts a file as a series of resumable chunks and lands the
+assembled bytes in a media store.
+
+An upload is opened, filled, inspected and finished over HTTP:
+
+    POST {base}                  open an upload, answering with its id
+    PUT  {base}/{id}/chunks/{n}  store chunk n
+    GET  {base}/{id}             report which chunks are stored
+    POST {base}/{id}/complete    assemble, check and store the file
+
+A PUT carries the chunk's SHA-256 in the X-Chunk-SHA256 header and its bytes
+in the body. Chunks may arrive in any order, an index may be sent again with
+the digest it already has, and the same index sent with a different digest is
+refused with the chunk_mismatch code. A chunk is written to its staging file
+only once its digest matches, so a staged chunk is always the bytes its digest
+names. The per-upload and per-owner byte limits are enforced while a chunk
+arrives rather than after the file is assembled, so an upload cannot fill the
+disk and then be rejected.
+
+Completing an upload streams the chunks in order, checks the whole-file
+digest the client declares, and stores the bytes through Config.Store under
+the upload's own id. An upload that stops receiving chunks expires after
+Config.UploadTTL and its files are removed.
+
+Every failure is written in the shared error envelope, so a client branches on
+the envelope's code rather than on prose.
+
+The zero Handler is not usable: New builds one from a Config and opens its
+staging directory. The package reads no environment.
+
+TYPES
+
+type BlobStore interface {
+	// PersistWithID stores src under blobID with the given metadata,
+	// leaving a blob already stored under that id untouched.
+	PersistWithID(ctx context.Context, blobID string, src io.Reader, p mediastore.Put) error
+}
+    BlobStore receives the assembled bytes of a finished upload.
+    A mediastore.Store satisfies it.
+
+type Config struct {
+	// Dir is the directory chunk files are staged in. New creates it when
+	// it is absent and opens it as the root every staged path is resolved
+	// through. Required.
+	Dir string
+	// Store receives the bytes of a finished upload. Required.
+	Store BlobStore
+	// BasePath is the URL prefix the handler serves under. Empty means
+	// "/uploads". The prefix is matched as a whole path segment, so it
+	// never doubles as the prefix of an unrelated route.
+	BasePath string
+	// MaxUploadBytes caps the size of one upload. Zero means 4 GiB.
+	MaxUploadBytes int64
+	// MaxOwnerBytes caps the bytes one owner may hold across the uploads
+	// this handler holds at once, counting the chunks staged so far. The
+	// cap is per handler, not per store, so two handlers over one store
+	// each admit the full budget. Zero means 16 GiB.
+	//
+	// A consumer that needs one owner capped across a whole store must
+	// serve that store from a single handler.
+	MaxOwnerBytes int64
+	// MaxChunks caps how many chunks one upload may hold, which bounds the
+	// per-chunk bookkeeping a single upload can make the handler keep.
+	// Zero means 65536.
+	MaxChunks int
+	// UploadTTL is how long an upload may sit without a chunk arriving
+	// before the sweep removes it. Zero means 24 hours.
+	UploadTTL time.Duration
+	// SweepInterval is how often Start's loop sweeps. Zero means one hour.
+	SweepInterval time.Duration
+	// Now supplies the clock the handler stamps and expires uploads
+	// with. Nil means time.Now.
+	Now func() time.Time
+	// Log receives one line per server fault and one per staging file the
+	// sweep cannot remove. Nil discards.
+	Log *slog.Logger
+}
+    Config configures New.
+
+type Handler struct {
+	// Has unexported fields.
+}
+    Handler serves the chunked upload protocol. Build one with New.
+
+func New(cfg Config) (*Handler, error)
+    New opens the staging directory and returns a handler ready to serve.
+    A zero field takes its documented default; a value out of range is refused
+    rather than clamped.
+
+func (h *Handler) Close() error
+    Close stops Start's loop, waits for it to exit, and closes the staging
+    directory. It is safe on a handler that was never started, and a second call
+    is a no-op that reports the first call's error.
+
+func (h *Handler) Mount(mux *http.ServeMux)
+    Mount registers the handler on mux under its base path. The collection path
+    and its subtree are both registered, so a request the handler does not serve
+    is answered here rather than by a neighbouring route that happens to share
+    the prefix.
+
+func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request)
+    ServeHTTP serves the upload protocol:
+
+        POST {base}                  open an upload
+        PUT  {base}/{id}/chunks/{n}  store chunk n
+        GET  {base}/{id}             report the upload's state
+        POST {base}/{id}/complete    assemble, check and store the upload
+
+func (h *Handler) Start()
+    Start begins sweeping expired uploads every Config.SweepInterval until
+    Close. A caller that would rather drive expiry itself leaves Start uncalled
+    and calls Sweep instead.
+
+func (h *Handler) Sweep() (int, error)
+    Sweep removes the uploads that have outlived Config.UploadTTL, along with
+    any staging directory left behind by a previous process, and reports how
+    many it removed. Start calls it on a ticker; a caller that left Start
+    uncalled calls it directly.
+
+
+########## github.com/nrynss/keel/wire
+package wire // import "github.com/nrynss/keel/wire"
+
+Package wire holds the HTTP shapes that every Keel handler and every client
+share. Package wire pins one error envelope for every non-2xx JSON response.
+A client branches on the envelope code and never on the message, so a message
+can change wording without a client release.
+
+CONSTANTS
+
+const (
+	// EventProgress reports work in flight and is never terminal.
+	EventProgress = "progress"
+	// EventDone reports a job that finished on its own.
+	EventDone = "done"
+	// EventError reports a job that failed.
+	EventError = "error"
+	// EventCancelled reports a job that ended because its context was
+	// cancelled.
+	EventCancelled = "cancelled"
+	// EventInterrupted reports a job that a restart ended.
+	EventInterrupted = "interrupted"
+)
+    Event names for a job stream. The name travels in the event field of one
+    frame. Each terminal name also serves as the status member of its payload.
+
+
+FUNCTIONS
+
+func SetEventHeaders(w http.ResponseWriter)
+    SetEventHeaders sets the response headers every server-sent event stream
+    carries. Content-Type names the stream. Cache-Control no-store stops a cache
+    from keeping a copy. X-Accel-Buffering no stops a reverse proxy from holding
+    frames back.
+
+func WriteError(w http.ResponseWriter, status int, code, message string, detail any) error
+    WriteError writes the error envelope that every non-2xx JSON
+    response carries. The body is one JSON object of the shape
+    {"error":{"code","message","detail"}} followed by a newline.
+
+    code is the stable snake_case identifier that a client branches on.
+    message is a human sentence that a client may show but never branches on.
+    detail is optional and travels as the detail member.
+
+    WriteError sets Content-Type application/json and Cache-Control no-store on
+    every response. A 429 also sets Retry-After in whole seconds, at least 1.
+    The header takes the retry_after_seconds member of detail, rounds a fraction
+    up, and falls back to 1 when detail carries no usable hint, so header and
+    body never disagree.
+
+    A detail that fails to encode, or one that encodes to null, leaves the
+    body without the detail member. A failed detail encoding comes back as the
+    returned error, and so does a failed write. The status goes out in every
+    case, so the client always sees one envelope.
+
+    The signature takes no request context. A response write belongs to the
+    handler's own request, and a second context would add nothing to it.
+
+func WriteEvent(w http.ResponseWriter, name string, id uint64, data any) error
+    WriteEvent writes one server-sent event frame to w. The frame carries the
+    event name, the id, exactly one data line of compact JSON, and a blank line
+    that ends the frame.
+
+    data is any value that json.Marshal encodes, normally one of the payload
+    structs in this file. json.Marshal emits compact JSON, which holds no
+    newline, so the frame always carries exactly one data line.
+
+    The caller flushes w after each frame and drops a duplicate on job_id.
+    A frame that fails to encode or to write comes back as the returned error.
+
+    The signature takes no request context. A response write belongs to the
+    handler's own request, and a second context would add nothing to it.
+
+func WriteHeartbeat(w http.ResponseWriter) error
+    WriteHeartbeat writes the heartbeat frame, a comment line and a blank line.
+    A stream sends it after a quiet period so an intermediary does not reap the
+    connection. A client ignores a comment frame.
+
+
+TYPES
+
+type ErrorEvent struct {
+	JobID  string          `json:"job_id"`
+	Status string          `json:"status"`
+	Error  json.RawMessage `json:"error"`
+}
+    ErrorEvent is the payload of an error event. Error carries the envelope body
+    that WriteError also writes, so a reader feeds the member to the one parser
+    it already uses for a failed response. Build it with NewErrorEvent.
+
+func NewErrorEvent(jobID, code, message string, detail any) (ErrorEvent, error)
+    NewErrorEvent builds the payload of an error event. code, message and detail
+    fill the same envelope body that WriteError writes for a failed response,
+    so the event and a failed request carry one parser. A detail that cannot
+    encode comes back as the returned error.
+
+type Frame struct {
+	Comment string
+	Event   string
+	ID      uint64
+	Data    json.RawMessage
+}
+    Frame is one server-sent event frame read from a stream. A comment frame,
+    such as the heartbeat, carries Comment and no event, id or data. An event
+    frame carries Event, ID and Data. Data holds the compact JSON of the frame's
+    data lines, joined with a newline.
+
+func ReadEvent(br *bufio.Reader) (Frame, error)
+    ReadEvent reads one frame from br. It returns io.EOF at the end of the
+    stream. A malformed id or an unreadable frame comes back as the returned
+    error.
+
+    A blank line ends a frame. Every data line joins with a newline, so a
+    payload that a producer split over several data lines reads back whole.
+
+    A client that reads a job stream follows one order. It subscribes first
+    and waits for the stream to open. It then fetches the job's current state
+    and deduplicates the terminal event on job_id. Catch-up reads that state,
+    so a frame id never promises a replay of progress. An id only lets the
+    client drop a duplicate, and ids increase within one topic.
+
+type ProgressEvent struct {
+	JobID   string          `json:"job_id"`
+	Stage   string          `json:"stage"`
+	Current *int64          `json:"current,omitempty"`
+	Total   *int64          `json:"total,omitempty"`
+	Detail  json.RawMessage `json:"detail,omitempty"`
+}
+    ProgressEvent is the payload of a progress event. It reports work in flight
+    and is never terminal. Stage names the step, and Current and Total are
+    optional. A nil Current or Total leaves the member out. Detail is optional
+    raw JSON that the app alone reads.
+
+type StatusEvent struct {
+	JobID  string `json:"job_id"`
+	Status string `json:"status"`
+}
+    StatusEvent is the payload of a done, cancelled or interrupted event.
+    Each of those events is terminal and carries no other member. Status repeats
+    the event name.
+
+

@@ -156,7 +156,7 @@ func TestSweepDeletesAgedUnplacedAndKeepsPlaced(t *testing.T) {
 	place(t, s, Blob{ID: unplaced, ContentType: "audio/mpeg", CreatedAt: base}, blob(120))
 	placed := placeGroup(t, s, "g1", base, 1, 80)[0]
 
-	w := newSweeper(t, s, RetentionConfig{Now: fixedClock(base.Add(DefaultUnplacedAge + time.Minute))})
+	w := newSweeper(t, s, RetentionConfig{Now: fixedClock(base.Add(defaultUnplacedAge + time.Minute))})
 	result, err := w.Sweep(t.Context())
 	if err != nil {
 		t.Fatalf("sweep: %v", err)
@@ -203,8 +203,8 @@ func TestSweepUnplacedAgeBoundary(t *testing.T) {
 		want bool
 	}{
 		{"just placed", time.Minute, true},
-		{"one minute short", DefaultUnplacedAge - time.Minute, true},
-		{"one minute over", DefaultUnplacedAge + time.Minute, false},
+		{"one minute short", defaultUnplacedAge - time.Minute, true},
+		{"one minute over", defaultUnplacedAge + time.Minute, false},
 		{"three days old", 72 * time.Hour, false},
 	}
 	for _, tc := range cases {
@@ -253,7 +253,7 @@ func TestSweepRetainVetoIsAbsolute(t *testing.T) {
 // has to reach that shape too.
 func TestSweepRetainVetoCoversAReservedIDWithNoRow(t *testing.T) {
 	s := openTestStoreAt(t, base)
-	blobID := orphan(t, s, blob(40), base.Add(-2*DefaultOrphanFileAge))
+	blobID := orphan(t, s, blob(40), base.Add(-2*defaultOrphanFileAge))
 
 	w := newSweeper(t, s, RetentionConfig{
 		Now:    fixedClock(base),
@@ -277,7 +277,7 @@ func TestSweepRetainVetoCoversAReservedIDWithNoRow(t *testing.T) {
 // aged one goes and the fresh one stays.
 func TestSweepRemovesAgedUnreferencedFiles(t *testing.T) {
 	s := openTestStoreAt(t, base)
-	aged := orphan(t, s, blob(70), base.Add(-DefaultOrphanFileAge-time.Hour))
+	aged := orphan(t, s, blob(70), base.Add(-defaultOrphanFileAge-time.Hour))
 	fresh := orphan(t, s, blob(90), base)
 
 	w := newSweeper(t, s, RetentionConfig{Now: fixedClock(base)})
@@ -490,7 +490,7 @@ func TestSweepUnderBudgetEvictsNothing(t *testing.T) {
 
 	w := newSweeper(t, s, RetentionConfig{
 		Now:         fixedClock(base),
-		MaxBytes:    DefaultMaxBytes,
+		MaxBytes:    defaultMaxBytes,
 		MinGroupAge: time.Minute,
 	})
 	result, err := w.Sweep(t.Context())
@@ -510,7 +510,7 @@ func TestSweepIsIdempotent(t *testing.T) {
 	s := openTestStoreAt(t, base)
 	blobID := newID(t)
 	place(t, s, Blob{ID: blobID, ContentType: "audio/mpeg", CreatedAt: base}, blob(60))
-	orphan(t, s, blob(20), base.Add(-2*DefaultOrphanFileAge))
+	orphan(t, s, blob(20), base.Add(-2*defaultOrphanFileAge))
 
 	w := newSweeper(t, s, RetentionConfig{Now: fixedClock(base.Add(24 * time.Hour)), MaxBytes: Unbounded})
 	first, err := w.Sweep(t.Context())
@@ -575,23 +575,23 @@ func TestNewSweeperDefaults(t *testing.T) {
 	s := openTestStoreAt(t, base)
 	w := newSweeper(t, s, RetentionConfig{})
 
-	if w.unplacedAge != DefaultUnplacedAge {
-		t.Fatalf("unplacedAge = %v, want %v", w.unplacedAge, DefaultUnplacedAge)
+	if w.unplacedAge != defaultUnplacedAge {
+		t.Fatalf("unplacedAge = %v, want %v", w.unplacedAge, defaultUnplacedAge)
 	}
-	if w.orphanFileAge != DefaultOrphanFileAge {
-		t.Fatalf("orphanFileAge = %v, want %v", w.orphanFileAge, DefaultOrphanFileAge)
+	if w.orphanFileAge != defaultOrphanFileAge {
+		t.Fatalf("orphanFileAge = %v, want %v", w.orphanFileAge, defaultOrphanFileAge)
 	}
-	if w.maxBytes != DefaultMaxBytes {
-		t.Fatalf("maxBytes = %d, want %d", w.maxBytes, DefaultMaxBytes)
+	if w.maxBytes != defaultMaxBytes {
+		t.Fatalf("maxBytes = %d, want %d", w.maxBytes, defaultMaxBytes)
 	}
-	if w.minGroupAge != DefaultMinGroupAge {
-		t.Fatalf("minGroupAge = %v, want %v", w.minGroupAge, DefaultMinGroupAge)
+	if w.minGroupAge != defaultMinGroupAge {
+		t.Fatalf("minGroupAge = %v, want %v", w.minGroupAge, defaultMinGroupAge)
 	}
-	if w.minGroups != DefaultMinGroups {
-		t.Fatalf("minGroups = %d, want %d", w.minGroups, DefaultMinGroups)
+	if w.minGroups != defaultMinGroups {
+		t.Fatalf("minGroups = %d, want %d", w.minGroups, defaultMinGroups)
 	}
-	if w.interval != DefaultSweepInterval {
-		t.Fatalf("interval = %v, want %v", w.interval, DefaultSweepInterval)
+	if w.interval != defaultSweepInterval {
+		t.Fatalf("interval = %v, want %v", w.interval, defaultSweepInterval)
 	}
 	if w.retain == nil || w.now == nil {
 		t.Fatal("retain and now must never be nil")

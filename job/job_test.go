@@ -458,7 +458,7 @@ func TestOpenRejectsMissingDependencies(t *testing.T) {
 // full, and a finished job frees its slot.
 func TestStartAtLimit(t *testing.T) {
 	t.Run("explicit-limit", func(t *testing.T) {
-		b, r := newBrokerAndRunnerKinds(t, map[string]Kind{DefaultKind: {Limit: 1}})
+		b, r := newBrokerAndRunnerKinds(t, map[string]Kind{defaultKind: {Limit: 1}})
 		release := make(chan struct{})
 		if _, err := r.Start(context.Background(), func(ctx context.Context, progress func(Progress)) ([]byte, error) {
 			<-release
@@ -499,23 +499,23 @@ func TestStartAtLimit(t *testing.T) {
 	})
 
 	t.Run("default-limit", func(t *testing.T) {
-		if DefaultLimit <= 0 {
-			t.Fatalf("DefaultLimit = %d, want positive", DefaultLimit)
+		if defaultLimit <= 0 {
+			t.Fatalf("defaultLimit = %d, want positive", defaultLimit)
 		}
 		_, r := newBrokerAndRunner(t)
 		release := make(chan struct{})
-		for i := 0; i < DefaultLimit; i++ {
+		for i := 0; i < defaultLimit; i++ {
 			if _, err := r.Start(context.Background(), func(ctx context.Context, progress func(Progress)) ([]byte, error) {
 				<-release
 				return nil, nil
 			}); err != nil {
-				t.Fatalf("Start %d of %d: %v", i+1, DefaultLimit, err)
+				t.Fatalf("Start %d of %d: %v", i+1, defaultLimit, err)
 			}
 		}
 		if _, err := r.Start(context.Background(), func(ctx context.Context, progress func(Progress)) ([]byte, error) {
 			return nil, nil
 		}); !errors.Is(err, ErrLimit) {
-			t.Errorf("job %d: err = %v, want ErrLimit at the default limit", DefaultLimit+1, err)
+			t.Errorf("job %d: err = %v, want ErrLimit at the default limit", defaultLimit+1, err)
 		}
 		close(release)
 	})
@@ -649,7 +649,7 @@ func TestRunningStatusBeforeTerminal(t *testing.T) {
 // is published exactly once through run's single site, and the slots
 // recover.
 func TestCancelRunningJobRecoversSlot(t *testing.T) {
-	b, r := newBrokerAndRunnerKinds(t, map[string]Kind{DefaultKind: {Limit: 2}})
+	b, r := newBrokerAndRunnerKinds(t, map[string]Kind{defaultKind: {Limit: 2}})
 	started := make(chan struct{}, 2)
 	blocked := func(ctx context.Context, progress func(Progress)) ([]byte, error) {
 		started <- struct{}{}
@@ -802,7 +802,7 @@ func TestResultCapFailsJob(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Open: %v", err)
 		}
-		big := make([]byte, 4*DefaultMaxResultBytes)
+		big := make([]byte, 4*defaultMaxResultBytes)
 		id, _ := startGated(t, b, r, func(ctx context.Context, progress func(Progress)) ([]byte, error) {
 			return big, nil
 		})

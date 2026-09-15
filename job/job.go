@@ -40,22 +40,22 @@ import (
 )
 
 // TopicPrefix is the broker topic namespace every job publishes on. A job's
-// topic is TopicPrefix + its id. Subscribers hardcode the convention, so it
-// is pinned here and by TestTopicFormat.
+// topic is TopicPrefix + its id. The subscriber side hardcodes the
+// convention, so it is pinned here and by TestTopicFormat.
 const TopicPrefix = "job:"
 
-// DefaultKind is the kind Start runs when the caller names none.
-const DefaultKind = "default"
+// defaultKind is the kind Start runs when the caller names none.
+const defaultKind = "default"
 
-// DefaultLimit is the number of jobs of one kind that run at once when the
+// defaultLimit is the number of jobs of one kind that run at once when the
 // kind's Limit is unset. The bound keeps a bug or a burst from forking
 // unbounded goroutines.
-const DefaultLimit = 16
+const defaultLimit = 16
 
-// DefaultMaxResultBytes is the largest result the Runner keeps inline when
+// defaultMaxResultBytes is the largest result the Runner keeps inline when
 // Config.MaxResultBytes is unset. A larger result belongs in a media store,
 // with its id in the result, so the job row stays small.
-const DefaultMaxResultBytes = 1 << 20
+const defaultMaxResultBytes = 1 << 20
 
 // Unbounded disables the result cap when it is set as Config.MaxResultBytes.
 const Unbounded = -1
@@ -171,11 +171,11 @@ type Result struct {
 
 // Kind configures one class of job. Each kind runs under its own concurrency
 // limit, so a heavy kind can run one at a time while a light kind runs
-// several. The zero Kind runs DefaultLimit jobs at once and is never
+// several. The zero Kind runs defaultLimit jobs at once and is never
 // resumed.
 type Kind struct {
 	// Limit is the number of jobs of this kind that run at once. Zero or
-	// negative means DefaultLimit.
+	// negative means defaultLimit.
 	Limit int
 	// Idempotent reports that running a job of this kind a second time is
 	// safe, so the Runner may resume it after a restart. The zero value
@@ -201,7 +201,7 @@ type Config struct {
 	// be nil.
 	Store Store
 	// Kinds configures the named kinds. A kind absent from the map gets
-	// the zero Kind, so it runs DefaultLimit jobs at once and is never
+	// the zero Kind, so it runs defaultLimit jobs at once and is never
 	// resumed.
 	Kinds map[string]Kind
 	// Log receives one line per recorded fault, such as a store write that
@@ -210,7 +210,7 @@ type Config struct {
 	// Now stamps each record's UpdatedAt. Nil means time.Now.
 	Now func() time.Time
 	// MaxResultBytes caps the inline result size. A larger result fails
-	// the job with ErrResultTooLarge. Zero means DefaultMaxResultBytes,
+	// the job with ErrResultTooLarge. Zero means defaultMaxResultBytes,
 	// and Unbounded disables the cap.
 	MaxResultBytes int
 }
@@ -339,7 +339,7 @@ func Open(ctx context.Context, cfg Config) (*Runner, error) {
 	}
 	maxResultBytes := cfg.MaxResultBytes
 	if maxResultBytes == 0 {
-		maxResultBytes = DefaultMaxResultBytes
+		maxResultBytes = defaultMaxResultBytes
 	}
 	r := &Runner{
 		broker:         cfg.Broker,
@@ -367,7 +367,7 @@ func Topic(id string) string {
 // Start runs fn as a job of the default kind and returns the job id at once.
 // See StartKind.
 func (r *Runner) Start(ctx context.Context, fn Func) (string, error) {
-	return r.StartKind(ctx, DefaultKind, fn)
+	return r.StartKind(ctx, defaultKind, fn)
 }
 
 // StartKind runs fn as a job of the named kind and returns the job id at
@@ -437,7 +437,7 @@ func (r *Runner) spawn(jobCtx context.Context, cancel context.CancelFunc, rec Re
 }
 
 // slot returns the concurrency gate for kind, creating it on first use. A
-// kind absent from Config gets the zero Kind, so its gate holds DefaultLimit
+// kind absent from Config gets the zero Kind, so its gate holds defaultLimit
 // slots.
 func (r *Runner) slot(kind string) chan struct{} {
 	r.mu.Lock()
@@ -446,7 +446,7 @@ func (r *Runner) slot(kind string) chan struct{} {
 	if !ok {
 		limit := r.kinds[kind].Limit
 		if limit <= 0 {
-			limit = DefaultLimit
+			limit = defaultLimit
 		}
 		ch = make(chan struct{}, limit)
 		r.slots[kind] = ch
