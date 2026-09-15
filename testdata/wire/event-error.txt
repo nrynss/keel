@@ -1,0 +1,4 @@
+event: error
+id: 5
+data: {"job_id":"3f9a1c7e5b2d8046a1c3e5f7092b4d68","status":"error","error":{"error":{"code":"upstream_failed","message":"The media service failed.","detail":{"attempts":3}}}}
+
