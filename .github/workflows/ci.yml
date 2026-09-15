@@ -31,7 +31,8 @@ jobs:
           docker cp "${cid}:/ffprobe" /usr/local/bin/ffprobe
           docker rm "$cid"
 
-      # KEEL_REQUIRE_FFMPEG exists for tests that need ffmpeg.
-      # No test consumes it yet.
+      # Tests that shell out to ffmpeg read KEEL_REQUIRE_FFMPEG.
+      # An unset variable makes those tests skip when a binary is missing.
+      # CI sets the variable here so a missing binary fails the run instead.
       - name: Run every quality gate
         run: KEEL_REQUIRE_FFMPEG=1 tools/check.sh

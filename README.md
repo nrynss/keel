@@ -21,6 +21,7 @@ machinery, extracted so each product stops rebuilding it.
 | `mediastore` | Blobs on disk under unguessable ids, served with Range support, with retention sweeps |
 | `ffmpeg` | ffmpeg and ffprobe bound to a context, with a bounded wait on shutdown |
 | `cost` | Money as integer nanodollars, and a ledger of charges |
+| `sqlite` | One SQLite file with WAL, a writer handle, a read-only reader pool, namespaced migrations and online backup |
 
 ## Status
 
