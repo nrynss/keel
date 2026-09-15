@@ -108,10 +108,14 @@ else
     echo "no packages yet, skipping"
 fi
 
+# Both content scans pass -I to grep so they judge file content and not file names.
+# Grep treats a file holding a NUL byte as binary and as if it held no matches.
+# The binary fixtures carry every short byte sequence by chance, and chance is not a citation.
+# A text file named *.bin holds real words, and grep still scans it.
 # Check 6: no consumer name in a tracked file.
 header "6/8 consumer names"
 if [ "${#scanned_files[@]}" -gt 0 ]; then
-    hits=$(grep -l -i -E -e "$consumer_re" -- "${scanned_files[@]}" || true)
+    hits=$(grep -l -i -E -I -e "$consumer_re" -- "${scanned_files[@]}" || true)
     if [ -n "$hits" ]; then
         printf '%s\n' "$hits"
         fail "6/8 consumer names" "tracked files above name a consumer"
@@ -122,7 +126,7 @@ passed
 # Check 7: no planning reference in a tracked file.
 header "7/8 plan references"
 if [ "${#scanned_files[@]}" -gt 0 ]; then
-    hits=$(grep -l -i -E -e "$plan_re" -- "${scanned_files[@]}" || true)
+    hits=$(grep -l -i -E -I -e "$plan_re" -- "${scanned_files[@]}" || true)
     if [ -n "$hits" ]; then
         printf '%s\n' "$hits"
         fail "7/8 plan references" "tracked files above cite planning"
