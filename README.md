@@ -22,8 +22,8 @@ machinery, extracted so each product stops rebuilding it.
 
 ## Status
 
-Pre-release. The packages are being extracted from Thutapi and Ajilamu, where
-they run in production.
+Pre-release. The packages are being extracted from services that already run
+them in production.
 
 ## License
 
