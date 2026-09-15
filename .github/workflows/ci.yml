@@ -1,0 +1,37 @@
+# Continuous integration for Keel.
+# The job runs the same gates as tools/check.sh so CI and the workstation agree.
+name: ci
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      # Go version comes from go.mod so CI matches the local toolchain.
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # Tests that shell out to ffmpeg need one static binary pair.
+      # The digest pins the image so every run gets the same build.
+      - name: Install static ffmpeg and ffprobe
+        run: |
+          cid=$(docker create mwader/static-ffmpeg:7.1@sha256:a8090df5f5608daef387e1b2e93b98aaacb4d92153ad904e7d715c725724fca4)
+          docker cp "${cid}:/ffmpeg" /usr/local/bin/ffmpeg
+          docker cp "${cid}:/ffprobe" /usr/local/bin/ffprobe
+          docker rm "$cid"
+
+      # KEEL_REQUIRE_FFMPEG exists for tests that need ffmpeg.
+      # No test consumes it yet.
+      - name: Run every quality gate
+        run: KEEL_REQUIRE_FFMPEG=1 tools/check.sh
