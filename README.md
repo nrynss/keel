@@ -13,6 +13,8 @@ machinery, extracted so each product stops rebuilding it.
 
 | Package | Does |
 |---|---|
+| `wire` | The error envelope and the event contract every response and stream shares |
+| `id` | Unguessable 128-bit ids in lowercase hex, for anything served in public |
 | `gate` | Per-client and global token buckets, plus an optional passcode, in front of the routes that spend money |
 | `stream` | Topic broker and server-sent events, with heartbeats and a non-blocking slow-subscriber policy |
 | `job` | Long work started by a short request, observed over `stream`, durable across restarts |
