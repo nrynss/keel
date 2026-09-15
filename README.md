@@ -22,6 +22,7 @@ machinery, extracted so each product stops rebuilding it.
 | `ffmpeg` | ffmpeg and ffprobe bound to a context, with a bounded wait on shutdown |
 | `cost` | Money as integer nanodollars, and a ledger of charges |
 | `sqlite` | One SQLite file with WAL, a writer handle, a read-only reader pool, namespaced migrations and online backup |
+| `upload` | Resumable chunked uploads that land in `mediastore`, staged on disk and resumable by id after a dropped connection |
 
 ## Status
 
