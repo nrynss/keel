@@ -24,6 +24,11 @@ machinery, extracted so each product stops rebuilding it.
 | `sqlite` | One SQLite file with WAL, a writer handle, a read-only reader pool, namespaced migrations and online backup |
 | `upload` | Resumable chunked uploads that land in `mediastore`, staged on disk and resumable by id after a dropped connection |
 
+## Examples
+
+Every package carries a runnable example that shows its common case. Run
+`go test -run Example -v ./...` to see them.
+
 ## Status
 
 Pre-release. The packages are being extracted from services that already run
