@@ -1374,6 +1374,30 @@ func TestDecodeNestedSecretListMultilineInteriorQuote(t *testing.T) {
 	}
 }
 
+// TestDecodeNestedSecretListMultilineExtraQuoteAtEnd pins a nested secret
+// list whose path is a multiline basic string that ends with one extra
+// quote. Decode keeps the reference. The extra quote is content.
+func TestDecodeNestedSecretListMultilineExtraQuoteAtEnd(t *testing.T) {
+	doc := "rows = [[{source = \"file\", path = \"\"\"end\"\"\"\"}]]\n"
+	var got struct {
+		Rows [][]Secret `toml:"rows"`
+	}
+	if err := Decode([]byte(doc), &got, stubRegistry(t)); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if len(got.Rows) != 1 {
+		t.Fatalf("got %d outer rows, want 1", len(got.Rows))
+	}
+	keys := got.Rows[0]
+	if len(keys) != 1 {
+		t.Fatalf("got %+v, want one reference", keys)
+	}
+	gotRefs := keys[0].refs
+	if len(gotRefs) != 1 || gotRefs[0].Source() != "file" || gotRefs[0].Path() != `end"` {
+		t.Errorf("rows = %+v, want file path ending with a quote", keys)
+	}
+}
+
 // TestDecodeNestedSecretListEmptyInner pins an empty inner list on a nested
 // secret list. Decode refuses it as an empty reference list and names rows.
 func TestDecodeNestedSecretListEmptyInner(t *testing.T) {

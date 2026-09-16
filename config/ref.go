@@ -363,6 +363,7 @@ const (
 
 // nextStringState steps one byte of TOML quoting and comments.
 // extra is how many following bytes the step already consumed.
+// A multiline closer is a run of three, four, or five quotes.
 func nextStringState(doc []byte, i int, state tomlLex) (tomlLex, int) {
 	c := doc[i]
 	switch state {
@@ -388,13 +389,21 @@ func nextStringState(doc []byte, i int, state tomlLex) (tomlLex, int) {
 		switch {
 		case c == '\\':
 			return tomlMultiBasic, 1
-		case bytes.HasPrefix(doc[i:], []byte(`"""`)):
-			return tomlPlain, 2
+		case c == '"':
+			n := quoteRun(doc, i, '"')
+			if n >= 3 {
+				return tomlPlain, n - 1
+			}
+			return tomlMultiBasic, n - 1
 		}
 		return tomlMultiBasic, 0
 	case tomlMultiLiteral:
-		if bytes.HasPrefix(doc[i:], []byte("'''")) {
-			return tomlPlain, 2
+		if c == '\'' {
+			n := quoteRun(doc, i, '\'')
+			if n >= 3 {
+				return tomlPlain, n - 1
+			}
+			return tomlMultiLiteral, n - 1
 		}
 		return tomlMultiLiteral, 0
 	default:
@@ -412,6 +421,15 @@ func nextStringState(doc []byte, i int, state tomlLex) (tomlLex, int) {
 		}
 		return tomlPlain, 0
 	}
+}
+
+// quoteRun counts consecutive quotes at i, at most five.
+func quoteRun(doc []byte, i int, q byte) int {
+	n := 0
+	for n < 5 && i+n < len(doc) && doc[i+n] == q {
+		n++
+	}
+	return n
 }
 
 // insideString reports whether at sits inside a string, so a line inside a
