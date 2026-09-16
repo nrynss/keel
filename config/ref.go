@@ -349,68 +349,82 @@ func lineStart(doc, needle []byte) (int, bool) {
 	}
 }
 
-// insideString reports whether at sits inside a string, so a line inside a
-// multi-line string is not taken for the setting. It tracks the lexical
-// states the document can be in, including the multi-line delimiters.
-func insideString(doc []byte, at int) bool {
-	const (
-		plain = iota
-		basic
-		literal
-		multiBasic
-		multiLiteral
-		comment
-	)
-	state := plain
-	for i := 0; i < at && i < len(doc); i++ {
-		c := doc[i]
-		switch state {
-		case comment:
-			if c == '\n' {
-				state = plain
-			}
-		case basic:
-			switch c {
-			case '\\':
-				i++
-			case '"':
-				state = plain
-			}
-		case literal:
-			if c == '\'' {
-				state = plain
-			}
-		case multiBasic:
-			switch {
-			case c == '\\':
-				i++
-			case bytes.HasPrefix(doc[i:], []byte(`"""`)):
-				state = plain
-				i += 2
-			}
-		case multiLiteral:
-			if bytes.HasPrefix(doc[i:], []byte("'''")) {
-				state = plain
-				i += 2
-			}
-		default:
-			switch {
-			case c == '#':
-				state = comment
-			case bytes.HasPrefix(doc[i:], []byte(`"""`)):
-				state = multiBasic
-				i += 2
-			case bytes.HasPrefix(doc[i:], []byte("'''")):
-				state = multiLiteral
-				i += 2
-			case c == '"':
-				state = basic
-			case c == '\'':
-				state = literal
-			}
+// tomlLex names the lexical state of TOML quoting and comments.
+type tomlLex int
+
+const (
+	tomlPlain tomlLex = iota
+	tomlBasic
+	tomlLiteral
+	tomlMultiBasic
+	tomlMultiLiteral
+	tomlComment
+)
+
+// nextStringState steps one byte of TOML quoting and comments.
+// extra is how many following bytes the step already consumed.
+func nextStringState(doc []byte, i int, state tomlLex) (tomlLex, int) {
+	c := doc[i]
+	switch state {
+	case tomlComment:
+		if c == '\n' {
+			return tomlPlain, 0
 		}
+		return tomlComment, 0
+	case tomlBasic:
+		switch c {
+		case '\\':
+			return tomlBasic, 1
+		case '"':
+			return tomlPlain, 0
+		}
+		return tomlBasic, 0
+	case tomlLiteral:
+		if c == '\'' {
+			return tomlPlain, 0
+		}
+		return tomlLiteral, 0
+	case tomlMultiBasic:
+		switch {
+		case c == '\\':
+			return tomlMultiBasic, 1
+		case bytes.HasPrefix(doc[i:], []byte(`"""`)):
+			return tomlPlain, 2
+		}
+		return tomlMultiBasic, 0
+	case tomlMultiLiteral:
+		if bytes.HasPrefix(doc[i:], []byte("'''")) {
+			return tomlPlain, 2
+		}
+		return tomlMultiLiteral, 0
+	default:
+		switch {
+		case c == '#':
+			return tomlComment, 0
+		case bytes.HasPrefix(doc[i:], []byte(`"""`)):
+			return tomlMultiBasic, 2
+		case bytes.HasPrefix(doc[i:], []byte("'''")):
+			return tomlMultiLiteral, 2
+		case c == '"':
+			return tomlBasic, 0
+		case c == '\'':
+			return tomlLiteral, 0
+		}
+		return tomlPlain, 0
 	}
-	return state != plain && state != comment
+}
+
+// insideString reports whether at sits inside a string, so a line inside a
+// multi-line string is not taken for the setting. It walks nextStringState
+// from the start of the document.
+func insideString(doc []byte, at int) bool {
+	state := tomlPlain
+	for i := 0; i < at && i < len(doc); i++ {
+		var extra int
+		state, extra = nextStringState(doc, i, state)
+		i += extra
+	}
+	return state != tomlPlain && state != tomlComment
 }
 
 // leadIsBlank reports whether only blanks and header brackets sit between

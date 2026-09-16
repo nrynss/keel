@@ -1151,40 +1151,29 @@ func nestedArraySpan(elem *unstable.Node, doc []byte) (int, int, bool) {
 }
 
 // matchListEnd returns the index after the ']' that closes the list at
-// start. Brackets inside a quoted string do not change the depth. A
-// comment runs from '#' to the next newline and does not change the depth.
+// start. Brackets inside a string or a comment do not change the depth.
+// Quoting uses the same states as insideString. A single quote inside a
+// multiline string does not close it. A comment runs from '#' to the
+// next newline.
 func matchListEnd(doc []byte, start int) int {
 	depth := 0
-	var quote byte
+	state := tomlPlain
 	for i := start; i < len(doc); i++ {
 		c := doc[i]
-		switch {
-		case quote == '"':
-			if c == '\\' {
-				i++
-				continue
-			}
-			if c == '"' {
-				quote = 0
-			}
-		case quote == '\'':
-			if c == '\'' {
-				quote = 0
-			}
-		case c == '"' || c == '\'':
-			quote = c
-		case c == '#':
-			for i+1 < len(doc) && doc[i+1] != '\n' {
-				i++
-			}
-		case c == '[':
-			depth++
-		case c == ']':
-			depth--
-			if depth == 0 {
-				return i + 1
+		if state == tomlPlain {
+			switch c {
+			case '[':
+				depth++
+			case ']':
+				depth--
+				if depth == 0 {
+					return i + 1
+				}
 			}
 		}
+		var extra int
+		state, extra = nextStringState(doc, i, state)
+		i += extra
 	}
 	return -1
 }
