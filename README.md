@@ -31,8 +31,9 @@ Every package carries a runnable example that shows its common case. Run
 
 ## Status
 
-Pre-release. The packages are being extracted from services that already run
-them in production.
+Tagged `v0.1.0`. The exported API is frozen in `api/v0.1.0.txt`, and CI
+rejects any change to it. The packages are extracted from services that
+already run them in production.
 
 ## License
 
