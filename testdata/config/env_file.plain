@@ -1,0 +1,4 @@
+# comment lines are ignored
+PROVIDER_API_KEY=fixture-plain-ok
+QUOTED_KEY=fixture-quoted-inner
+OTHER=fixture-other-ok

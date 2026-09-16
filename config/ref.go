@@ -73,6 +73,47 @@ func (r Ref) Args() []string {
 // Read returns when this reference resolves.
 func (r Ref) Read() ReadMode { return r.read }
 
+// RefConfig is the locator a caller uses to construct a Ref without
+// decoding TOML. NewRef copies the fields into a Ref.
+type RefConfig struct {
+	// Source is the source name, such as env or file.
+	Source string
+	// Path is the filesystem path the source reads.
+	Path string
+	// Name is the entry name within a directory the source reads.
+	Name string
+	// Var is the variable name the source reads.
+	Var string
+	// Command is the program the command source runs.
+	Command string
+	// Args is the argument list for the command source.
+	Args []string
+	// Read says when the reference resolves. Empty means ReadAtBoot.
+	Read ReadMode
+}
+
+// NewRef returns a Ref with cfg's locator fields. An empty Read becomes
+// ReadAtBoot. Args is copied, so the caller can reuse the slice.
+func NewRef(cfg RefConfig) Ref {
+	read := cfg.Read
+	if read == "" {
+		read = ReadAtBoot
+	}
+	var args []string
+	if len(cfg.Args) > 0 {
+		args = append([]string(nil), cfg.Args...)
+	}
+	return Ref{
+		source:   cfg.Source,
+		path:     cfg.Path,
+		name:     cfg.Name,
+		variable: cfg.Var,
+		command:  cfg.Command,
+		args:     args,
+		read:     read,
+	}
+}
+
 // locator returns the locator fields the source reads, as space separated
 // key=value pairs. The plan printer in this package uses it, and it never
 // carries a secret value.
