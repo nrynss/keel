@@ -32,8 +32,9 @@ var secretType = reflect.TypeOf(Secret{})
 //
 // A field of type Secret holds a reference, and the document holds no value
 // for it. Decode refuses a literal value there, unknown keys, unknown source
-// names, and a malformed reference, and every refusal names the key. reg
-// supplies the names a reference may use as its source.
+// names, and a malformed reference. Every refusal names the setting key,
+// including a secret the decoder creates. reg supplies the names a
+// reference may use as its source.
 //
 // Decode parses only. It resolves nothing, so every Secret it fills still
 // reports ErrUnresolved until a loader resolves it.
@@ -232,8 +233,10 @@ type secretArray struct {
 // list setting, and returns it beside a copy of the document with each
 // array emptied. The copy stays a valid document, and line breaks stay in
 // place, so the strict decoder fills an empty list at the right position
-// and the references are injected into it afterwards. A fixed size array
-// takes the references only when the document writes exactly that many.
+// and the references are injected into it afterwards. The record's path
+// carries the element index of each enclosing array table, restarted for
+// a new parent element. A fixed size array takes the references only when
+// the document writes exactly that many.
 func stashSecretArrays(t reflect.Type, doc []byte) ([]secretArray, []byte, error) {
 	var parser unstable.Parser
 	parser.Reset(doc)
@@ -413,7 +416,8 @@ func emptyArraySpan(doc []byte, start, end int) {
 // injectSecretArrays writes the references read from each inline array into
 // the list setting it was written on. The strict decode left that list
 // empty, because the decode copy carries an emptied array. Each list is
-// matched by its document path, so the walk order does not matter.
+// matched by the path the type walk settles, including the element index
+// of each enclosing array table. The walk order does not matter.
 func injectSecretArrays(v reflect.Value, prefix []string, stashed []secretArray) []secretArray {
 	switch v.Kind() {
 	case reflect.Pointer:
@@ -511,9 +515,10 @@ func fillSecretList(v reflect.Value, refs []Secret) {
 	v.Set(out)
 }
 
-// checkRefKeys validates every locator key inside each secret setting by
-// walking the document beside the settings type. It reports the full path
-// and the position in the file, for decoder created secrets too.
+// checkRefKeys validates every secret reference by walking the document
+// beside the settings type. It refuses an unknown locator key, a locator
+// of the wrong type, and an unknown read mode. It reports the setting key
+// and the position in the file, including a secret the decoder creates.
 func checkRefKeys(t reflect.Type, doc []byte) error {
 	var parser unstable.Parser
 	parser.Reset(doc)
@@ -524,6 +529,9 @@ func checkRefKeys(t reflect.Type, doc []byte) error {
 		expr := parser.Expression()
 		switch expr.Kind {
 		case unstable.Table, unstable.ArrayTable:
+			if err := checkPendingBody(pending, doc); err != nil {
+				return err
+			}
 			table = tablePath(table, expr, open)
 			if err := checkRefTableBody(t, table, &pending); err != nil {
 				return err
@@ -538,7 +546,7 @@ func checkRefKeys(t reflect.Type, doc []byte) error {
 	if err := parser.Error(); err != nil {
 		return nil
 	}
-	return nil
+	return checkPendingBody(pending, doc)
 }
 
 // openTables tracks the element index each array table is open at, keyed by
@@ -554,8 +562,9 @@ func newOpenTables() *openTables {
 }
 
 // tablePath appends one table header to the path, and adds the element index
-// of every array table the header sits inside. A list nested inside such an
-// element resolves through those indices, and no index reaches a message.
+// of every array table the header sits inside. A new element restarts the
+// lists inside it, so a nested list's index is local to that element. No
+// index reaches a message.
 func tablePath(table []string, expr *unstable.Node, open *openTables) []string {
 	keys := expr.Key()
 	named := make([]string, 0, len(table)+1)
@@ -587,6 +596,13 @@ func tablePath(table []string, expr *unstable.Node, open *openTables) []string {
 	at := open.next[name]
 	open.next[name]++
 	open.at[name] = at
+	// A new element of an array table restarts the lists inside it, so
+	// every counter below this header starts again.
+	for other := range open.next {
+		if other != name && strings.HasPrefix(other, name+".") {
+			delete(open.next, other)
+		}
+	}
 	return append(path, strconv.Itoa(at))
 }
 
@@ -609,10 +625,14 @@ func headerPrefix(name string, parts []string) bool {
 
 // pendingTable holds a table header that may own the key values that
 // follow it. The header names a secret setting directly, so each later
-// key is a locator key of that setting.
+// key is a locator key of that setting. start and end span the body in
+// the file, so a typed fault is read here rather than only by the decoder.
 type pendingTable struct {
 	target reflect.Type
 	prefix []string
+	start  int
+	end    int
+	body   bool
 }
 
 // checkRefTableBody notes a table header that names a secret setting. A
@@ -629,6 +649,10 @@ func checkRefTableBody(t reflect.Type, table []string, pending *[]pendingTable) 
 	*pending = []pendingTable{{target: target, prefix: prefix}}
 	return nil
 }
+
+// checkRefKeyValue checks one assignment against the settings type. A nested
+// inline table is walked even when its own path is not a secret. A locator
+// typo inside it still names the setting and the file position.
 func checkRefKeyValue(
 	t reflect.Type,
 	table []string,
@@ -650,22 +674,92 @@ func checkRefKeyValue(
 				col,
 			)
 		}
+		recordPendingSpan(pending, expr)
 		return nil
 	}
 	parts := tableParts(table, expr)
+	value := expr.Value()
 	target, prefix, _, ok := secretTarget(t, parts)
+	if ok && target == secretType {
+		if value.Kind == unstable.InlineTable {
+			return checkRefInlineTable(target, prefix, expr, parser, doc)
+		}
+		return nil
+	}
+	if value.Kind == unstable.InlineTable {
+		return checkRefInlineValue(t, parts, value, parser, doc)
+	}
+	if ok && value.Kind == unstable.Array {
+		return checkRefArray(target, prefix, expr, parser, doc)
+	}
+	return nil
+}
+
+// recordPendingSpan extends the pending table body to cover one assignment,
+// so the body can be read after the header's keys end.
+func recordPendingSpan(pending *[]pendingTable, expr *unstable.Node) {
+	if len(*pending) == 0 || expr.Raw.Length == 0 {
+		return
+	}
+	start := int(expr.Raw.Offset)
+	end := start + int(expr.Raw.Length)
+	head := &(*pending)[0]
+	if !head.body {
+		head.start = start
+		head.end = end
+		head.body = true
+		return
+	}
+	if start < head.start {
+		head.start = start
+	}
+	if end > head.end {
+		head.end = end
+	}
+}
+
+// checkPendingBody reads the collected table body of a secret setting. A
+// locator of the wrong type and an unknown read mode fail with the setting
+// key and the position in the file, including a secret the decoder creates.
+func checkPendingBody(pending []pendingTable, doc []byte) error {
+	if len(pending) == 0 || !pending[0].body {
+		return nil
+	}
+	head := pending[0]
+	return parseRefSpan(doc, head.start, head.end, head.prefix)
+}
+
+// parseRefSpan decodes one reference body from the document. A typed fault
+// and an unknown read mode fail with the setting key and the file position,
+// not a fragment the decoder created.
+func parseRefSpan(doc []byte, start, end int, prefix []string) error {
+	if start < 0 || end > len(doc) || start >= end {
+		return nil
+	}
+	line, col, _ := fragmentAt(doc, start)
+	scan := refScan{
+		doc:      doc,
+		key:      strings.Join(prefix, "."),
+		fragLine: line,
+		fragCol:  col,
+		found:    true,
+	}
+	_, err := parseRefs(doc[start:end], scan)
+	return err
+}
+
+// parseRefAssignment reads the value of one assignment as a reference body.
+func parseRefAssignment(
+	kv *unstable.Node,
+	parser *unstable.Parser,
+	doc []byte,
+	prefix []string,
+) error {
+	start, end, ok := valueSpan(parser, kv, doc)
 	if !ok {
 		return nil
 	}
-	value := expr.Value()
-	switch value.Kind {
-	case unstable.InlineTable:
-		return checkRefInlineTable(target, prefix, value, parser, doc)
-	case unstable.Array:
-		return checkRefArray(target, prefix, value, parser, doc)
-	default:
-		return nil
-	}
+	return parseRefSpan(doc, start, end, prefix)
 }
 
 // tableParts joins the enclosing table header with the assignment key
@@ -813,23 +907,67 @@ func secretField(node reflect.Type, part string) (reflect.StructField, string, b
 	return reflect.StructField{}, "", false
 }
 
-// checkRefInlineTable validates the locator keys of one inline table
-// reference. An unknown key fails with the setting key and the position
-// in the file.
+// checkRefInlineValue walks the children of one inline table that is not
+// itself a secret. A child that is a secret is checked as a reference. A
+// child that is a list is checked as a list of references. A child that is
+// itself an inline table is walked again with the path extended by its key.
+func checkRefInlineValue(
+	t reflect.Type,
+	parts []string,
+	value *unstable.Node,
+	parser *unstable.Parser,
+	doc []byte,
+) error {
+	children := value.Children()
+	for children.Next() {
+		child := children.Node()
+		if child.Kind != unstable.KeyValue {
+			continue
+		}
+		childParts := tableParts(parts, child)
+		childValue := child.Value()
+		target, prefix, _, ok := secretTarget(t, childParts)
+		if ok && target == secretType {
+			if childValue.Kind == unstable.InlineTable {
+				if err := checkRefInlineTable(target, prefix, child, parser, doc); err != nil {
+					return err
+				}
+			}
+			continue
+		}
+		if ok && childValue.Kind == unstable.Array {
+			if err := checkRefArray(target, prefix, child, parser, doc); err != nil {
+				return err
+			}
+			continue
+		}
+		if childValue.Kind == unstable.InlineTable {
+			if err := checkRefInlineValue(t, childParts, childValue, parser, doc); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// checkRefInlineTable validates one inline table reference. An unknown
+// locator key, a locator of the wrong type, and an unknown read mode fail
+// with the setting key and the position in the file.
 func checkRefInlineTable(
 	target reflect.Type,
 	prefix []string,
-	value *unstable.Node,
+	kv *unstable.Node,
 	parser *unstable.Parser,
 	doc []byte,
 ) error {
 	if target != secretType {
 		return nil
 	}
+	value := kv.Value()
 	children := value.Children()
 	for children.Next() {
-		kv := children.Node()
-		name, row, col := keyNameAt(kv, parser, doc)
+		child := children.Node()
+		name, row, col := keyNameAt(child, parser, doc)
 		if !isRefDocKey(name) {
 			return fmt.Errorf(
 				"%w: %sunknown key %q at line %d, column %d",
@@ -841,22 +979,24 @@ func checkRefInlineTable(
 			)
 		}
 	}
-	return nil
+	return parseRefAssignment(kv, parser, doc, prefix)
 }
 
 // checkRefArray validates the locator keys of each inline table in one
 // inline array. Each element is one ordered reference, so an unknown key
-// fails with the setting key and the position in the file.
+// fails with the setting key and the position in the file. The array body
+// is then read, so a typed fault and an unknown read mode fail the same way.
 func checkRefArray(
 	target reflect.Type,
 	prefix []string,
-	value *unstable.Node,
+	kv *unstable.Node,
 	parser *unstable.Parser,
 	doc []byte,
 ) error {
 	if !isSecretList(target) {
 		return nil
 	}
+	value := kv.Value()
 	children := value.Children()
 	for children.Next() {
 		elem := children.Node()
@@ -868,8 +1008,8 @@ func checkRefArray(
 		}
 		tables := elem.Children()
 		for tables.Next() {
-			kv := tables.Node()
-			name, row, col := keyNameAt(kv, parser, doc)
+			child := tables.Node()
+			name, row, col := keyNameAt(child, parser, doc)
 			if !isRefDocKey(name) {
 				return fmt.Errorf(
 					"%w: %sunknown key %q at line %d, column %d",
@@ -882,7 +1022,7 @@ func checkRefArray(
 			}
 		}
 	}
-	return nil
+	return parseRefAssignment(kv, parser, doc, prefix)
 }
 
 // keyNameAt reads one key and its position in the file. The parser reports

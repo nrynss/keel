@@ -251,7 +251,9 @@ func looksLikeValue(raw []byte) bool {
 
 // refError turns a parser failure inside a reference into a message that
 // names the setting key and places every offending key at its position in
-// the document. A failure with no position keeps the text the parser wrote.
+// the document. The scan carries the setting key and the file position,
+// including a secret the decoder creates. A failure with no position keeps
+// the text the parser wrote.
 func refError(err error, scan refScan) error {
 	key := ""
 	if scan.key != "" {
@@ -307,10 +309,11 @@ func fragmentLead(raw []byte, line, col int) (int, int) {
 // locateFragment finds the raw value bytes in the document, so a failure can
 // report where the setting sits in the file. It looks behind the table
 // header or the key the setting is written under first, then for the value
-// alone. A match must start its own line, because the same text inside a
-// comment or a string is not the setting. One that shares a line with
-// something else is taken only when no line carries the text alone. It
-// reports false when the bytes cannot be found at all.
+// alone. A match must start its own line, after any leading blanks and
+// header brackets. A line inside a comment or a multi-line string is not
+// the setting. One that shares a line with something else is taken only
+// when no line carries the text alone. It reports false when the bytes
+// cannot be found at all.
 func locateFragment(scan refScan, raw []byte) (int, int, bool) {
 	if len(scan.doc) == 0 || len(raw) == 0 {
 		return 0, 0, false
@@ -330,7 +333,8 @@ func locateFragment(scan refScan, raw []byte) (int, int, bool) {
 }
 
 // lineStart finds the first occurrence of needle that starts a line after
-// any leading blanks and header brackets.
+// any leading blanks and header brackets, and that does not sit inside a
+// string.
 func lineStart(doc, needle []byte) (int, bool) {
 	for from := 0; ; {
 		at := bytes.Index(doc[from:], needle)
@@ -338,11 +342,75 @@ func lineStart(doc, needle []byte) (int, bool) {
 			return 0, false
 		}
 		at += from
-		if leadIsBlank(doc, at) {
+		if leadIsBlank(doc, at) && !insideString(doc, at) {
 			return at, true
 		}
 		from = at + 1
 	}
+}
+
+// insideString reports whether at sits inside a string, so a line inside a
+// multi-line string is not taken for the setting. It tracks the lexical
+// states the document can be in, including the multi-line delimiters.
+func insideString(doc []byte, at int) bool {
+	const (
+		plain = iota
+		basic
+		literal
+		multiBasic
+		multiLiteral
+		comment
+	)
+	state := plain
+	for i := 0; i < at && i < len(doc); i++ {
+		c := doc[i]
+		switch state {
+		case comment:
+			if c == '\n' {
+				state = plain
+			}
+		case basic:
+			switch c {
+			case '\\':
+				i++
+			case '"':
+				state = plain
+			}
+		case literal:
+			if c == '\'' {
+				state = plain
+			}
+		case multiBasic:
+			switch {
+			case c == '\\':
+				i++
+			case bytes.HasPrefix(doc[i:], []byte(`"""`)):
+				state = plain
+				i += 2
+			}
+		case multiLiteral:
+			if bytes.HasPrefix(doc[i:], []byte("'''")) {
+				state = plain
+				i += 2
+			}
+		default:
+			switch {
+			case c == '#':
+				state = comment
+			case bytes.HasPrefix(doc[i:], []byte(`"""`)):
+				state = multiBasic
+				i += 2
+			case bytes.HasPrefix(doc[i:], []byte("'''")):
+				state = multiLiteral
+				i += 2
+			case c == '"':
+				state = basic
+			case c == '\'':
+				state = literal
+			}
+		}
+	}
+	return state != plain && state != comment
 }
 
 // leadIsBlank reports whether only blanks and header brackets sit between

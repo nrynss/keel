@@ -970,3 +970,80 @@ func TestDecodePositionIgnoresRepeatedText(t *testing.T) {
 		t.Errorf("err = %v, want the fault %s", err, want)
 	}
 }
+
+// nestedOuterRows holds a list inside an array table that itself sits
+// inside another array table. Each outer row has its own nested list.
+type nestedOuterRows struct {
+	Outer []struct {
+		Inner []struct {
+			Keys []Secret `toml:"keys"`
+		} `toml:"inner"`
+	} `toml:"outer"`
+}
+
+// TestDecodeNestedListInTwoOuterRows pins two outer rows that each hold a
+// nested list. A new outer element restarts the nested list index, so the
+// second row keeps the references the document wrote.
+func TestDecodeNestedListInTwoOuterRows(t *testing.T) {
+	doc := "[[outer]]\n[[outer.inner]]\nkeys = " + twoRefs + "\n" +
+		"[[outer]]\n[[outer.inner]]\nkeys = [{source = \"env\", var = \"B\"}]\n"
+	var got nestedOuterRows
+	if err := Decode([]byte(doc), &got, stubRegistry(t)); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if len(got.Outer) != 2 {
+		t.Fatalf("got %d outer rows, want 2", len(got.Outer))
+	}
+	if len(got.Outer[0].Inner) != 1 || len(got.Outer[0].Inner[0].Keys) != 2 {
+		t.Fatalf("row 0 = %+v, want two references", got.Outer[0])
+	}
+	if len(got.Outer[1].Inner) != 1 || len(got.Outer[1].Inner[0].Keys) != 1 {
+		t.Fatalf("row 1 = %+v, want one reference", got.Outer[1])
+	}
+	ref := got.Outer[1].Inner[0].Keys[0].refs
+	if len(ref) != 1 || ref[0].Source() != "env" || ref[0].Var() != "B" {
+		t.Errorf("row 1 reference = %+v, want env B", ref)
+	}
+}
+
+// TestDecodeTypedFaultOnFreshSliceNamesKey pins a locator of the wrong type
+// on a fresh array of tables. The message names the field key and the file
+// line, not a fragment line, and it carries no element index.
+func TestDecodeTypedFaultOnFreshSliceNamesKey(t *testing.T) {
+	filler := strings.Repeat("# filler line, the file is not empty\n", 3)
+	doc := filler + "[[key]]\nsource = \"env\"\nvar = 1\n"
+	at := strings.Index(doc, "var = 1")
+	line := 1 + strings.Count(doc[:at], "\n")
+	var got sliceSecrets
+	err := Decode([]byte(doc), &got, stubRegistry(t))
+	if !errors.Is(err, ErrInvalidRef) {
+		t.Fatalf("err = %v, want ErrInvalidRef", err)
+	}
+	if !strings.Contains(err.Error(), "key: ") {
+		t.Errorf("error does not name the key: %v", err)
+	}
+	if strings.Contains(err.Error(), "key.0") {
+		t.Errorf("error carries an element index: %v", err)
+	}
+	want := fmt.Sprintf("at line %d,", line)
+	if !strings.Contains(err.Error(), want) {
+		t.Errorf("err = %v, want the fault %s", err, want)
+	}
+}
+
+// TestDecodeUnknownReadModeOnFreshMapNamesKey pins an unknown read mode on
+// a fresh map value. The message names the map entry key.
+func TestDecodeUnknownReadModeOnFreshMapNamesKey(t *testing.T) {
+	doc := "[secrets]\nk = {source = \"env\", read = \"sometimes\"}\n"
+	var got mapSecrets
+	err := Decode([]byte(doc), &got, stubRegistry(t))
+	if !errors.Is(err, ErrInvalidRef) {
+		t.Fatalf("err = %v, want ErrInvalidRef", err)
+	}
+	if !strings.Contains(err.Error(), "secrets.k") {
+		t.Errorf("error does not name the map entry: %v", err)
+	}
+	if !strings.Contains(err.Error(), `unknown read mode "sometimes"`) {
+		t.Errorf("error does not name the read mode: %v", err)
+	}
+}
