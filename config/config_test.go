@@ -1321,6 +1321,54 @@ func TestDecodeNestedSecretArrayLocatorTypo(t *testing.T) {
 	}
 }
 
+// TestDecodeNestedSecretListCommentBracket pins a nested secret list whose
+// comment holds a closing bracket after the first inner table. Decode
+// keeps both references.
+func TestDecodeNestedSecretListCommentBracket(t *testing.T) {
+	doc := `rows = [[
+  {source = "env", var = "A"}, # note: ]
+  {source = "file", path = "/x"}
+]]
+`
+	var got struct {
+		Rows [][]Secret `toml:"rows"`
+	}
+	if err := Decode([]byte(doc), &got, stubRegistry(t)); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if len(got.Rows) != 1 {
+		t.Fatalf("got %d outer rows, want 1", len(got.Rows))
+	}
+	keys := got.Rows[0]
+	if len(keys) != 2 {
+		t.Fatalf("got %+v, want two references", keys)
+	}
+	first := keys[0].refs
+	second := keys[1].refs
+	if len(first) != 1 || first[0].Source() != "env" || len(second) != 1 || second[0].Source() != "file" {
+		t.Errorf("rows = %+v, want env then file", keys)
+	}
+}
+
+// TestDecodeNestedSecretListEmptyInner pins an empty inner list on a nested
+// secret list. Decode refuses it as an empty reference list and names rows.
+func TestDecodeNestedSecretListEmptyInner(t *testing.T) {
+	doc := "rows = [[]]\n"
+	var got struct {
+		Rows [][]Secret `toml:"rows"`
+	}
+	err := Decode([]byte(doc), &got, stubRegistry(t))
+	if !errors.Is(err, ErrInvalidRef) {
+		t.Fatalf("err = %v, want ErrInvalidRef", err)
+	}
+	if !strings.Contains(err.Error(), "rows: empty reference list") {
+		t.Errorf("err = %v, want it to contain %q", err, "rows: empty reference list")
+	}
+	if strings.Contains(err.Error(), "rows.0") {
+		t.Errorf("error carries an element index: %v", err)
+	}
+}
+
 // TestDecodeMapNestedSecretList pins a nested secret list written as a map
 // value. The inner list decodes in document order.
 func TestDecodeMapNestedSecretList(t *testing.T) {

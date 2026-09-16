@@ -363,9 +363,9 @@ func stashInlineTable(
 
 // stashInlineArray records secret lists written inside an inline array of
 // structs, maps, or nested arrays. An array element that is a secret list
-// is recorded at the settled path. Other elements are walked with their
-// index on the path, so a nested list is recorded at the slice the
-// decoder fills.
+// is recorded at the settled path. An empty inner list is refused. Other
+// elements are walked with their index on the path, so a nested list is
+// recorded at the slice the decoder fills.
 func stashInlineArray(
 	t reflect.Type,
 	parts []string,
@@ -408,7 +408,8 @@ func stashInlineArray(
 
 // stashNestedSecretList records one secret list written as an array
 // element. go-toml leaves Array.Raw unset, so the span is rebuilt from
-// the first child back to the opening bracket.
+// the first child back to the opening bracket. An empty inner list has
+// no child and is refused as an empty reference list.
 func stashNestedSecretList(
 	target reflect.Type,
 	prefix []string,
@@ -419,7 +420,7 @@ func stashNestedSecretList(
 ) error {
 	start, end, ok := nestedArraySpan(elem, doc)
 	if !ok {
-		return nil
+		return fmt.Errorf("%w: %sempty reference list", ErrInvalidRef, secretPath(prefix))
 	}
 	refs, err := parseArraySpan(doc, start, end, prefix)
 	if err != nil {
@@ -1066,9 +1067,10 @@ func checkRefInlineValue(
 
 // checkRefInlineArray walks an array that is not itself a secret list.
 // An array element that is a secret list is checked as a list of
-// references. An inline table element is walked as a struct or a map.
-// Any other array element is walked again with its index on the path.
-// The index never joins a setting-key message.
+// references. An empty inner list is refused. An inline table element is
+// walked as a struct or a map. Any other array element is walked again
+// with its index on the path. The index never joins a setting-key
+// message.
 func checkRefInlineArray(
 	t reflect.Type,
 	parts []string,
@@ -1110,7 +1112,9 @@ func checkRefInlineArray(
 
 // nestedArraySpan returns the document span of an array node whose parser
 // range is empty. go-toml leaves Array.Raw unset, so the span is rebuilt
-// from the first child's offset back to '[' and a matching close.
+// from the first child's offset back to '[' and a matching close. A
+// comment does not change that close. An empty inner list has no child,
+// so the rebuild returns false.
 func nestedArraySpan(elem *unstable.Node, doc []byte) (int, int, bool) {
 	if elem.Raw.Length > 0 {
 		start := int(elem.Raw.Offset)
@@ -1147,7 +1151,8 @@ func nestedArraySpan(elem *unstable.Node, doc []byte) (int, int, bool) {
 }
 
 // matchListEnd returns the index after the ']' that closes the list at
-// start. Brackets inside a quoted string do not change the depth.
+// start. Brackets inside a quoted string do not change the depth. A
+// comment runs from '#' to the next newline and does not change the depth.
 func matchListEnd(doc []byte, start int) int {
 	depth := 0
 	var quote byte
@@ -1168,6 +1173,10 @@ func matchListEnd(doc []byte, start int) int {
 			}
 		case c == '"' || c == '\'':
 			quote = c
+		case c == '#':
+			for i+1 < len(doc) && doc[i+1] != '\n' {
+				i++
+			}
 		case c == '[':
 			depth++
 		case c == ']':
@@ -1182,7 +1191,8 @@ func matchListEnd(doc []byte, start int) int {
 
 // checkNestedSecretArray checks locator keys of a secret list written as
 // an array element, then reads the list body so a typed fault and an
-// unknown read mode name the setting.
+// unknown read mode name the setting. An empty inner list is refused as
+// an empty reference list.
 func checkNestedSecretArray(prefix []string, elem *unstable.Node, parser *unstable.Parser, doc []byte) error {
 	inner := elem.Children()
 	for inner.Next() {
@@ -1211,7 +1221,7 @@ func checkNestedSecretArray(prefix []string, elem *unstable.Node, parser *unstab
 	}
 	start, end, ok := nestedArraySpan(elem, doc)
 	if !ok {
-		return nil
+		return fmt.Errorf("%w: %sempty reference list", ErrInvalidRef, secretPath(prefix))
 	}
 	return parseRefSpan(doc, start, end, prefix)
 }
