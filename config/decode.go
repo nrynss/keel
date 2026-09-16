@@ -362,8 +362,8 @@ func stashInlineTable(
 }
 
 // stashInlineArray records secret lists written inside an inline array of
-// structs. Each inline table is walked with its element index on the path,
-// so a nested list is recorded at the slice the decoder fills.
+// structs, maps, or nested arrays. Each element is walked with its index
+// on the path, so a nested list is recorded at the slice the decoder fills.
 func stashInlineArray(
 	t reflect.Type,
 	parts []string,
@@ -379,12 +379,18 @@ func stashInlineArray(
 		if elem.Kind == unstable.Comment {
 			continue
 		}
-		if elem.Kind != unstable.InlineTable {
-			continue
-		}
 		elemParts := appendPath(parts, strconv.Itoa(i))
-		if err := stashInlineTable(t, elemParts, elem, parser, doc, found); err != nil {
-			return err
+		switch elem.Kind {
+		case unstable.InlineTable:
+			if err := stashInlineTable(t, elemParts, elem, parser, doc, found); err != nil {
+				return err
+			}
+		case unstable.Array:
+			if err := stashInlineArray(t, elemParts, elem, parser, doc, found); err != nil {
+				return err
+			}
+		default:
+			continue
 		}
 		i++
 	}
@@ -694,9 +700,9 @@ func checkRefTableBody(t reflect.Type, table []string, pending *[]pendingTable) 
 
 // checkRefKeyValue checks one assignment against the settings type. A secret
 // written as an inline table or an inline array of references is read here.
-// An inline table or an inline array of structs is walked even when its own
-// path is not a secret. A locator typo inside it still names the setting
-// and the file position.
+// An inline table, an inline array of structs, a list of maps, or a nested
+// array is walked even when its own path is not a secret. A locator typo
+// inside it names the setting and the file position.
 func checkRefKeyValue(
 	t reflect.Type,
 	table []string,
@@ -860,9 +866,10 @@ func secretTarget(t reflect.Type, parts []string) (reflect.Type, []string, []str
 
 // secretStep consumes one document key part. A struct answers with the
 // field behind that part, a map answers with its entry shape, and a list
-// answers with its element shape for an index part. The field or entry
-// type is kept whole, so a map of secrets still resolves after the entry
-// name.
+// answers with its element shape for an index part. The element is a
+// struct, a map, a list, or a Secret, after pointers are followed. The
+// field or entry type is kept whole, so a map of secrets still resolves
+// after the entry name.
 //
 // It returns the message name for the part, which is empty for an element
 // index, and the settled name, which is the field key, the entry name or
@@ -891,7 +898,8 @@ func secretStep(node reflect.Type, part string) (reflect.Type, string, string, b
 		for elem.Kind() == reflect.Pointer {
 			elem = elem.Elem()
 		}
-		if elem == secretType || elem.Kind() == reflect.Struct {
+		switch elem.Kind() {
+		case reflect.Struct, reflect.Map, reflect.Slice, reflect.Array:
 			return elem, "", part, true
 		}
 		return nil, "", "", false
@@ -961,8 +969,8 @@ func secretField(node reflect.Type, part string) (reflect.StructField, string, b
 // itself a secret. A child that is a secret is checked as a reference,
 // whether it is an inline table or an inline array. A child that is a list
 // of secrets is checked as a list of references. A child that is an inline
-// table or an inline array of structs is walked again with the path extended
-// by its key or element index.
+// table, an inline array of structs, or a nested array is walked again
+// with the path extended by its key or element index.
 func checkRefInlineValue(
 	t reflect.Type,
 	parts []string,
@@ -1013,9 +1021,10 @@ func checkRefInlineValue(
 	return nil
 }
 
-// checkRefInlineArray walks each inline table of an array that is not a
-// secret list. The element index is appended to the path so the type walk
-// can consume the slice. The index never joins a setting-key message.
+// checkRefInlineArray walks an array that is not a secret list. An inline
+// table element is walked as a struct or a map. An array element is walked
+// again with its index on the path so the type walk can consume the list.
+// The index never joins a setting-key message.
 func checkRefInlineArray(
 	t reflect.Type,
 	parts []string,
@@ -1030,12 +1039,18 @@ func checkRefInlineArray(
 		if elem.Kind == unstable.Comment {
 			continue
 		}
-		if elem.Kind != unstable.InlineTable {
-			continue
-		}
 		elemParts := appendPath(parts, strconv.Itoa(i))
-		if err := checkRefInlineValue(t, elemParts, elem, parser, doc); err != nil {
-			return err
+		switch elem.Kind {
+		case unstable.InlineTable:
+			if err := checkRefInlineValue(t, elemParts, elem, parser, doc); err != nil {
+				return err
+			}
+		case unstable.Array:
+			if err := checkRefInlineArray(t, elemParts, elem, parser, doc); err != nil {
+				return err
+			}
+		default:
+			continue
 		}
 		i++
 	}
