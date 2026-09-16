@@ -2,7 +2,10 @@ module github.com/nrynss/keel
 
 go 1.27.1
 
-require modernc.org/sqlite v1.58.0
+require (
+	github.com/pelletier/go-toml/v2 v2.4.3
+	modernc.org/sqlite v1.58.0
+)
 
 require (
 	github.com/dustin/go-humanize v1.0.1 // indirect

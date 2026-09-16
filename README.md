@@ -34,6 +34,7 @@ if you use it. Everything else is pure Go, and `CGO_ENABLED=0` builds the whole 
 | `sqlite` | One SQLite file with WAL, a writer handle, a read-only reader pool, namespaced migrations and online backup |
 | `ffmpeg` | ffmpeg and ffprobe bound to a context, with a bounded wait on shutdown |
 | `cost` | Money as integer nanodollars, a ledger of charges, and a budget that refuses before a call |
+| `config` | TOML settings, and secret references that resolve from the environment, a file, a directory or a command, never holding a value in the file |
 
 The stores that need SQLite live one directory down, in `job/sqlitestore`,
 `mediastore/sqlitestore` and `cost/sqlitestore`. Only those packages import a SQLite driver, so an

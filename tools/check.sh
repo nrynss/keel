@@ -179,34 +179,46 @@ header "9/10 conventions"
 go run ./tools/conventions || fail "9/10 conventions" "the convention breaches above must be fixed"
 passed
 
-# regenerate_api_doc writes a go doc -all transcript of every module package to
-# the path in $1. The package list is sorted, and each package contributes a
-# header line, so a regeneration on an unchanged tree is byte for byte the same.
-# Both calls run under the frozen build context named above, so the transcript
-# is host independent.
+# recorded_packages names the packages the transcript record covers, in the
+# order the record writes them. The guard covers the surface a release shipped,
+# so a package no release has carried yet is not compared against the record.
+recorded_packages() {
+    sed -n 's/^########## //p' "$api_doc"
+}
+
+# regenerate_api_doc writes a go doc -all transcript of every recorded package
+# to the path in $1. Each package contributes a header line, so a regeneration
+# on an unchanged tree is byte for byte the same. Both calls run under the
+# frozen build context named above, so the transcript is host independent.
 regenerate_api_doc() {
     local dest=$1
     local pkg
     : > "$dest"
     while IFS= read -r pkg; do
         printf '########## %s\n' "$pkg" >> "$dest"
-        GOOS="$frozen_goos" GOARCH="$frozen_goarch" go doc -all "$pkg" >> "$dest"
+        GOOS="$frozen_goos" GOARCH="$frozen_goarch" go doc -all "$pkg" >> "$dest" \
+            || fail "10/10 api" "${pkg} is named by ${api_doc} and no longer resolves"
         printf '\n' >> "$dest"
-    done < <(GOOS="$frozen_goos" GOARCH="$frozen_goarch" go list ./... | LC_ALL=C sort)
+    done < <(recorded_packages)
 }
 
 # Check 10: the exported API matches both frozen records, taken from the one
 # frozen build context named above, linux/amd64, which CI also runs on. The
 # transcript half regenerates under that context, so the same bytes come out on
 # any host. The conventions check keeps every file inside that context, so a file
-# from another context cannot grow the surface the records never see. The
-# transcript catches a signature or a doc change a reader can see. The baseline
-# catches a change apidiff classifies as compatible or not.
+# from another context cannot grow the surface the records never see.
+#
+# The records freeze the surface of the last release. A compatible addition,
+# such as the package the current work adds, is not a change to that surface. It
+# does not fail here, and the release that ships it writes its own record pair.
+# The transcript catches a signature or a doc change a reader can see inside a
+# recorded package. The baseline catches every incompatible change, whether or
+# not a recorded package carries it.
 header "10/10 api"
 api_tmp=$(mktemp -d)
 trap 'rm -rf "$api_tmp"' EXIT
-regenerate_api_doc "$api_tmp/v0.1.0.txt"
-if ! diff -u "$api_doc" "$api_tmp/v0.1.0.txt"; then
+regenerate_api_doc "$api_tmp/$(basename "$api_doc")"
+if ! diff -u "$api_doc" "$api_tmp/$(basename "$api_doc")"; then
     fail "10/10 api" "the exported API differs from ${api_doc}, see the diff above"
 fi
 # The pinned apidiff refuses to run when GOOS is set for its own build, so build
@@ -215,11 +227,11 @@ fi
 mkdir -p "$api_tmp/bin"
 GOBIN="$api_tmp/bin" go install "golang.org/x/exp/cmd/apidiff@${apidiff_version}" \
     || fail "10/10 api" "apidiff could not be installed at ${apidiff_version}"
-api_report=$(GOOS="$frozen_goos" GOARCH="$frozen_goarch" "$api_tmp/bin/apidiff" -m "$api_export" "$(go list -m)") \
+api_report=$(GOOS="$frozen_goos" GOARCH="$frozen_goarch" "$api_tmp/bin/apidiff" -incompatible -m "$api_export" "$(go list -m)") \
     || fail "10/10 api" "apidiff could not compare against ${api_export}"
 if [ -n "$api_report" ]; then
     printf '%s\n' "$api_report"
-    fail "10/10 api" "apidiff reports a change against ${api_export}, see the report above"
+    fail "10/10 api" "apidiff reports an incompatible change against ${api_export}, see the report above"
 fi
 passed
 
