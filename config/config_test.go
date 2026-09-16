@@ -1238,3 +1238,110 @@ func TestDecodeNestedArrayNestedList(t *testing.T) {
 		t.Errorf("keys = %+v, want env then file", keys)
 	}
 }
+
+// TestDecodeNestedSecretListLocatorTypo pins a locator typo on a nested
+// secret list written as an array element. The message names rows and the
+// file line, and carries no element index.
+func TestDecodeNestedSecretListLocatorTypo(t *testing.T) {
+	filler := strings.Repeat("# filler line, the file is not empty\n", 3)
+	doc := filler + "rows = [[{source = \"env\", vr = \"A\"}]]\n"
+	at := strings.Index(doc, "vr")
+	if at < 0 {
+		t.Fatalf("vr is not in the document")
+	}
+	line := 1 + strings.Count(doc[:at], "\n")
+	start := strings.LastIndexByte(doc[:at], '\n') + 1
+	column := at - start + 1
+	var got struct {
+		Rows [][]Secret `toml:"rows"`
+	}
+	err := Decode([]byte(doc), &got, stubRegistry(t))
+	if !errors.Is(err, ErrInvalidRef) {
+		t.Fatalf("err = %v, want ErrInvalidRef", err)
+	}
+	want := fmt.Sprintf("rows: unknown key %q at line %d, column %d", "vr", line, column)
+	if !strings.Contains(err.Error(), want) {
+		t.Errorf("err = %v, want it to contain %q", err, want)
+	}
+	if strings.Contains(err.Error(), "rows.0") {
+		t.Errorf("error carries an element index: %v", err)
+	}
+}
+
+// TestDecodeNestedSecretList pins a nested secret list written as an array
+// element. Each inner list decodes in document order.
+func TestDecodeNestedSecretList(t *testing.T) {
+	doc := "rows = [[{source = \"env\", var = \"A\"}, {source = \"file\", path = \"/x\"}]]\n"
+	var got struct {
+		Rows [][]Secret `toml:"rows"`
+	}
+	if err := Decode([]byte(doc), &got, stubRegistry(t)); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if len(got.Rows) != 1 {
+		t.Fatalf("got %d outer rows, want 1", len(got.Rows))
+	}
+	keys := got.Rows[0]
+	if len(keys) != 2 {
+		t.Fatalf("got %+v, want two references", keys)
+	}
+	first := keys[0].refs
+	second := keys[1].refs
+	if len(first) != 1 || first[0].Source() != "env" || len(second) != 1 || second[0].Source() != "file" {
+		t.Errorf("rows = %+v, want env then file", keys)
+	}
+}
+
+// TestDecodeNestedSecretArrayLocatorTypo pins a locator typo on a nested
+// fixed size secret list. The message names rows, not rows.0.0, and
+// carries no element index.
+func TestDecodeNestedSecretArrayLocatorTypo(t *testing.T) {
+	filler := strings.Repeat("# filler line, the file is not empty\n", 3)
+	doc := filler + "rows = [[{source = \"env\", vr = \"A\"}, {source = \"file\", path = \"/x\"}], [{source = \"env\", var = \"B\"}, {source = \"file\", path = \"/y\"}]]\n"
+	at := strings.Index(doc, "vr")
+	if at < 0 {
+		t.Fatalf("vr is not in the document")
+	}
+	line := 1 + strings.Count(doc[:at], "\n")
+	start := strings.LastIndexByte(doc[:at], '\n') + 1
+	column := at - start + 1
+	var got struct {
+		Rows [2][2]Secret `toml:"rows"`
+	}
+	err := Decode([]byte(doc), &got, stubRegistry(t))
+	if !errors.Is(err, ErrInvalidRef) {
+		t.Fatalf("err = %v, want ErrInvalidRef", err)
+	}
+	want := fmt.Sprintf("rows: unknown key %q at line %d, column %d", "vr", line, column)
+	if !strings.Contains(err.Error(), want) {
+		t.Errorf("err = %v, want it to contain %q", err, want)
+	}
+	if strings.Contains(err.Error(), "rows.0") {
+		t.Errorf("error carries an element index: %v", err)
+	}
+}
+
+// TestDecodeMapNestedSecretList pins a nested secret list written as a map
+// value. The inner list decodes in document order.
+func TestDecodeMapNestedSecretList(t *testing.T) {
+	doc := "groups = { a = [[{source = \"env\", var = \"A\"}, {source = \"file\", path = \"/x\"}]] }\n"
+	var got struct {
+		Groups map[string][][]Secret `toml:"groups"`
+	}
+	if err := Decode([]byte(doc), &got, stubRegistry(t)); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	inner := got.Groups["a"]
+	if len(inner) != 1 {
+		t.Fatalf("got %+v, want one inner list", got.Groups)
+	}
+	keys := inner[0]
+	if len(keys) != 2 {
+		t.Fatalf("got %+v, want two references", keys)
+	}
+	first := keys[0].refs
+	second := keys[1].refs
+	if len(first) != 1 || first[0].Source() != "env" || len(second) != 1 || second[0].Source() != "file" {
+		t.Errorf("groups.a = %+v, want env then file", keys)
+	}
+}

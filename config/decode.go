@@ -362,8 +362,10 @@ func stashInlineTable(
 }
 
 // stashInlineArray records secret lists written inside an inline array of
-// structs, maps, or nested arrays. Each element is walked with its index
-// on the path, so a nested list is recorded at the slice the decoder fills.
+// structs, maps, or nested arrays. An array element that is a secret list
+// is recorded at the settled path. Other elements are walked with their
+// index on the path, so a nested list is recorded at the slice the
+// decoder fills.
 func stashInlineArray(
 	t reflect.Type,
 	parts []string,
@@ -386,6 +388,13 @@ func stashInlineArray(
 				return err
 			}
 		case unstable.Array:
+			target, prefix, settled, ok := secretTarget(t, elemParts)
+			if ok && isSecretList(target) {
+				if err := stashNestedSecretList(target, prefix, settled, elem, doc, found); err != nil {
+					return err
+				}
+				break
+			}
 			if err := stashInlineArray(t, elemParts, elem, parser, doc, found); err != nil {
 				return err
 			}
@@ -394,6 +403,38 @@ func stashInlineArray(
 		}
 		i++
 	}
+	return nil
+}
+
+// stashNestedSecretList records one secret list written as an array
+// element. go-toml leaves Array.Raw unset, so the span is rebuilt from
+// the first child back to the opening bracket.
+func stashNestedSecretList(
+	target reflect.Type,
+	prefix []string,
+	settled []string,
+	elem *unstable.Node,
+	doc []byte,
+	found *[]secretArray,
+) error {
+	start, end, ok := nestedArraySpan(elem, doc)
+	if !ok {
+		return nil
+	}
+	refs, err := parseArraySpan(doc, start, end, prefix)
+	if err != nil {
+		return err
+	}
+	if target.Kind() == reflect.Array && target.Len() != len(refs) {
+		return fmt.Errorf(
+			"%w: %s: the setting holds %d, the document writes %d references",
+			ErrInvalidRef,
+			strings.Join(prefix, "."),
+			target.Len(),
+			len(refs),
+		)
+	}
+	*found = append(*found, secretArray{key: settled, refs: refs, start: start, end: end})
 	return nil
 }
 
@@ -701,7 +742,8 @@ func checkRefTableBody(t reflect.Type, table []string, pending *[]pendingTable) 
 // checkRefKeyValue checks one assignment against the settings type. A secret
 // written as an inline table or an inline array of references is read here.
 // An inline table, an inline array of structs, a list of maps, or a nested
-// array is walked even when its own path is not a secret. A locator typo
+// array is walked even when its own path is not a secret. A nested secret
+// list sitting as an array element is checked the same way. A locator typo
 // inside it names the setting and the file position.
 func checkRefKeyValue(
 	t reflect.Type,
@@ -970,7 +1012,8 @@ func secretField(node reflect.Type, part string) (reflect.StructField, string, b
 // whether it is an inline table or an inline array. A child that is a list
 // of secrets is checked as a list of references. A child that is an inline
 // table, an inline array of structs, or a nested array is walked again
-// with the path extended by its key or element index.
+// with the path extended by its key or element index. A nested array that
+// holds a secret list is checked as that list.
 func checkRefInlineValue(
 	t reflect.Type,
 	parts []string,
@@ -1021,9 +1064,10 @@ func checkRefInlineValue(
 	return nil
 }
 
-// checkRefInlineArray walks an array that is not a secret list. An inline
-// table element is walked as a struct or a map. An array element is walked
-// again with its index on the path so the type walk can consume the list.
+// checkRefInlineArray walks an array that is not itself a secret list.
+// An array element that is a secret list is checked as a list of
+// references. An inline table element is walked as a struct or a map.
+// Any other array element is walked again with its index on the path.
 // The index never joins a setting-key message.
 func checkRefInlineArray(
 	t reflect.Type,
@@ -1046,6 +1090,13 @@ func checkRefInlineArray(
 				return err
 			}
 		case unstable.Array:
+			target, prefix, _, ok := secretTarget(t, elemParts)
+			if ok && isSecretList(target) {
+				if err := checkNestedSecretArray(prefix, elem, parser, doc); err != nil {
+					return err
+				}
+				break
+			}
 			if err := checkRefInlineArray(t, elemParts, elem, parser, doc); err != nil {
 				return err
 			}
@@ -1055,6 +1106,114 @@ func checkRefInlineArray(
 		i++
 	}
 	return nil
+}
+
+// nestedArraySpan returns the document span of an array node whose parser
+// range is empty. go-toml leaves Array.Raw unset, so the span is rebuilt
+// from the first child's offset back to '[' and a matching close.
+func nestedArraySpan(elem *unstable.Node, doc []byte) (int, int, bool) {
+	if elem.Raw.Length > 0 {
+		start := int(elem.Raw.Offset)
+		end := start + int(elem.Raw.Length)
+		if start >= 0 && end <= len(doc) && start < end {
+			return start, end, true
+		}
+	}
+	children := elem.Children()
+	var first *unstable.Node
+	for children.Next() {
+		n := children.Node()
+		if n.Kind == unstable.Comment {
+			continue
+		}
+		first = n
+		break
+	}
+	if first == nil || first.Raw.Length == 0 {
+		return 0, 0, false
+	}
+	start := int(first.Raw.Offset)
+	for start > 0 && doc[start] != '[' {
+		start--
+	}
+	if start >= len(doc) || doc[start] != '[' {
+		return 0, 0, false
+	}
+	end := matchListEnd(doc, start)
+	if end < 0 {
+		return 0, 0, false
+	}
+	return start, end, true
+}
+
+// matchListEnd returns the index after the ']' that closes the list at
+// start. Brackets inside a quoted string do not change the depth.
+func matchListEnd(doc []byte, start int) int {
+	depth := 0
+	var quote byte
+	for i := start; i < len(doc); i++ {
+		c := doc[i]
+		switch {
+		case quote == '"':
+			if c == '\\' {
+				i++
+				continue
+			}
+			if c == '"' {
+				quote = 0
+			}
+		case quote == '\'':
+			if c == '\'' {
+				quote = 0
+			}
+		case c == '"' || c == '\'':
+			quote = c
+		case c == '[':
+			depth++
+		case c == ']':
+			depth--
+			if depth == 0 {
+				return i + 1
+			}
+		}
+	}
+	return -1
+}
+
+// checkNestedSecretArray checks locator keys of a secret list written as
+// an array element, then reads the list body so a typed fault and an
+// unknown read mode name the setting.
+func checkNestedSecretArray(prefix []string, elem *unstable.Node, parser *unstable.Parser, doc []byte) error {
+	inner := elem.Children()
+	for inner.Next() {
+		it := inner.Node()
+		if it.Kind == unstable.Comment {
+			continue
+		}
+		if it.Kind != unstable.InlineTable {
+			continue
+		}
+		tables := it.Children()
+		for tables.Next() {
+			child := tables.Node()
+			name, row, col := keyNameAt(child, parser, doc)
+			if !isRefDocKey(name) {
+				return fmt.Errorf(
+					"%w: %sunknown key %q at line %d, column %d",
+					ErrInvalidRef,
+					secretPath(prefix),
+					name,
+					row,
+					col,
+				)
+			}
+		}
+	}
+	start, end, ok := nestedArraySpan(elem, doc)
+	if !ok {
+		return nil
+	}
+	return parseRefSpan(doc, start, end, prefix)
 }
 
 // checkRefInlineTable validates one inline table reference. An unknown
