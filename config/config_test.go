@@ -1047,3 +1047,83 @@ func TestDecodeUnknownReadModeOnFreshMapNamesKey(t *testing.T) {
 		t.Errorf("error does not name the read mode: %v", err)
 	}
 }
+
+// TestDecodeSecretArrayOnFreshMapNamesKey pins a locator typo on a Secret
+// written as an inline array inside a fresh map. The message names the map
+// entry and the file line.
+func TestDecodeSecretArrayOnFreshMapNamesKey(t *testing.T) {
+	filler := strings.Repeat("# filler line, the file is not empty\n", 3)
+	doc := filler + "[secrets]\nk = [{source = \"env\", vr = \"A\"}]\n"
+	at := strings.Index(doc, "vr")
+	if at < 0 {
+		t.Fatalf("vr is not in the document")
+	}
+	line := 1 + strings.Count(doc[:at], "\n")
+	var got mapSecrets
+	err := Decode([]byte(doc), &got, stubRegistry(t))
+	if !errors.Is(err, ErrInvalidRef) {
+		t.Fatalf("err = %v, want ErrInvalidRef", err)
+	}
+	if !strings.Contains(err.Error(), "secrets.k") {
+		t.Errorf("error does not name the map entry: %v", err)
+	}
+	want := fmt.Sprintf("at line %d,", line)
+	if !strings.Contains(err.Error(), want) {
+		t.Errorf("err = %v, want the key %s", err, want)
+	}
+}
+
+// TestDecodeInlineRowsNestedList pins an inline array of structs that holds
+// a nested secret list. The list decodes in document order.
+func TestDecodeInlineRowsNestedList(t *testing.T) {
+	doc := "rows = [{name = \"a\", keys = [{source = \"env\", var = \"A\"}, {source = \"file\", path = \"/x\"}]}]\n"
+	var got struct {
+		Rows []struct {
+			Name string   `toml:"name"`
+			Keys []Secret `toml:"keys"`
+		} `toml:"rows"`
+	}
+	if err := Decode([]byte(doc), &got, stubRegistry(t)); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if len(got.Rows) != 1 || len(got.Rows[0].Keys) != 2 {
+		t.Fatalf("got %+v, want two references", got.Rows)
+	}
+	first := got.Rows[0].Keys[0].refs
+	second := got.Rows[0].Keys[1].refs
+	if len(first) != 1 || first[0].Source() != "env" || len(second) != 1 || second[0].Source() != "file" {
+		t.Errorf("keys = %+v, want env then file", got.Rows[0].Keys)
+	}
+}
+
+// TestDecodeInlineRowsNestedSecretTypo pins a locator typo on a nested
+// Secret inside an inline array of structs. The message names rows.one and
+// carries no element index.
+func TestDecodeInlineRowsNestedSecretTypo(t *testing.T) {
+	filler := strings.Repeat("# filler line, the file is not empty\n", 3)
+	doc := filler + "rows = [{name = \"a\", one = {source = \"env\", vr = \"A\"}}]\n"
+	at := strings.Index(doc, "vr")
+	if at < 0 {
+		t.Fatalf("vr is not in the document")
+	}
+	line := 1 + strings.Count(doc[:at], "\n")
+	start := strings.LastIndexByte(doc[:at], '\n') + 1
+	column := at - start + 1
+	var got struct {
+		Rows []struct {
+			Name string `toml:"name"`
+			One  Secret `toml:"one"`
+		} `toml:"rows"`
+	}
+	err := Decode([]byte(doc), &got, stubRegistry(t))
+	if !errors.Is(err, ErrInvalidRef) {
+		t.Fatalf("err = %v, want ErrInvalidRef", err)
+	}
+	want := fmt.Sprintf("rows.one: unknown key %q at line %d, column %d", "vr", line, column)
+	if !strings.Contains(err.Error(), want) {
+		t.Errorf("err = %v, want it to contain %q", err, want)
+	}
+	if strings.Contains(err.Error(), "rows.0") {
+		t.Errorf("error carries an element index: %v", err)
+	}
+}

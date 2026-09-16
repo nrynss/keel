@@ -295,10 +295,10 @@ func valueSpan(parser *unstable.Parser, expr *unstable.Node, doc []byte) (int, i
 }
 
 // stashValue records the inline arrays written inside one assignment. The
-// value is the array itself, or an inline table holding one deeper, so the
-// walk descends an inline table until it reaches a list setting. A fixed
-// size array takes the references only when the document writes exactly
-// that many.
+// value is the array itself, an inline table holding one deeper, or an
+// inline array of structs holding one deeper. The walk descends until it
+// reaches a list setting. A fixed size array takes the references only when
+// the document writes exactly that many.
 func stashValue(
 	t reflect.Type,
 	parts []string,
@@ -309,43 +309,85 @@ func stashValue(
 ) error {
 	value := expr.Value()
 	if value.Kind == unstable.InlineTable {
-		children := value.Children()
-		for children.Next() {
-			child := children.Node()
-			if child.Kind != unstable.KeyValue {
-				continue
-			}
-			if err := stashValue(t, tableParts(parts, child), child, parser, doc, found); err != nil {
-				return err
-			}
-		}
-		return nil
+		return stashInlineTable(t, parts, value, parser, doc, found)
 	}
 	if value.Kind != unstable.Array {
 		return nil
 	}
 	target, prefix, settled, ok := secretTarget(t, parts)
-	if !ok || !isSecretList(target) {
+	if ok && isSecretList(target) {
+		start, end, ok := valueSpan(parser, expr, doc)
+		if !ok {
+			return nil
+		}
+		refs, err := parseArraySpan(doc, start, end, prefix)
+		if err != nil {
+			return err
+		}
+		if target.Kind() == reflect.Array && target.Len() != len(refs) {
+			return fmt.Errorf(
+				"%w: %s: the setting holds %d, the document writes %d references",
+				ErrInvalidRef,
+				strings.Join(prefix, "."),
+				target.Len(),
+				len(refs),
+			)
+		}
+		*found = append(*found, secretArray{key: settled, refs: refs, start: start, end: end})
 		return nil
 	}
-	start, end, ok := valueSpan(parser, expr, doc)
-	if !ok {
-		return nil
+	return stashInlineArray(t, parts, value, parser, doc, found)
+}
+
+// stashInlineTable records secret lists written inside one inline table.
+func stashInlineTable(
+	t reflect.Type,
+	parts []string,
+	value *unstable.Node,
+	parser *unstable.Parser,
+	doc []byte,
+	found *[]secretArray,
+) error {
+	children := value.Children()
+	for children.Next() {
+		child := children.Node()
+		if child.Kind != unstable.KeyValue {
+			continue
+		}
+		if err := stashValue(t, tableParts(parts, child), child, parser, doc, found); err != nil {
+			return err
+		}
 	}
-	refs, err := parseArraySpan(doc, start, end, prefix)
-	if err != nil {
-		return err
+	return nil
+}
+
+// stashInlineArray records secret lists written inside an inline array of
+// structs. Each inline table is walked with its element index on the path,
+// so a nested list is recorded at the slice the decoder fills.
+func stashInlineArray(
+	t reflect.Type,
+	parts []string,
+	value *unstable.Node,
+	parser *unstable.Parser,
+	doc []byte,
+	found *[]secretArray,
+) error {
+	children := value.Children()
+	i := 0
+	for children.Next() {
+		elem := children.Node()
+		if elem.Kind == unstable.Comment {
+			continue
+		}
+		if elem.Kind != unstable.InlineTable {
+			continue
+		}
+		elemParts := appendPath(parts, strconv.Itoa(i))
+		if err := stashInlineTable(t, elemParts, elem, parser, doc, found); err != nil {
+			return err
+		}
+		i++
 	}
-	if target.Kind() == reflect.Array && target.Len() != len(refs) {
-		return fmt.Errorf(
-			"%w: %s: the setting holds %d, the document writes %d references",
-			ErrInvalidRef,
-			strings.Join(prefix, "."),
-			target.Len(),
-			len(refs),
-		)
-	}
-	*found = append(*found, secretArray{key: settled, refs: refs, start: start, end: end})
 	return nil
 }
 
@@ -650,9 +692,11 @@ func checkRefTableBody(t reflect.Type, table []string, pending *[]pendingTable) 
 	return nil
 }
 
-// checkRefKeyValue checks one assignment against the settings type. A nested
-// inline table is walked even when its own path is not a secret. A locator
-// typo inside it still names the setting and the file position.
+// checkRefKeyValue checks one assignment against the settings type. A secret
+// written as an inline table or an inline array of references is read here.
+// An inline table or an inline array of structs is walked even when its own
+// path is not a secret. A locator typo inside it still names the setting
+// and the file position.
 func checkRefKeyValue(
 	t reflect.Type,
 	table []string,
@@ -684,13 +728,19 @@ func checkRefKeyValue(
 		if value.Kind == unstable.InlineTable {
 			return checkRefInlineTable(target, prefix, expr, parser, doc)
 		}
+		if value.Kind == unstable.Array {
+			return parseRefAssignment(expr, parser, doc, prefix)
+		}
 		return nil
 	}
 	if value.Kind == unstable.InlineTable {
 		return checkRefInlineValue(t, parts, value, parser, doc)
 	}
-	if ok && value.Kind == unstable.Array {
-		return checkRefArray(target, prefix, expr, parser, doc)
+	if value.Kind == unstable.Array {
+		if ok && isSecretList(target) {
+			return checkRefArray(target, prefix, expr, parser, doc)
+		}
+		return checkRefInlineArray(t, parts, value, parser, doc)
 	}
 	return nil
 }
@@ -908,9 +958,11 @@ func secretField(node reflect.Type, part string) (reflect.StructField, string, b
 }
 
 // checkRefInlineValue walks the children of one inline table that is not
-// itself a secret. A child that is a secret is checked as a reference. A
-// child that is a list is checked as a list of references. A child that is
-// itself an inline table is walked again with the path extended by its key.
+// itself a secret. A child that is a secret is checked as a reference,
+// whether it is an inline table or an inline array. A child that is a list
+// of secrets is checked as a list of references. A child that is an inline
+// table or an inline array of structs is walked again with the path extended
+// by its key or element index.
 func checkRefInlineValue(
 	t reflect.Type,
 	parts []string,
@@ -933,10 +985,21 @@ func checkRefInlineValue(
 					return err
 				}
 			}
+			if childValue.Kind == unstable.Array {
+				if err := parseRefAssignment(child, parser, doc, prefix); err != nil {
+					return err
+				}
+			}
 			continue
 		}
-		if ok && childValue.Kind == unstable.Array {
-			if err := checkRefArray(target, prefix, child, parser, doc); err != nil {
+		if childValue.Kind == unstable.Array {
+			if ok && isSecretList(target) {
+				if err := checkRefArray(target, prefix, child, parser, doc); err != nil {
+					return err
+				}
+				continue
+			}
+			if err := checkRefInlineArray(t, childParts, childValue, parser, doc); err != nil {
 				return err
 			}
 			continue
@@ -946,6 +1009,35 @@ func checkRefInlineValue(
 				return err
 			}
 		}
+	}
+	return nil
+}
+
+// checkRefInlineArray walks each inline table of an array that is not a
+// secret list. The element index is appended to the path so the type walk
+// can consume the slice. The index never joins a setting-key message.
+func checkRefInlineArray(
+	t reflect.Type,
+	parts []string,
+	value *unstable.Node,
+	parser *unstable.Parser,
+	doc []byte,
+) error {
+	children := value.Children()
+	i := 0
+	for children.Next() {
+		elem := children.Node()
+		if elem.Kind == unstable.Comment {
+			continue
+		}
+		if elem.Kind != unstable.InlineTable {
+			continue
+		}
+		elemParts := appendPath(parts, strconv.Itoa(i))
+		if err := checkRefInlineValue(t, elemParts, elem, parser, doc); err != nil {
+			return err
+		}
+		i++
 	}
 	return nil
 }
