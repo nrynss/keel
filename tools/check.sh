@@ -81,11 +81,11 @@ for path in "${tracked_files[@]}"; do
 done
 
 # Check 1: every Go file stays gofmt clean.
-header "1/10 gofmt"
+header "1/11 gofmt"
 unformatted=$(gofmt -l .)
 if [ -n "$unformatted" ]; then
     printf '%s\n' "$unformatted"
-    fail "1/10 gofmt" "files above need gofmt -w"
+    fail "1/11 gofmt" "files above need gofmt -w"
 fi
 passed
 
@@ -95,33 +95,33 @@ packages=$(go list ./... 2>/dev/null || true)
 
 if [ -n "$packages" ]; then
     # Check 2: the Go vet suite passes.
-    header "2/10 go vet"
-    go vet ./... || fail "2/10 go vet" "go vet found problems"
+    header "2/11 go vet"
+    go vet ./... || fail "2/11 go vet" "go vet found problems"
     passed
 
     # Check 3: staticcheck passes at the pinned version.
-    header "3/10 staticcheck"
+    header "3/11 staticcheck"
     go run "honnef.co/go/tools/cmd/staticcheck@${staticcheck_version}" ./... \
-        || fail "3/10 staticcheck" "staticcheck found problems"
+        || fail "3/11 staticcheck" "staticcheck found problems"
     passed
 
     # Check 4: every package builds without cgo.
-    header "4/10 build"
+    header "4/11 build"
     # A cgo-only directory vanishes from ./... under CGO_ENABLED=0.
     # go build then warns and exits 0, so compare the package lists as well.
     packages_cgo=$(CGO_ENABLED=1 go list ./... 2>/dev/null || true)
     packages_nocgo=$(CGO_ENABLED=0 go list ./... 2>/dev/null || true)
     missing_packages=$(comm -23 <(sort <<<"$packages_cgo") <(sort <<<"$packages_nocgo"))
-    CGO_ENABLED=0 go build ./... || fail "4/10 build" "build failed with CGO disabled"
+    CGO_ENABLED=0 go build ./... || fail "4/11 build" "build failed with CGO disabled"
     if [ -n "$missing_packages" ]; then
         printf '%s\n' "$missing_packages"
-        fail "4/10 build" "packages above disappear when cgo is disabled"
+        fail "4/11 build" "packages above disappear when cgo is disabled"
     fi
     passed
 
     # Check 5: the test suite passes under the race detector.
-    header "5/10 test"
-    go test -race ./... || fail "5/10 test" "tests failed under the race detector"
+    header "5/11 test"
+    go test -race ./... || fail "5/11 test" "tests failed under the race detector"
     passed
 else
     echo "== checks 2 to 5 (go vet, staticcheck, build, test) =="
@@ -133,50 +133,95 @@ fi
 # The binary fixtures carry every short byte sequence by chance, and chance is not a citation.
 # A text file named *.bin holds real words, and grep still scans it.
 # Check 6: no consumer name in a tracked file.
-header "6/10 consumer names"
+header "6/11 consumer names"
 if [ "${#scanned_files[@]}" -gt 0 ]; then
     hits=$(grep -l -i -E -I -e "$consumer_re" -- "${scanned_files[@]}" || true)
     if [ -n "$hits" ]; then
         printf '%s\n' "$hits"
-        fail "6/10 consumer names" "tracked files above name a consumer"
+        fail "6/11 consumer names" "tracked files above name a consumer"
     fi
 fi
 passed
 
 # Check 7: no planning reference in a tracked file.
-header "7/10 plan references"
+header "7/11 plan references"
 if [ "${#scanned_files[@]}" -gt 0 ]; then
     hits=$(grep -l -i -E -I -e "$plan_re" -- "${scanned_files[@]}" || true)
     if [ -n "$hits" ]; then
         printf '%s\n' "$hits"
-        fail "7/10 plan references" "tracked files above cite planning"
+        fail "7/11 plan references" "tracked files above cite planning"
     fi
 fi
 passed
 
+# Third-party modules stay behind named package prefixes.
+# Each row is a module path and the import-path globs allowed to depend on it.
+# modernc.org/sqlite -> */sqlite, */sqlite/*, */sqlitestore, */sqlitestore/*
+# github.com/pelletier/go-toml/v2 -> */config, */config/source, */config/source/*
+# Check 8 walks the sqlite row. Check 9 walks the parser row.
+edge_sqlite_module="modernc.org/sqlite"
+edge_sqlite_prefixes=("*/sqlite" "*/sqlite/*" "*/sqlitestore" "*/sqlitestore/*")
+edge_parser_module="github.com/pelletier/go-toml/v2"
+edge_parser_prefixes=("*/config" "*/config/source" "*/config/source/*")
+
+# check_edge walks every package against one table row.
+# $1 is the check label. $2 is the module. The rest are allowed globs.
+# grep -q can end the pipe early, which kills go list with SIGPIPE
+# under pipefail, so a real hit would read as clean.
+# Capture the list first and match it without an early exit.
+check_edge() {
+    local label=$1
+    local module=$2
+    shift 2
+    local pkg deps glob allowed dep
+    while IFS= read -r pkg; do
+        allowed=0
+        for glob in "$@"; do
+            case "$pkg" in
+                $glob)
+                    allowed=1
+                    break
+                    ;;
+            esac
+        done
+        if [ "$allowed" = 1 ]; then
+            continue
+        fi
+        deps=$(go list -deps "$pkg") || fail "$label" "go list -deps ${pkg} failed"
+        # A subpackage of the module counts, because the root import path is not
+        # always in the dep list. Match an exact module line or that path plus
+        # a slash. A sibling module that only shares a prefix is not a hit.
+        while IFS= read -r dep; do
+            case "$dep" in
+                "$module"|"$module"/*)
+                    fail "$label" "package ${pkg} depends on ${module}"
+                    ;;
+            esac
+        done <<< "$deps"
+    done <<< "$packages"
+}
+
 # Check 8: only packages built to wrap sqlite may depend on its driver.
-header "8/10 sqlite edge"
+header "8/11 sqlite edge"
 if [ -z "$packages" ]; then
     echo "no packages yet, skipping"
 else
-    while IFS= read -r pkg; do
-        case "$pkg" in
-            */sqlite | */sqlite/* | */sqlitestore | */sqlitestore/*) continue ;;
-        esac
-        # grep -q can end the pipe early, which kills go list with SIGPIPE
-        # under pipefail, so a real hit would read as clean.
-        # Capture the list first and match it without an early exit.
-        deps=$(go list -deps "$pkg") || fail "8/10 sqlite edge" "go list -deps ${pkg} failed"
-        case $'\n'"${deps}"$'\n' in
-            *$'\n'modernc.org/sqlite$'\n'*) fail "8/10 sqlite edge" "package ${pkg} depends on modernc.org/sqlite" ;;
-        esac
-    done <<< "$packages"
+    check_edge "8/11 sqlite edge" "$edge_sqlite_module" "${edge_sqlite_prefixes[@]}"
     passed
 fi
 
-# Check 9: the four Go conventions that gofmt, vet and staticcheck cannot see.
-header "9/10 conventions"
-go run ./tools/conventions || fail "9/10 conventions" "the convention breaches above must be fixed"
+# Check 9: only packages built to parse settings may depend on the parser.
+header "9/11 toml edge"
+if [ -z "$packages" ]; then
+    echo "no packages yet, skipping"
+else
+    check_edge "9/11 toml edge" "$edge_parser_module" "${edge_parser_prefixes[@]}"
+    passed
+fi
+
+# Check 10: the four Go conventions that gofmt, vet and staticcheck cannot see.
+header "10/11 conventions"
+go run ./tools/conventions || fail "10/11 conventions" "the convention breaches above must be fixed"
 passed
 
 # recorded_packages names the packages the transcript record covers, in the
@@ -197,12 +242,12 @@ regenerate_api_doc() {
     while IFS= read -r pkg; do
         printf '########## %s\n' "$pkg" >> "$dest"
         GOOS="$frozen_goos" GOARCH="$frozen_goarch" go doc -all "$pkg" >> "$dest" \
-            || fail "10/10 api" "${pkg} is named by ${api_doc} and no longer resolves"
+            || fail "11/11 api" "${pkg} is named by ${api_doc} and no longer resolves"
         printf '\n' >> "$dest"
     done < <(recorded_packages)
 }
 
-# Check 10: the exported API matches both frozen records, taken from the one
+# Check 11: the exported API matches both frozen records, taken from the one
 # frozen build context named above, linux/amd64, which CI also runs on. The
 # transcript half regenerates under that context, so the same bytes come out on
 # any host. The conventions check keeps every file inside that context, so a file
@@ -214,24 +259,24 @@ regenerate_api_doc() {
 # The transcript catches a signature or a doc change a reader can see inside a
 # recorded package. The baseline catches every incompatible change, whether or
 # not a recorded package carries it.
-header "10/10 api"
+header "11/11 api"
 api_tmp=$(mktemp -d)
 trap 'rm -rf "$api_tmp"' EXIT
 regenerate_api_doc "$api_tmp/$(basename "$api_doc")"
 if ! diff -u "$api_doc" "$api_tmp/$(basename "$api_doc")"; then
-    fail "10/10 api" "the exported API differs from ${api_doc}, see the diff above"
+    fail "11/11 api" "the exported API differs from ${api_doc}, see the diff above"
 fi
 # The pinned apidiff refuses to run when GOOS is set for its own build, so build
 # it once for the host and run that binary under the frozen context. GOBIN keeps
 # the tool out of go.mod.
 mkdir -p "$api_tmp/bin"
 GOBIN="$api_tmp/bin" go install "golang.org/x/exp/cmd/apidiff@${apidiff_version}" \
-    || fail "10/10 api" "apidiff could not be installed at ${apidiff_version}"
+    || fail "11/11 api" "apidiff could not be installed at ${apidiff_version}"
 api_report=$(GOOS="$frozen_goos" GOARCH="$frozen_goarch" "$api_tmp/bin/apidiff" -incompatible -m "$api_export" "$(go list -m)") \
-    || fail "10/10 api" "apidiff could not compare against ${api_export}"
+    || fail "11/11 api" "apidiff could not compare against ${api_export}"
 if [ -n "$api_report" ]; then
     printf '%s\n' "$api_report"
-    fail "10/10 api" "apidiff reports an incompatible change against ${api_export}, see the report above"
+    fail "11/11 api" "apidiff reports an incompatible change against ${api_export}, see the report above"
 fi
 passed
 
