@@ -281,14 +281,19 @@ header "11/11 api"
 # transcript path. The guard hashes that successor in the index, the copy
 # the commit carries, and accepts the deletion only on a byte-identical
 # match, so a missing index entry fails. After the rows the guard asks the
-# index for the old path and refuses it by name. A sanctioned transcript or
-# export row also gets an index-side content judge, because the commit
-# carries the index. That judge regenerates the transcript or runs apidiff
-# on the staged bytes and refuses a mismatch by name. The guard names the
+# index for the old path and refuses it by name. A cached row on the
+# transcript or the export also arms an index-side content judge over the
+# staged bytes. The worktree view arms nothing, because the commit carries
+# index bytes alone. That judge regenerates the transcript or runs apidiff
+# on the index copy and refuses a mismatch by name. The guard names the
 # first record it refuses and exits there, fail-fast by design.
 doc_at_head=$(git show HEAD:tools/check.sh | sed -n 's/^api_doc="\(.*\)"$/\1/p')
 doc_row=
 export_row=
+cached_doc_rows=$(git diff --cached --name-status --no-renames HEAD -- "${api_doc}" | cut -f1 | sort -u | tr -d '\n')
+case "${cached_doc_rows}" in *[MA]*) doc_row=1 ;; esac
+cached_export_rows=$(git diff --cached --name-status --no-renames HEAD -- "${api_export}" | cut -f1 | sort -u | tr -d '\n')
+case "${cached_export_rows}" in *A*) export_row=1 ;; esac
 rows=$({
     git diff --name-status --no-renames HEAD -- api/
     git diff --cached --name-status --no-renames HEAD -- api/
@@ -300,15 +305,11 @@ stale_index() {
 if [ -n "$rows" ] || stale_index; then
     while IFS=$'\t' read -r status path; do
         if [ "$status" = "M" ]; then
-            [ "$path" = "$api_doc" ] && { doc_row=1; continue; }
+            [ "$path" = "$api_doc" ] && continue
             fail "11/11 api" "a released record under api/ changed: ${path}, only ${api_doc} may move"
         elif [ "$status" = "A" ]; then
-            if [ "$path" = "$api_doc" ]; then doc_row=1
-            elif [ "$path" = "$api_export" ]; then export_row=1
-            else
+            [ "$path" = "$api_doc" ] || [ "$path" = "$api_export" ] || \
                 fail "11/11 api" "a new record under api/ was added: ${path}, only the release pair ${api_doc} and ${api_export} may appear"
-            fi
-            continue
         elif [ "$status" = "D" ]; then
             successor_blob=$(git rev-parse ":${api_doc}" 2>/dev/null) || true
             if [ "$path" = "$doc_at_head" ] && [ -n "$doc_at_head" ] \
@@ -331,9 +332,9 @@ regenerate_api_doc "$api_tmp/$(basename "$api_doc")"
 if ! diff -u "$api_doc" "$api_tmp/$(basename "$api_doc")"; then
     fail "11/11 api" "the exported API differs from ${api_doc}, see the diff above"
 fi
-# A sanctioned transcript row only cleared the path rules. The commit
-# carries the index, so the staged transcript bytes get their own judge
-# when a sanctioned row touched the transcript in either view.
+# A cached transcript row only cleared the path rules. The cached view
+# alone arms this judge, so it runs exactly when the commit carries
+# changed transcript bytes.
 if [ -n "$doc_row" ]; then
     git show ":${api_doc}" > "$api_tmp/index-doc.txt" \
         || fail "11/11 api" "the staged ${api_doc} could not be read from the index"
@@ -354,7 +355,7 @@ if [ -n "$api_report" ]; then
     printf '%s\n' "$api_report"
     fail "11/11 api" "apidiff reports an incompatible change against ${api_export}, see the report above"
 fi
-# A sanctioned export row gets the same index-side judge. apidiff runs
+# A cached export row arms the same index-side judge. apidiff runs
 # against the staged export bytes, the copy the commit carries.
 if [ -n "$export_row" ]; then
     git show ":${api_export}" > "$api_tmp/index-export" \
