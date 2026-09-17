@@ -85,7 +85,7 @@ func markFileOrigins(t reflect.Type, node any, prefix []string, filePath string,
 			markFileOrigins(field.Type, child, appendPath(prefix, key), filePath, origins)
 		}
 	case reflect.Slice, reflect.Array:
-		if isStructElem(t.Elem()) {
+		if isContainerElem(t.Elem()) {
 			list, ok := node.([]any)
 			if !ok {
 				return
@@ -99,7 +99,7 @@ func markFileOrigins(t reflect.Type, node any, prefix []string, filePath string,
 		if !ok {
 			return
 		}
-		if isStructElem(t.Elem()) {
+		if isContainerElem(t.Elem()) {
 			for _, key := range sortedKeys(tree) {
 				markFileOrigins(t.Elem(), tree[key], appendPath(prefix, key), filePath, origins)
 			}

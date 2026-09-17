@@ -668,6 +668,121 @@ func TestLoadMapOfMapsStructEnvOverlay(t *testing.T) {
 	}
 }
 
+func TestLoadMapOfMapsStructFileOrigin(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.toml")
+	if err := os.WriteFile(path, []byte("[groups.prod.openai]\nmodel = \"file-model\"\n"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	var got struct {
+		Groups map[string]map[string]struct {
+			Model string `toml:"model"`
+		} `toml:"groups"`
+	}
+	plan, err := Load(t.Context(), &got, Config{
+		Path:      path,
+		LookupEnv: mapLookup(nil),
+	})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	inner, ok := got.Groups["prod"]
+	if !ok {
+		t.Fatal("missing groups.prod")
+	}
+	p, ok := inner["openai"]
+	if !ok {
+		t.Fatal("missing groups.prod.openai")
+	}
+	if p.Model != "file-model" {
+		t.Errorf("model = %q, want file-model", p.Model)
+	}
+	printed := plan.String()
+	want := "groups.prod.openai.model\tfile\tpath=" + path + "\tresolved"
+	if !strings.Contains(printed, want) {
+		t.Errorf("plan missing file origin %q:\n%s", want, printed)
+	}
+	if strings.Contains(printed, "groups.prod.openai.model\tdefault\t") {
+		t.Errorf("plan named default for a file-set nested field:\n%s", printed)
+	}
+}
+
+func TestLoadSliceOfMapsStructFileOrigin(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.toml")
+	if err := os.WriteFile(path, []byte("rows = [{openai = { model = \"file-model\" }}]\n"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	var got struct {
+		Rows []map[string]struct {
+			Model string `toml:"model"`
+		} `toml:"rows"`
+	}
+	plan, err := Load(t.Context(), &got, Config{
+		Path:      path,
+		LookupEnv: mapLookup(nil),
+	})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(got.Rows) != 1 {
+		t.Fatalf("len(rows) = %d, want 1", len(got.Rows))
+	}
+	p, ok := got.Rows[0]["openai"]
+	if !ok {
+		t.Fatal("missing rows.0.openai")
+	}
+	if p.Model != "file-model" {
+		t.Errorf("model = %q, want file-model", p.Model)
+	}
+	printed := plan.String()
+	want := "rows.0.openai.model\tfile\tpath=" + path + "\tresolved"
+	if !strings.Contains(printed, want) {
+		t.Errorf("plan missing file origin %q:\n%s", want, printed)
+	}
+	if strings.Contains(printed, "rows.0.openai.model\tdefault\t") {
+		t.Errorf("plan named default for a file-set nested field:\n%s", printed)
+	}
+}
+
+func TestLoadMapOfSlicesStructFileOrigin(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.toml")
+	if err := os.WriteFile(path, []byte("[[groups.prod]]\nmodel = \"file-model\"\n"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	var got struct {
+		Groups map[string][]struct {
+			Model string `toml:"model"`
+		} `toml:"groups"`
+	}
+	plan, err := Load(t.Context(), &got, Config{
+		Path:      path,
+		LookupEnv: mapLookup(nil),
+	})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	list, ok := got.Groups["prod"]
+	if !ok {
+		t.Fatal("missing groups.prod")
+	}
+	if len(list) != 1 {
+		t.Fatalf("len(groups.prod) = %d, want 1", len(list))
+	}
+	if list[0].Model != "file-model" {
+		t.Errorf("model = %q, want file-model", list[0].Model)
+	}
+	printed := plan.String()
+	want := "groups.prod.0.model\tfile\tpath=" + path + "\tresolved"
+	if !strings.Contains(printed, want) {
+		t.Errorf("plan missing file origin %q:\n%s", want, printed)
+	}
+	if strings.Contains(printed, "groups.prod.0.model\tdefault\t") {
+		t.Errorf("plan named default for a file-set nested field:\n%s", printed)
+	}
+}
+
 func TestLoadCancelledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
