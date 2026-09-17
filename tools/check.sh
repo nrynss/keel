@@ -273,15 +273,22 @@ header "11/11 api"
 #
 # One move is sanctioned, the release move. A release births a new pair, the
 # new transcript and its export record, so the release adds both records of
-# the pair and repoints the pair variables in this script. The guard reads
-# the change rows under api/ with one diff and judges each row against the
-# pair variables and against the transcript path that HEAD gated, which it
-# reads from HEAD, so no record name is hardcoded. A staged restore of that
-# old path is a byte-identical no-op the diff cannot see, so after the rows
-# the guard asks the index for the old path and refuses it by name. The guard
-# names the first record it refuses and exits there, fail-fast by design.
+# the pair and repoints the pair variables in this script. A commit carries
+# the index, but a plain diff judges the working tree. The guard therefore
+# reads the change rows from both views, drops duplicate rows, and judges
+# every merged row once. A row passes only against the pair variables or the
+# transcript path that HEAD gated, which it reads from HEAD, so no record
+# name is hardcoded. The release move stages the successor of the old
+# transcript path. The guard hashes that successor in the index, the copy
+# the commit carries, and accepts the deletion only on a byte-identical
+# match, so a missing index entry fails. After the rows the guard asks the
+# index for the old path and refuses it by name. The guard names the first
+# record it refuses and exits there, fail-fast by design.
 doc_at_head=$(git show HEAD:tools/check.sh | sed -n 's/^api_doc="\(.*\)"$/\1/p')
-rows=$(git diff --name-status --no-renames HEAD -- api/)
+rows=$({
+    git diff --name-status --no-renames HEAD -- api/
+    git diff --cached --name-status --no-renames HEAD -- api/
+} | sort -u)
 stale_index() {
     [ -n "$doc_at_head" ] && [ "$doc_at_head" != "$api_doc" ] \
         && [ -n "$(git ls-files -- "$doc_at_head")" ]
@@ -295,9 +302,10 @@ if [ -n "$rows" ] || stale_index; then
             { [ "$path" = "$api_doc" ] || [ "$path" = "$api_export" ]; } && continue
             fail "11/11 api" "a new record under api/ was added: ${path}, only the release pair ${api_doc} and ${api_export} may appear"
         elif [ "$status" = "D" ]; then
+            successor_blob=$(git rev-parse ":${api_doc}" 2>/dev/null) || true
             if [ "$path" = "$doc_at_head" ] && [ -n "$doc_at_head" ] \
-                    && [ "$doc_at_head" != "$api_doc" ] && [ -f "$api_doc" ] \
-                    && [ "$(git hash-object "$api_doc")" = "$(git rev-parse "HEAD:${path}")" ]; then
+                    && [ "$doc_at_head" != "$api_doc" ] && [ -n "$successor_blob" ] \
+                    && [ "$successor_blob" = "$(git rev-parse "HEAD:${path}")" ]; then
                 continue
             fi
             fail "11/11 api" "a released record under api/ was deleted: ${path}, only the move to ${api_doc} is sanctioned"
