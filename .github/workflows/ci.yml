@@ -24,7 +24,7 @@ jobs:
       # The digest pins the image so every run gets the same build.
       - name: Install static ffmpeg and ffprobe
         run: |
-          cid=$(docker create mwader/static-ffmpeg:7.1@sha256:a8090df5f5608daef387e1b2e93b98aaacb4d92153ad904e7d715c725724fca4)
+          cid=$(docker create mwader/static-ffmpeg:9.0.1@sha256:54e55b0cb8f672870fc38ceb2e6c411855cb3b39c505f5f3b2505ee01ed5f2b7)
           docker cp "${cid}:/ffmpeg" /usr/local/bin/ffmpeg
           docker cp "${cid}:/ffprobe" /usr/local/bin/ffprobe
           docker rm "$cid"

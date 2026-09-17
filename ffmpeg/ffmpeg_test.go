@@ -41,21 +41,19 @@ func requireFFmpeg(t *testing.T) {
 }
 
 // TestDurationMatchesFixtures checks the length ffprobe measures for every
-// fixture against the value recorded in testdata/audio/README.md.
+// fixture against the value recorded in testdata/audio/README.md. CI and the
+// gate both run one pinned ffmpeg version, so every fixture asserts exact
+// millisecond equality.
 func TestDurationMatchesFixtures(t *testing.T) {
 	requireFFmpeg(t)
 	tests := []struct {
 		name string
 		ms   int64
-		// tolMs absorbs a version difference in how ffprobe estimates a
-		// stream. ffprobe 7.1 counts one extra MP3 frame and reports the
-		// three second MP3 take as 3024 ms, while ffprobe 9 reports 3000 ms.
-		tolMs int64
 	}{
 		{name: "tone-48k.wav", ms: 3000},
 		{name: "tone-24k.wav", ms: 3000},
 		{name: "tone-48k.opus", ms: 3007}, // README records 3.006500 s, rounded to 3007 ms
-		{name: "tone-48k.mp3", ms: 3000, tolMs: 40},
+		{name: "tone-48k.mp3", ms: 3000},
 		{name: "truncated.wav", ms: 1194}, // README records 1.194208 s, rounded to 1194 ms
 	}
 	for _, tc := range tests {
@@ -64,8 +62,8 @@ func TestDurationMatchesFixtures(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Duration(%s) failed: %v", tc.name, err)
 			}
-			if diff := got.Milliseconds() - tc.ms; diff < -tc.tolMs || diff > tc.tolMs {
-				t.Errorf("Duration(%s) = %d ms, want %d ms within %d ms", tc.name, got.Milliseconds(), tc.ms, tc.tolMs)
+			if got.Milliseconds() != tc.ms {
+				t.Errorf("Duration(%s) = %d ms, want %d ms", tc.name, got.Milliseconds(), tc.ms)
 			}
 		})
 	}

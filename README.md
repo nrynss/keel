@@ -19,7 +19,10 @@ go get github.com/nrynss/keel@v0.2.0
 ```
 
 Go 1.27 or newer. The `ffmpeg` package runs the `ffmpeg` and `ffprobe` binaries, so install those
-if you use it. Everything else is pure Go, and `CGO_ENABLED=0` builds the whole module.
+if you use it. Pin ffmpeg 9.0.1: the media tests and CI assert durations exactly on that version,
+and other versions may differ by milliseconds. For example, install the static build with
+`docker create mwader/static-ffmpeg:9.0.1`, then `docker cp` both binaries out of it. Everything
+else is pure Go, and `CGO_ENABLED=0` builds the whole module.
 
 ## Packages
 
