@@ -220,12 +220,6 @@ type valueCell struct {
 	deadlines []bool
 }
 
-func (c *valueCell) get() (string, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.value, true
-}
-
 func (c *valueCell) set(value string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
