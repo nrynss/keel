@@ -267,10 +267,25 @@ regenerate_api_doc() {
 header "11/11 api"
 # The released records are frozen at their release. Only the transcript of
 # the surface under construction moves with the work, so the api check first
-# refuses any other change under api/. A rename that left a stale record
-# behind, or an edit that rewrote a released record, fails here.
+# runs one cheap diff that ignores the current transcript. A clean or
+# ordinary tree passes there. The guard judges any other change under api/
+# below, and names the record it refuses.
+#
+# One move is sanctioned, the release move. A release renames the transcript
+# to its new name and repoints api_doc in this script. Pre-commit the move
+# shows up here as the deletion of the transcript path that the last commit
+# gated, and this script reads that path from HEAD. The deletion passes only
+# when those exact bytes now sit at the current transcript path. Every other
+# deletion, rename or edit of a released record fails by name.
 if ! git diff --quiet HEAD -- api/ ":!${api_doc}"; then
-    fail "11/11 api" "a released record under api/ changed, only ${api_doc} may move"
+    prev_doc=$(git show HEAD:tools/check.sh | sed -n 's/^api_doc="\(.*\)"$/\1/p')
+    while IFS=$'\t' read -r status path; do
+        if [ "$status" = "D" ] && [ "$path" = "$prev_doc" ] \
+                && cmp -s <(git show "HEAD:${prev_doc}") "$api_doc"; then
+            continue
+        fi
+        fail "11/11 api" "a released record under api/ changed: ${path}, only ${api_doc} may move"
+    done < <(git diff --name-status HEAD -- api/ ":!${api_doc}")
 fi
 api_tmp=$(mktemp -d)
 trap 'rm -rf "$api_tmp"' EXIT
