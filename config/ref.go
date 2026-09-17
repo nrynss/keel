@@ -21,9 +21,13 @@ const (
 	// default, so a reference without a read key gets it.
 	ReadAtBoot ReadMode = "at_boot"
 
-	// ReadAtUse is accepted as a read mode. The loader still resolves it
-	// at load and bind caches the value. A rotated file does not change
-	// Reveal.
+	// ReadAtUse resolves the reference again on each Reveal. The loader
+	// still runs a trial resolution at load, so a missing key fails at
+	// boot and the plan names the winner. A rotated value takes effect
+	// without a restart. The trial winner decides the mode for the whole
+	// list. An at_boot winner stays cached even when a later reference
+	// reads at_use. An at_use winner re-resolves the full ordered list
+	// on each Reveal, including references that read at_boot.
 	ReadAtUse ReadMode = "at_use"
 )
 

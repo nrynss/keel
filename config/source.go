@@ -37,7 +37,9 @@ type Source interface {
 
 // Registry maps a source name to the Source that resolves it. Create one
 // with NewRegistry, register the built-in and application sources, and pass
-// it to the loader.
+// it to the loader. Do not mutate a registry after load while an at_use
+// secret lives. Each Reveal looks sources up again, so a late Register
+// races with Reveal.
 //
 // The zero value is usable and holds no sources. A nil *Registry is usable
 // too, holds no sources, and refuses every registration.

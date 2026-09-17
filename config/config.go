@@ -3,9 +3,12 @@
 //
 // Settings sit inline in the file. A secret is a reference, never a value:
 // the file says which source holds the secret and how to find it there.
-// The loader reads every secret when settings load, including a reference
-// marked at_use, and caches the value for Reveal. No secret value is ever
-// written in the file, so a settings file is safe to keep in a repository.
+// The loader trial resolves every secret at load, including a reference
+// marked at_use, and that trial feeds the plan. An at_boot secret returns
+// the cached trial value. An at_use secret resolves again on each Reveal,
+// so rotation takes effect without a restart. The trial winner decides the
+// mode for the whole list. No secret value is ever written in the file, so
+// a settings file is safe to keep in a repository.
 //
 // # The reference shape
 //

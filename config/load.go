@@ -63,8 +63,19 @@ type Config struct {
 // underscores, so render.max_seconds reads RENDER_MAX_SECONDS.
 //
 // A missing file is not an error. A present file that cannot be read or
-// parsed is fatal. Secrets resolve at load, including a reference marked
-// at_use, and Reveal returns the cached value.
+// parsed is fatal. The loader trial resolves every secret at load, including
+// a reference marked at_use. An at_boot Reveal returns the cached trial
+// value, and an at_use Reveal resolves again on each call. The trial winner
+// decides the mode for the whole list. An at_boot winner stays cached even
+// when a later reference reads at_use. An at_use winner re-resolves the full
+// ordered list on each Reveal, including references that read at_boot.
+//
+// The live reader keeps the load context values through context.WithoutCancel.
+// Cancellation and deadline do not survive into Reveal. Load with a context
+// that carries only long lived values.
+//
+// Do not mutate the registry after load while an at_use secret lives. Each
+// Reveal looks sources up again, so a late Register races with Reveal.
 //
 // A field tagged config:"required" must be non-zero after every layer. A
 // secret with references must resolve. Failures name the key, the source,

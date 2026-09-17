@@ -1,6 +1,7 @@
 package config
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -23,7 +24,11 @@ const redacted = "<secret>"
 
 // Secret is one secret setting. It decodes from a reference table in the
 // settings file, holding the ordered list of references that name the value.
-// A loader resolves it and replaces the references with the resolved value.
+// A loader trial resolves every reference at load and installs the reader
+// Reveal uses. The trial winner decides the mode for the whole list. An
+// at_boot winner returns the cached trial value. An at_use winner resolves
+// the ordered list again on each call, so rotation takes effect without a
+// restart.
 //
 // No formatting path prints the value. String, Format, GoString, the JSON
 // and text marshallers, and the slog value all print a fixed placeholder.
@@ -55,8 +60,11 @@ func (s *Secret) UnmarshalTOML(data []byte) error {
 	return nil
 }
 
-// Reveal returns the value bind cached at load. It returns ErrUnresolved
-// when no loader resolved this Secret. A rotated file does not change it.
+// Reveal returns the secret value. It returns ErrUnresolved when no loader
+// resolved this Secret. An at_boot Secret returns the value the load cached.
+// An at_use Secret resolves its ordered references again on each call and
+// returns the first success. A use time failure returns an error and never
+// serves a cached value.
 func (s Secret) Reveal() (string, error) {
 	if s.reveal == nil {
 		return "", ErrUnresolved
@@ -64,10 +72,56 @@ func (s Secret) Reveal() (string, error) {
 	return s.reveal()
 }
 
-// bind installs a Reveal that returns value. Every secret resolves once at
-// load, so at_use and at_boot share this path.
+// bind installs a Reveal that returns value. The loader uses it for a secret
+// whose winning reference reads at_boot.
 func (s *Secret) bind(value string) {
 	s.reveal = func() (string, error) { return value, nil }
+}
+
+// bindLive installs a Reveal that resolves the ordered references on each
+// call. The loader uses it for a secret whose winning reference reads at_use.
+// Each call tries the references in order and returns the first success. A
+// call that finds no success returns an error naming the key. It never serves
+// a cached value. The reader keeps the load context values through
+// context.WithoutCancel. Cancellation and deadline do not survive into the
+// call, so load with a context that carries only long lived values.
+func (s *Secret) bindLive(key string, refs []Ref, reg *Registry, ctx context.Context) {
+	liveRefs := append([]Ref(nil), refs...)
+	live := context.Background()
+	if ctx != nil {
+		live = context.WithoutCancel(ctx)
+	}
+	s.reveal = func() (string, error) {
+		var last error
+		var lastRef Ref
+		for _, ref := range liveRefs {
+			src, ok := reg.Lookup(ref.Source())
+			if !ok {
+				last = fmt.Errorf("%w: %q", ErrUnknownSource, ref.Source())
+				lastRef = ref
+				continue
+			}
+			val, err := src.Resolve(live, ref)
+			if err != nil {
+				last = err
+				lastRef = ref
+				continue
+			}
+			return val, nil
+		}
+		loc := lastRef.locator()
+		if loc == "" {
+			loc = sourceNone
+		}
+		srcName := lastRef.Source()
+		if srcName == "" {
+			srcName = sourceNone
+		}
+		if last == nil {
+			last = ErrUnresolved
+		}
+		return "", fmt.Errorf("%w: %s (source %s locator %s): %w", ErrResolve, key, srcName, loc, last)
+	}
 }
 
 // String returns the placeholder, never the value.

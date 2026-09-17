@@ -220,10 +220,14 @@ func secretFlag(key string, secretKeys map[string]bool) bool {
 	return false
 }
 
-// resolveSecrets tries each secret's references in order and installs a
-// Reveal that returns the first value that succeeds. A secret with no
-// references stays unresolved. A secret whose references all fail stops
-// the load.
+// resolveSecrets runs a trial resolution for each secret and installs the
+// Reveal its winner earns. The trial tries the ordered references and the
+// plan records the winning source. The winner decides the mode for the whole
+// list. A winner that reads at_boot binds the cached trial value, even when
+// a later reference reads at_use. A winner that reads at_use installs a
+// resolver that retries the ordered list on each Reveal, including references
+// that read at_boot. A secret with no references stays unresolved. A secret
+// whose references all fail stops the load.
 func resolveSecrets(
 	ctx context.Context,
 	v reflect.Value,
@@ -257,7 +261,11 @@ func resolveSecrets(
 				lastRef = ref
 				continue
 			}
-			sec.bind(val)
+			if ref.Read() == ReadAtUse {
+				sec.bindLive(s.key, sec.refs, reg, ctx)
+			} else {
+				sec.bind(val)
+			}
 			if err := setSecret(s.val, sec); err != nil {
 				return err
 			}
