@@ -21,10 +21,9 @@ const (
 	// default, so a reference without a read key gets it.
 	ReadAtBoot ReadMode = "at_boot"
 
-	// ReadAtUse resolves the reference on every read. A rotated value
-	// takes effect without a restart, and a resolution failure surfaces
-	// at the read rather than at boot. It never falls back to a cached
-	// value.
+	// ReadAtUse is accepted as a read mode. The loader still resolves it
+	// at load and bind caches the value. A rotated file does not change
+	// Reveal.
 	ReadAtUse ReadMode = "at_use"
 )
 

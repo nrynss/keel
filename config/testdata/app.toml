@@ -1,0 +1,9 @@
+[render]
+model = "file-model"
+max_seconds = 10
+workers = 4
+
+[secrets.key]
+source = "file"
+path = "/run/secrets/provider_key"
+read = "at_use"

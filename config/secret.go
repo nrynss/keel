@@ -55,14 +55,19 @@ func (s *Secret) UnmarshalTOML(data []byte) error {
 	return nil
 }
 
-// Reveal returns the resolved value. It returns ErrUnresolved when no loader
-// resolved this Secret, and it returns the resolution failure when an at-use
-// reference cannot be read.
+// Reveal returns the value bind cached at load. It returns ErrUnresolved
+// when no loader resolved this Secret. A rotated file does not change it.
 func (s Secret) Reveal() (string, error) {
 	if s.reveal == nil {
 		return "", ErrUnresolved
 	}
 	return s.reveal()
+}
+
+// bind installs a Reveal that returns value. Every secret resolves once at
+// load, so at_use and at_boot share this path.
+func (s *Secret) bind(value string) {
+	s.reveal = func() (string, error) { return value, nil }
 }
 
 // String returns the placeholder, never the value.

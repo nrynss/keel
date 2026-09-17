@@ -1,0 +1,6 @@
+render.format	default		resolved
+render.max_seconds	env	var=RENDER_MAX_SECONDS	resolved
+render.model	file	path=testdata/app.toml	resolved
+render.quality	env	var=RENDER_QUALITY	resolved
+render.workers	flag	flag=render.workers	resolved
+secrets.key	file	path=/run/secrets/provider_key	resolved

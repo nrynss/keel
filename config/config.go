@@ -2,8 +2,9 @@
 // resolves its secrets from wherever each one lives.
 //
 // Settings sit inline in the file. A secret is a reference, never a value:
-// the file says which source holds the secret and how to find it there, and
-// the loader reads the value at load or at use. No secret value is ever
+// the file says which source holds the secret and how to find it there.
+// The loader reads every secret when settings load, including a reference
+// marked at_use, and caches the value for Reveal. No secret value is ever
 // written in the file, so a settings file is safe to keep in a repository.
 //
 // # The reference shape
@@ -35,6 +36,35 @@
 // the JSON and text marshallers, and the slog value all print a fixed
 // placeholder. Reveal is the one way to read the value, and it reads as a
 // deliberate act at the call site.
+//
+// # Precedence
+//
+// Load fills a settings struct in one order. Defaults are the values already
+// in the struct. The file overlays them. Environment overrides overlay the
+// file, for non-secret settings only. Explicit flags win last.
+//
+// The override key is the field path in upper case, with dots and hyphens
+// turned into underscores. render.max_seconds reads RENDER_MAX_SECONDS.
+// There is no second table and no application prefix.
+//
+// # File choice
+//
+// Config.Path names the file. When it is empty, PathVar is looked up and its
+// value is the path. When that is empty too, Search is tried in order. A
+// missing file is not an error. A present file that cannot be read or parsed
+// is fatal.
+//
+// # Required fields
+//
+// A field tagged config:"required" cannot stay zero. Load fails with the
+// key, its source, and its locator when no layer supplies a value.
+//
+// # The plan
+//
+// Load returns a Plan. String prints one tab separated line per key: name,
+// source, locator, and whether it resolved. No line carries a value. Dump
+// writes the effective settings as TOML, with every secret replaced by its
+// plan line.
 //
 // # No environment reads
 //
