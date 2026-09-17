@@ -25,7 +25,7 @@ if you use it. Everything else is pure Go, and `CGO_ENABLED=0` builds the whole 
 
 | Package | Does |
 |---|---|
-| `wire` | The error envelope and the event contract every response and stream shares |
+| `wire` | The error envelope shared by gate, upload, and direct app routes, plus the event frames stream and job publish |
 | `id` | Unguessable 128-bit ids in lowercase hex, for anything served in public |
 | `gate` | Per-client and global token buckets, plus an optional passcode, in front of the routes that spend money |
 | `stream` | Topic broker and server-sent events, with heartbeats and a non-blocking slow-subscriber policy |
