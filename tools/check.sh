@@ -266,14 +266,13 @@ regenerate_api_doc() {
 # move it.
 header "11/11 api"
 # The released records are frozen at their release. Only the transcript of
-# the surface under construction moves with the work, so the api check first
-# runs one cheap diff that ignores the current transcript. A clean or
-# ordinary tree passes there. The guard judges any other change under api/
-# below, and names the record it refuses.
+# the surface under construction moves with the work. A commit carries the
+# index, so the guard reads the change rows from both views, merges them,
+# and judges every row once, naming the record it refuses.
 #
 # One move is sanctioned, the release move. A release births a new pair, the
-# new transcript and its export record, so the release adds both records of
-# the pair and repoints the pair variables in this script. A commit carries
+# new transcript and its export record, so it adds both records of the pair
+# and repoints the variables in this script. A commit carries
 # the index, but a plain diff judges the working tree. The guard therefore
 # reads the change rows from both views, drops duplicate rows, and judges
 # every merged row once. A row passes only against the pair variables or the
@@ -282,9 +281,14 @@ header "11/11 api"
 # transcript path. The guard hashes that successor in the index, the copy
 # the commit carries, and accepts the deletion only on a byte-identical
 # match, so a missing index entry fails. After the rows the guard asks the
-# index for the old path and refuses it by name. The guard names the first
-# record it refuses and exits there, fail-fast by design.
+# index for the old path and refuses it by name. A sanctioned transcript or
+# export row also gets an index-side content judge, because the commit
+# carries the index. That judge regenerates the transcript or runs apidiff
+# on the staged bytes and refuses a mismatch by name. The guard names the
+# first record it refuses and exits there, fail-fast by design.
 doc_at_head=$(git show HEAD:tools/check.sh | sed -n 's/^api_doc="\(.*\)"$/\1/p')
+doc_row=
+export_row=
 rows=$({
     git diff --name-status --no-renames HEAD -- api/
     git diff --cached --name-status --no-renames HEAD -- api/
@@ -296,11 +300,15 @@ stale_index() {
 if [ -n "$rows" ] || stale_index; then
     while IFS=$'\t' read -r status path; do
         if [ "$status" = "M" ]; then
-            [ "$path" = "$api_doc" ] && continue
+            [ "$path" = "$api_doc" ] && { doc_row=1; continue; }
             fail "11/11 api" "a released record under api/ changed: ${path}, only ${api_doc} may move"
         elif [ "$status" = "A" ]; then
-            { [ "$path" = "$api_doc" ] || [ "$path" = "$api_export" ]; } && continue
-            fail "11/11 api" "a new record under api/ was added: ${path}, only the release pair ${api_doc} and ${api_export} may appear"
+            if [ "$path" = "$api_doc" ]; then doc_row=1
+            elif [ "$path" = "$api_export" ]; then export_row=1
+            else
+                fail "11/11 api" "a new record under api/ was added: ${path}, only the release pair ${api_doc} and ${api_export} may appear"
+            fi
+            continue
         elif [ "$status" = "D" ]; then
             successor_blob=$(git rev-parse ":${api_doc}" 2>/dev/null) || true
             if [ "$path" = "$doc_at_head" ] && [ -n "$doc_at_head" ] \
@@ -323,6 +331,17 @@ regenerate_api_doc "$api_tmp/$(basename "$api_doc")"
 if ! diff -u "$api_doc" "$api_tmp/$(basename "$api_doc")"; then
     fail "11/11 api" "the exported API differs from ${api_doc}, see the diff above"
 fi
+# A sanctioned transcript row only cleared the path rules. The commit
+# carries the index, so the staged transcript bytes get their own judge
+# when a sanctioned row touched the transcript in either view.
+if [ -n "$doc_row" ]; then
+    git show ":${api_doc}" > "$api_tmp/index-doc.txt" \
+        || fail "11/11 api" "the staged ${api_doc} could not be read from the index"
+    regenerate_api_doc "$api_tmp/index-regen.txt"
+    if ! diff -u "$api_tmp/index-doc.txt" "$api_tmp/index-regen.txt"; then
+        fail "11/11 api" "the committed transcript ${api_doc} differs from the regenerated API, refusing it"
+    fi
+fi
 # The pinned apidiff refuses to run when GOOS is set for its own build, so build
 # it once for the host and run that binary under the frozen context. GOBIN keeps
 # the tool out of go.mod.
@@ -334,6 +353,18 @@ api_report=$(GOOS="$frozen_goos" GOARCH="$frozen_goarch" "$api_tmp/bin/apidiff" 
 if [ -n "$api_report" ]; then
     printf '%s\n' "$api_report"
     fail "11/11 api" "apidiff reports an incompatible change against ${api_export}, see the report above"
+fi
+# A sanctioned export row gets the same index-side judge. apidiff runs
+# against the staged export bytes, the copy the commit carries.
+if [ -n "$export_row" ]; then
+    git show ":${api_export}" > "$api_tmp/index-export" \
+        || fail "11/11 api" "the staged ${api_export} could not be read from the index"
+    index_report=$(GOOS="$frozen_goos" GOARCH="$frozen_goarch" "$api_tmp/bin/apidiff" -incompatible -m "$api_tmp/index-export" "$(go list -m)") \
+        || fail "11/11 api" "apidiff could not compare against the staged ${api_export}"
+    if [ -n "$index_report" ]; then
+        printf '%s\n' "$index_report"
+        fail "11/11 api" "apidiff reports an incompatible change in the staged ${api_export}, refusing it"
+    fi
 fi
 passed
 
