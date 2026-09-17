@@ -783,6 +783,68 @@ func TestLoadMapOfSlicesStructFileOrigin(t *testing.T) {
 	}
 }
 
+func TestLoadMapOfScalarListsFileOrigin(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.toml")
+	if err := os.WriteFile(path, []byte("groups = { prod = [\"a\", \"b\"] }\n"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	var got struct {
+		Groups map[string][]string `toml:"groups"`
+	}
+	plan, err := Load(t.Context(), &got, Config{
+		Path:      path,
+		LookupEnv: mapLookup(nil),
+	})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	list, ok := got.Groups["prod"]
+	if !ok {
+		t.Fatal("missing groups.prod")
+	}
+	if len(list) != 2 || list[0] != "a" || list[1] != "b" {
+		t.Errorf("groups.prod = %v, want [a b]", list)
+	}
+	printed := plan.String()
+	want := "groups.prod\tfile\tpath=" + path + "\tresolved"
+	if !strings.Contains(printed, want) {
+		t.Errorf("plan missing file origin %q:\n%s", want, printed)
+	}
+	if strings.Contains(printed, "groups.prod\tdefault\t") {
+		t.Errorf("plan named default for a file-set nested list:\n%s", printed)
+	}
+}
+
+func TestLoadNestedScalarListsFileOrigin(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.toml")
+	if err := os.WriteFile(path, []byte("rows = [[\"a\", \"b\"]]\n"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	var got struct {
+		Rows [][]string `toml:"rows"`
+	}
+	plan, err := Load(t.Context(), &got, Config{
+		Path:      path,
+		LookupEnv: mapLookup(nil),
+	})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(got.Rows) != 1 || len(got.Rows[0]) != 2 || got.Rows[0][0] != "a" || got.Rows[0][1] != "b" {
+		t.Errorf("rows = %v, want [[a b]]", got.Rows)
+	}
+	printed := plan.String()
+	want := "rows.0\tfile\tpath=" + path + "\tresolved"
+	if !strings.Contains(printed, want) {
+		t.Errorf("plan missing file origin %q:\n%s", want, printed)
+	}
+	if strings.Contains(printed, "rows.0\tdefault\t") {
+		t.Errorf("plan named default for a file-set nested list:\n%s", printed)
+	}
+}
+
 func TestLoadCancelledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()

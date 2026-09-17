@@ -93,6 +93,10 @@ func markFileOrigins(t reflect.Type, node any, prefix []string, filePath string,
 			for i, item := range list {
 				markFileOrigins(t.Elem(), item, appendPath(prefix, strconv.Itoa(i)), filePath, origins)
 			}
+			return
+		}
+		if isScalarType(t.Elem()) {
+			origins[joinKey(prefix)] = origin{source: sourceFile, locator: loc}
 		}
 	case reflect.Map:
 		tree, ok := node.(map[string]any)
