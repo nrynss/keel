@@ -400,10 +400,11 @@ type setting struct {
 
 type settingFn func(setting) error
 
-// walkSettings visits every setting reachable from v. Nested structs are
-// walked. A nil pointer to a nested struct is allocated when it can be set.
-// A scalar slice or map is one setting. Each secret in a list or map is
-// its own setting.
+// walkSettings visits every setting reachable from v. Nested structs, maps,
+// and lists are walked. A nil pointer to a nested struct is allocated when
+// it can be set. A scalar slice or map is one setting. Each secret in a
+// list or map is its own setting. Only a Secret, or a list or map of
+// Secret as the leaf, is a secret setting.
 func walkSettings(v reflect.Value, t reflect.Type, prefix []string, parent reflect.StructField, fn settingFn) error {
 	for t.Kind() == reflect.Pointer {
 		elem := t.Elem()
@@ -458,7 +459,7 @@ func walkSettings(v reflect.Value, t reflect.Type, prefix []string, parent refle
 		if isSecretList(t) {
 			return walkSecretList(v, prefix, parent, fn)
 		}
-		if isStructElem(t.Elem()) {
+		if isContainerElem(t.Elem()) {
 			return walkIndexed(v, t.Elem(), prefix, fn)
 		}
 		return fn(setting{
@@ -471,7 +472,7 @@ func walkSettings(v reflect.Value, t reflect.Type, prefix []string, parent refle
 		if isSecretElem(t.Elem()) {
 			return walkSecretMap(v, prefix, parent, fn)
 		}
-		if isStructElem(t.Elem()) {
+		if isContainerElem(t.Elem()) {
 			return walkStructMap(v, t.Elem(), prefix, fn)
 		}
 		return fn(setting{
@@ -699,6 +700,24 @@ func isStructElem(t reflect.Type) bool {
 		t = t.Elem()
 	}
 	return t.Kind() == reflect.Struct && t != secretType
+}
+
+// isContainerElem reports a map, list, or struct that is not a Secret,
+// after pointers. Those elements are walked. A scalar element is one
+// settingList.
+func isContainerElem(t reflect.Type) bool {
+	if isStructElem(t) {
+		return true
+	}
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	switch t.Kind() {
+	case reflect.Map, reflect.Slice, reflect.Array:
+		return true
+	default:
+		return false
+	}
 }
 
 // isSecretElem reports a Secret, after pointers.

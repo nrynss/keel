@@ -513,6 +513,161 @@ func TestLoadNilPointerNestedEnv(t *testing.T) {
 	}
 }
 
+func TestLoadMapOfMapsSecretResolves(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.toml")
+	doc := `
+[groups.prod.a]
+source = "file"
+path = "/run/secrets/a"
+`
+	if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	var got struct {
+		Groups map[string]map[string]Secret `toml:"groups"`
+	}
+	plan, err := Load(t.Context(), &got, Config{
+		Path:      path,
+		LookupEnv: mapLookup(nil),
+		Registry:  valueRegistry(t, secretFixtureValue),
+	})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	inner, ok := got.Groups["prod"]
+	if !ok {
+		t.Fatal("missing groups.prod")
+	}
+	sec, ok := inner["a"]
+	if !ok {
+		t.Fatal("missing groups.prod.a")
+	}
+	val, err := sec.Reveal()
+	if err != nil {
+		t.Fatalf("Reveal: %v", err)
+	}
+	if val != secretFixtureValue {
+		t.Errorf("secret resolved to the wrong value")
+	}
+	p := plan.String()
+	if !strings.Contains(p, "groups.prod.a") {
+		t.Errorf("plan missing nested key:\n%s", p)
+	}
+	assertQuiet(t, p, secretFixtureValue)
+}
+
+func TestLoadSliceOfMapsSecretResolves(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.toml")
+	doc := `rows = [{a = {source = "file", path = "/run/secrets/a"}}]`
+	if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	var got struct {
+		Rows []map[string]Secret `toml:"rows"`
+	}
+	plan, err := Load(t.Context(), &got, Config{
+		Path:      path,
+		LookupEnv: mapLookup(nil),
+		Registry:  valueRegistry(t, secretFixtureValue),
+	})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(got.Rows) != 1 {
+		t.Fatalf("len(rows) = %d, want 1", len(got.Rows))
+	}
+	sec, ok := got.Rows[0]["a"]
+	if !ok {
+		t.Fatal("missing rows.0.a")
+	}
+	val, err := sec.Reveal()
+	if err != nil {
+		t.Fatalf("Reveal: %v", err)
+	}
+	if val != secretFixtureValue {
+		t.Errorf("secret resolved to the wrong value")
+	}
+	p := plan.String()
+	if !strings.Contains(p, "rows.0.a") && !strings.Contains(p, "rows.a") {
+		t.Errorf("plan missing nested key:\n%s", p)
+	}
+	assertQuiet(t, p, secretFixtureValue)
+}
+
+func TestLoadMapOfSecretListsResolves(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.toml")
+	doc := `groups = { prod = [{source = "file", path = "/run/secrets/a"}] }`
+	if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	var got struct {
+		Groups map[string][]Secret `toml:"groups"`
+	}
+	plan, err := Load(t.Context(), &got, Config{
+		Path:      path,
+		LookupEnv: mapLookup(nil),
+		Registry:  valueRegistry(t, secretFixtureValue),
+	})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	list, ok := got.Groups["prod"]
+	if !ok {
+		t.Fatal("missing groups.prod")
+	}
+	if len(list) != 1 {
+		t.Fatalf("len(groups.prod) = %d, want 1", len(list))
+	}
+	val, err := list[0].Reveal()
+	if err != nil {
+		t.Fatalf("Reveal: %v", err)
+	}
+	if val != secretFixtureValue {
+		t.Errorf("secret resolved to the wrong value")
+	}
+	p := plan.String()
+	if !strings.Contains(p, "groups.prod") {
+		t.Errorf("plan missing nested key:\n%s", p)
+	}
+	assertQuiet(t, p, secretFixtureValue)
+}
+
+func TestLoadMapOfMapsStructEnvOverlay(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.toml")
+	if err := os.WriteFile(path, []byte("[groups.prod.openai]\nmodel = \"file-model\"\n"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	var got struct {
+		Groups map[string]map[string]struct {
+			Model string `toml:"model"`
+		} `toml:"groups"`
+	}
+	_, err := Load(t.Context(), &got, Config{
+		Path: path,
+		LookupEnv: mapLookup(map[string]string{
+			"GROUPS_PROD_OPENAI_MODEL": "env-model",
+		}),
+	})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	inner, ok := got.Groups["prod"]
+	if !ok {
+		t.Fatal("missing groups.prod")
+	}
+	p, ok := inner["openai"]
+	if !ok {
+		t.Fatal("missing groups.prod.openai")
+	}
+	if p.Model != "env-model" {
+		t.Errorf("model = %q, want env-model", p.Model)
+	}
+}
+
 func TestLoadCancelledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
