@@ -93,7 +93,7 @@ mux.HandleFunc("GET /jobs/{id}/events", func(w http.ResponseWriter, r *http.Requ
 })
 ```
 
-Subscribe first, then read the job's state. The broker retains the terminal event for one minute,
+Subscribe first, then read the job's state. The broker retains the terminal event for the bound in `stream.Config.Retain`, one minute at defaults,
 so a subscriber that joins within retention still learns the outcome.
 
 ### Store media privately and serve it with seeking
@@ -270,7 +270,7 @@ Event names travel in each frame: `progress` while work runs, then one terminal 
 ```
 
 An `error` terminal embeds the same envelope body a failed response carries, so one parser reads
-both. The broker retains the terminal event for one minute, so a subscriber that joins within retention still receives it. A subscriber that joins after expiry gets live events only. The client
+both. The broker retains the terminal event for the bound in `stream.Config.Retain`, one minute at defaults, so a subscriber that joins within retention still receives it. A subscriber that joins after expiry gets live events only. The client
 subscribes first, then calls `Runner.Result` for the stored state, then drops a duplicate on the
 job id. A `Result` read for an unknown id fails with `job: unknown id` rather than a frame.
 
