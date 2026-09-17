@@ -41,11 +41,14 @@ staticcheck_version="v0.8.1"
 apidiff_version="v0.0.0-20260908205506-85c1c2202aba"
 
 # Two records freeze the exported API, and both live under api/.
-# api/v0.2.0.txt is the readable go doc -all transcript, which a diff can show
-# and a reviewer can read. api/v0.2.0.export is the binary export data that the
-# apidiff tool compares against. apidiff reads no transcript and a human reads
-# no export data, so the two formats stay separate on purpose.
-api_doc="api/v0.2.0.txt"
+# api_doc is the readable go doc -all transcript of the surface under
+# construction, which a diff can show and a reviewer can read. It moves with
+# the work. api_export is the binary export data of the latest release, which
+# the apidiff tool compares against. It never moves. apidiff reads no
+# transcript and a human reads no export data, so the formats stay separate on
+# purpose. A compatible addition updates the transcript. An incompatible
+# change fails against the release export.
+api_doc="api/next.txt"
 api_export="api/v0.2.0.export"
 
 # Both records are taken from one frozen build context, linux/amd64, which is
@@ -249,19 +252,26 @@ regenerate_api_doc() {
     done < <(recorded_packages)
 }
 
-# Check 11: the exported API matches both frozen records, taken from the one
-# frozen build context named above, linux/amd64, which CI also runs on. The
-# transcript half regenerates under that context, so the same bytes come out on
-# any host. The conventions check keeps every file inside that context, so a file
-# from another context cannot grow the surface the records never see.
+# Check 11: the exported API matches both records, taken from the one frozen
+# build context named above, linux/amd64, which CI also runs on. The transcript
+# half regenerates under that context, so the same bytes come out on any host.
+# The conventions check keeps every file inside that context, so a file from
+# another context cannot grow the surface the records never see.
 #
-# The records freeze the surface of the last release. A compatible addition,
-# such as the package the current work adds, is not a change to that surface. It
-# does not fail here, and the release that ships it writes its own record pair.
-# The transcript catches a signature or a doc change a reader can see inside a
-# recorded package. The baseline catches every incompatible change, whether or
-# not a recorded package carries it.
+# The export record stays at the last release. apidiff refuses every
+# incompatible change against it, whether or not a recorded package carries it.
+# The transcript record describes the surface under construction. It fails on
+# any visible change inside a recorded package until it is updated. Every other
+# record under api/ is frozen at its release, and the guard below refuses to
+# move it.
 header "11/11 api"
+# The released records are frozen at their release. Only the transcript of
+# the surface under construction moves with the work, so the api check first
+# refuses any other change under api/. A rename that left a stale record
+# behind, or an edit that rewrote a released record, fails here.
+if ! git diff --quiet HEAD -- api/ ":!${api_doc}"; then
+    fail "11/11 api" "a released record under api/ changed, only ${api_doc} may move"
+fi
 api_tmp=$(mktemp -d)
 trap 'rm -rf "$api_tmp"' EXIT
 regenerate_api_doc "$api_tmp/$(basename "$api_doc")"

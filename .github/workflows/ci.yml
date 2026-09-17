@@ -2,11 +2,9 @@
 # The job runs the same gates as tools/check.sh so CI and the workstation agree.
 name: ci
 
+# CI runs for a release, not while a phase of work is open. The release
+# restores the push and pull_request triggers and owns the first run.
 on:
-  push:
-    branches:
-      - main
-  pull_request:
   workflow_dispatch:
 
 jobs:
