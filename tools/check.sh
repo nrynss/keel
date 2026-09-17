@@ -227,6 +227,8 @@ passed
 # recorded_packages names the packages the transcript record covers, in the
 # order the record writes them. The guard covers the surface a release shipped,
 # so a package no release has carried yet is not compared against the record.
+# The transcript regenerates only listed packages, so a dropped package needs its header removed from the record.
+# Reviewers must diff the header list on release.
 recorded_packages() {
     sed -n 's/^########## //p' "$api_doc"
 }

@@ -88,13 +88,13 @@ kind that is safe to repeat opts in.
 The browser follows the job over server-sent events:
 
 ```go
-mux.HandleFunc("GET /api/jobs/{id}/events", func(w http.ResponseWriter, r *http.Request) {
-	broker.ServeTopic(w, r, "job:"+r.PathValue("id"))
+mux.HandleFunc("GET /jobs/{id}/events", func(w http.ResponseWriter, r *http.Request) {
+	broker.ServeTopic(w, r, job.Topic(r.PathValue("id")))
 })
 ```
 
-Subscribe first, then read the job's state. A topic can retain its terminal event, so a subscriber
-that joins late still learns the outcome.
+Subscribe first, then read the job's state. The broker retains the terminal event for one minute,
+so a subscriber that joins within retention still learns the outcome.
 
 ### Store media privately and serve it with seeking
 
@@ -210,8 +210,10 @@ that `stream` and `job` publish, so a browser client and the server agree on one
 
 ## Endpoints
 
-Every route below is an `http.Handler` value the app mounts on its own mux. All failures answer
-with the `wire` envelope, and clients branch on its `code`.
+Every route below is an `http.Handler` value the app mounts on its own mux.
+Gate refusals, upload failures, job terminal embeds, and direct app calls share the `wire` envelope, and clients branch on its `code`.
+Mediastore answers with plain `http.NotFound` and `http.Error` bodies for 404 unknown or refused, 405, and 500, never the envelope.
+ServeTopic writes SSE frames, not envelope JSON.
 
 ### Guarded routes with gate
 
@@ -230,7 +232,7 @@ guarded, err := g.Protect(gate.Rule{
 mux.Handle("POST /api/render", guarded)
 ```
 
-Refusals answer with the envelope and take no token from either bucket. A missing or wrong
+Refusals answer with the `wire` envelope and take no token from either bucket. A missing or wrong
 passcode answers 403 with code `passcode_required`. The passcode arrives in the `X-Passcode`
 header or the `passcode` cookie when the config leaves the names at defaults. An empty bucket
 answers 429 with code `rate_limited` and a `retry_after_seconds` detail, mirrored in the
@@ -242,20 +244,21 @@ Entry points: `stream.New`, `Broker.Subscribe`, `Broker.Publish`, `Broker.ServeT
 `job.Topic`, `job.Open`, `Runner.Start`, `Runner.StartKind`, `Runner.Result`, `Runner.Cancel`,
 `wire.SetEventHeaders`, `wire.WriteEvent`, `wire.ReadEvent`.
 
-The app exposes one stream route per job. The path below is the convention the examples use, and
-the app mounts it wherever its jobs live:
+The app exposes one stream route per job. The app chooses the path below as its convention, and it matches the stream example.
+The app mounts it wherever its jobs live:
 
 ```go
-mux.HandleFunc("GET /api/jobs/{id}/events", func(w http.ResponseWriter, r *http.Request) {
+mux.HandleFunc("GET /jobs/{id}/events", func(w http.ResponseWriter, r *http.Request) {
 	broker.ServeTopic(w, r, job.Topic(r.PathValue("id")))
 })
 ```
 
 `GET` opens a `text/event-stream` response with `Cache-Control: no-store`. `ServeTopic`
 subscribes to the job topic and writes one frame per published event until the client goes away
-or the subscription ends. A quiet connection sends a `: ping` comment on each heartbeat so a
-proxy keeps it open. The request has no body and no auth of its own. Wrap the route with `Protect`
-when the stream should cost against the same budget as the work.
+or the subscription ends. ServeTopic writes SSE frames, not envelope JSON. A quiet connection
+sends a `: ping` comment on each heartbeat so a proxy keeps it open. The request has no body and
+no auth of its own. Wrap the route with `Protect` when the stream should draw from the same rate
+limit buckets as the work.
 
 Event names travel in each frame: `progress` while work runs, then one terminal of `done`,
 `error`, `cancelled`, or `interrupted`. Payload shapes share the job id:
@@ -267,7 +270,7 @@ Event names travel in each frame: `progress` while work runs, then one terminal 
 ```
 
 An `error` terminal embeds the same envelope body a failed response carries, so one parser reads
-both. A terminal event is retained, so a subscriber that joins late still receives it. The client
+both. The broker retains the terminal event for one minute, so a subscriber that joins within retention still receives it. A subscriber that joins after expiry gets live events only. The client
 subscribes first, then calls `Runner.Result` for the stored state, then drops a duplicate on the
 job id. A `Result` read for an unknown id fails with `job: unknown id` rather than a frame.
 
@@ -292,7 +295,7 @@ names its bytes for good. A private blob answers with `Cache-Control: private, n
 when `Config.Authorize` allows the live request. A refusal answers 404, the same shape as an
 unknown or malformed id, so the response never confirms a private blob exists. A metadata row
 whose file has vanished also answers 404 while the server logs the fault. A lookup that fails for
-another reason answers 500.
+another reason answers 500. These answers use plain `http.NotFound` and `http.Error` bodies, never the `wire` envelope.
 
 ### Resumable uploads with upload
 
@@ -300,13 +303,13 @@ Entry points: `upload.New`, `Handler.Mount`, `Handler.ServeHTTP`, `Handler.Start
 `Handler.Sweep`, `Handler.Close`.
 
 `Mount` registers the handler on a mux under its base path, `/uploads` by default. All four
-routes share the envelope on failure, and clients branch on its code. The JSON shapes stay small:
+routes share the `wire` envelope on failure, and clients branch on its code. The JSON shapes stay small:
 state answers echo the upload, and completion answers with the stored id and digest.
 
 - `POST {base}` opens an upload. The request body is JSON with `owner`, `content_type`, optional
 `group`, optional `visibility` of `private` or `public`, optional `size_bytes`, and optional
 `chunk_size`. It answers 201 with the upload state: `id`, `owner`, `content_type`,
-`visibility`, `chunk_size`, `stored_bytes`, `received`, `missing`, and `expires_at`. A bad field
+`visibility`, `chunk_size`, `stored_bytes`, `received`, `missing`, and `expires_at`. The state adds `size_bytes` and `chunk_count` when the open declared a size. A bad field
 answers 400 with code `invalid_request` and the field name. An upload or owner over its byte limit
 answers 413 with code `limit_exceeded` and the limit name.
 - `PUT {base}/{id}/chunks/{n}` stores chunk `n`. The chunk bytes are the body and
@@ -325,7 +328,7 @@ stores the bytes under the upload id. The request body is JSON with `sha256`. It
 bytes answers 409 with code `hash_mismatch` and both digests. A content type the store refuses
 answers 415 with code `unsupported_type`.
 
-A wrong method on a known route answers 405 and names the allowed method. An unknown path under
+A wrong method on a known route answers 405 with code `invalid_request` and names the allowed method. Clients must branch on status plus code for method errors. An unknown path under
 the base answers 404 with code `not_found`.
 
 ### The shared error envelope with wire
@@ -341,7 +344,7 @@ Entry points: `wire.WriteError`, `wire.WriteEvent`, `wire.WriteHeartbeat`,
 
 It sets `Content-Type: application/json` and `Cache-Control: no-store` on every response. A 429
 also sets `Retry-After` from the `retry_after_seconds` member of the detail, rounded up with a
-floor of 1, so header and body never disagree. `gate` refusals, `upload` failures, and any app
+floor of 1, so header and body never disagree. `gate` refusals, `upload` failures, job terminal embeds, and any app
 route that calls it directly all share this body.
 
 ## Examples
