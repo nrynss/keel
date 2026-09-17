@@ -271,21 +271,43 @@ header "11/11 api"
 # ordinary tree passes there. The guard judges any other change under api/
 # below, and names the record it refuses.
 #
-# One move is sanctioned, the release move. A release renames the transcript
-# to its new name and repoints api_doc in this script. Pre-commit the move
-# shows up here as the deletion of the transcript path that the last commit
-# gated, and this script reads that path from HEAD. The deletion passes only
-# when those exact bytes now sit at the current transcript path. Every other
-# deletion, rename or edit of a released record fails by name.
-if ! git diff --quiet HEAD -- api/ ":!${api_doc}"; then
-    prev_doc=$(git show HEAD:tools/check.sh | sed -n 's/^api_doc="\(.*\)"$/\1/p')
+# One move is sanctioned, the release move. A release births a new pair, the
+# new transcript and its export record, so the release adds both records of
+# the pair and repoints the pair variables in this script. The guard reads
+# the change rows under api/ with one diff and judges each row against the
+# pair variables and against the transcript path that HEAD gated, which it
+# reads from HEAD, so no record name is hardcoded. A staged restore of that
+# old path is a byte-identical no-op the diff cannot see, so after the rows
+# the guard asks the index for the old path and refuses it by name. The guard
+# names the first record it refuses and exits there, fail-fast by design.
+doc_at_head=$(git show HEAD:tools/check.sh | sed -n 's/^api_doc="\(.*\)"$/\1/p')
+rows=$(git diff --name-status --no-renames HEAD -- api/)
+stale_index() {
+    [ -n "$doc_at_head" ] && [ "$doc_at_head" != "$api_doc" ] \
+        && [ -n "$(git ls-files -- "$doc_at_head")" ]
+}
+if [ -n "$rows" ] || stale_index; then
     while IFS=$'\t' read -r status path; do
-        if [ "$status" = "D" ] && [ "$path" = "$prev_doc" ] \
-                && cmp -s <(git show "HEAD:${prev_doc}") "$api_doc"; then
-            continue
+        if [ "$status" = "M" ]; then
+            [ "$path" = "$api_doc" ] && continue
+            fail "11/11 api" "a released record under api/ changed: ${path}, only ${api_doc} may move"
+        elif [ "$status" = "A" ]; then
+            { [ "$path" = "$api_doc" ] || [ "$path" = "$api_export" ]; } && continue
+            fail "11/11 api" "a new record under api/ was added: ${path}, only the release pair ${api_doc} and ${api_export} may appear"
+        elif [ "$status" = "D" ]; then
+            if [ "$path" = "$doc_at_head" ] && [ -n "$doc_at_head" ] \
+                    && [ "$doc_at_head" != "$api_doc" ] && [ -f "$api_doc" ] \
+                    && [ "$(git hash-object "$api_doc")" = "$(git rev-parse "HEAD:${path}")" ]; then
+                continue
+            fi
+            fail "11/11 api" "a released record under api/ was deleted: ${path}, only the move to ${api_doc} is sanctioned"
+        else
+            fail "11/11 api" "a record under api/ changed: ${path}, status ${status} is not sanctioned"
         fi
-        fail "11/11 api" "a released record under api/ changed: ${path}, only ${api_doc} may move"
-    done < <(git diff --name-status HEAD -- api/ ":!${api_doc}")
+    done <<<"$rows"
+    if stale_index; then
+        fail "11/11 api" "the stale record ${doc_at_head} is still staged, a release leaves no record at the old transcript path"
+    fi
 fi
 api_tmp=$(mktemp -d)
 trap 'rm -rf "$api_tmp"' EXIT
