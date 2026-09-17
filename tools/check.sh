@@ -41,12 +41,12 @@ staticcheck_version="v0.8.1"
 apidiff_version="v0.0.0-20260908205506-85c1c2202aba"
 
 # Two records freeze the exported API, and both live under api/.
-# api/v0.1.0.txt is the readable go doc -all transcript, which a diff can show
-# and a reviewer can read. api/v0.1.0.export is the binary export data that the
+# api/v0.2.0.txt is the readable go doc -all transcript, which a diff can show
+# and a reviewer can read. api/v0.2.0.export is the binary export data that the
 # apidiff tool compares against. apidiff reads no transcript and a human reads
 # no export data, so the two formats stay separate on purpose.
-api_doc="api/v0.1.0.txt"
-api_export="api/v0.1.0.export"
+api_doc="api/v0.2.0.txt"
+api_export="api/v0.2.0.export"
 
 # Both records are taken from one frozen build context, linux/amd64, which is
 # also the context CI runs on. The transcript is generated under it, so the same
