@@ -24,6 +24,13 @@
 // overshoots can therefore push booked spend past the ceiling, exactly as the
 // in-memory cost.Budget does.
 //
+// A KeyedBudget over the same store adds a ceiling per owner. The owner
+// ceilings live in their own table beside the one global ceiling, and every
+// keyed hold also counts against the global one, so an owner that exhausts
+// its share never touches another owner's headroom. The empty owner key
+// names the unkeyed budget the store itself keeps, so the keyed budget
+// refuses it.
+//
 // This package is one of the few allowed to import the SQLite driver. The
 // ledger arithmetic itself stays in the cost package, and every total is
 // summed through a cost.Ledger so the overflow rule never drifts.

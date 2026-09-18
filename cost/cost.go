@@ -1,7 +1,8 @@
 // Package cost records what paid API calls spend. A Price counts nanodollars
 // in an int64, so sums stay exact to the cent. A Ledger keeps charges and
 // totals them by kind and by reference. A Budget bounds the spend of a
-// sequence of calls. Rate cards stay in each application.
+// sequence of calls, and a KeyedBudget gives each of several owners a share
+// of one pool under a global ceiling. Rate cards stay in each application.
 package cost
 
 import (

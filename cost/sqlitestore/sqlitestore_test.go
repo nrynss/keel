@@ -258,13 +258,14 @@ func TestTotalReportsOverflow(t *testing.T) {
 }
 
 // TestOpenAppliesMigrationsOnce reopens the same file and counts the migration
-// ledger, so a second open cannot run a schema file again.
+// ledger, so a second open cannot run a schema file again. The ledger holds
+// one row per schema file the package owns, and both files are applied.
 func TestOpenAppliesMigrationsOnce(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "cost.db")
 	openStore(t, path)
 	openStore(t, path)
-	if n := freshCount(t, path, "cost_schema_migrations"); n != 1 {
-		t.Fatalf("migration ledger rows = %d, want 1", n)
+	if n := freshCount(t, path, "cost_schema_migrations"); n != 2 {
+		t.Fatalf("migration ledger rows = %d, want 2", n)
 	}
 }
 
@@ -1064,7 +1065,10 @@ func costTablesOn(t *testing.T, path string) []string {
 // assertWholeCostSchema checks that a cancelled open left a schema a retry can
 // complete. The migration runner creates the ledger table first and applies
 // each file in one transaction, so the cost tables on disk are either absent,
-// the ledger alone, or the ledger with every data table.
+// the ledger alone, the first file's data tables alone, or every data table.
+// A database that carries any table of the first file carries all of them,
+// because one file commits as a unit, and it may or may not carry the owner
+// table the second file adds.
 func assertWholeCostSchema(t *testing.T, deadline int, tables []string) {
 	t.Helper()
 	if len(tables) == 0 {
@@ -1077,10 +1081,17 @@ func assertWholeCostSchema(t *testing.T, deadline int, tables []string) {
 	if !present["cost_schema_migrations"] {
 		t.Fatalf("a %dus deadline left %v with no ledger table", deadline, tables)
 	}
-	if !present["cost_charge"] && !present["cost_budget"] && !present["cost_reservation"] {
+	firstFile := []string{"cost_charge", "cost_budget", "cost_reservation"}
+	any := false
+	for _, name := range firstFile {
+		if present[name] {
+			any = true
+		}
+	}
+	if !any {
 		return
 	}
-	for _, name := range []string{"cost_charge", "cost_budget", "cost_reservation"} {
+	for _, name := range firstFile {
 		if !present[name] {
 			t.Fatalf("a %dus deadline left a partial schema: %v", deadline, tables)
 		}
