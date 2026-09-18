@@ -1,6 +1,7 @@
 package cost_test
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/nrynss/keel/cost"
@@ -72,4 +73,59 @@ func ExampleKeyedBudget() {
 	// Output:
 	// $0.32
 	// $0.40
+}
+
+// ExampleMeter runs one measured call and one call without a usage report
+// for one owner of a keyed budget, through the same account shape a plain
+// budget offers.
+func ExampleMeter() {
+	budget, err := cost.NewKeyedBudget(cost.USD(1.00))
+	if err != nil {
+		fmt.Println("keyed budget failed:", err)
+		return
+	}
+	if err := budget.SetLimit("team-a", cost.USD(0.40)); err != nil {
+		fmt.Println("owner limit failed:", err)
+		return
+	}
+	account, err := budget.Owner("team-a")
+	if err != nil {
+		fmt.Println("owner account failed:", err)
+		return
+	}
+	meter, err := cost.NewMeter(account, cost.NewLedger())
+	if err != nil {
+		fmt.Println("meter failed:", err)
+		return
+	}
+
+	measured, err := meter.Call(context.Background(), cost.USD(0.10), "tts", "job-1",
+		func(context.Context) (cost.Usage, error) {
+			return cost.Usage{Price: cost.USD(0.08), Measured: true}, nil
+		})
+	if err != nil {
+		fmt.Println("measured call failed:", err)
+		return
+	}
+	estimated, err := meter.Call(context.Background(), cost.USD(0.10), "llm", "job-2",
+		func(context.Context) (cost.Usage, error) {
+			return cost.Usage{}, nil // the upstream reported no usage
+		})
+	if err != nil {
+		fmt.Println("estimated call failed:", err)
+		return
+	}
+	remaining, err := budget.Remaining("team-a")
+	if err != nil {
+		fmt.Println("remaining failed:", err)
+		return
+	}
+
+	fmt.Println(measured.Price, measured.Measured)
+	fmt.Println(estimated.Price, estimated.Measured)
+	fmt.Println(remaining)
+	// Output:
+	// $0.08 true
+	// $0.10 false
+	// $0.22
 }

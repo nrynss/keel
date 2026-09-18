@@ -134,3 +134,36 @@ func (k *KeyedBudget) Remaining(owner string) (Price, error) {
 	}
 	return o.Remaining()
 }
+
+// Owner returns one owner's account, shaped for NewMeter. It reports
+// ErrUnknownOwner when no ceiling was set for owner, so a mistyped owner
+// stops before a call runs. The account reserves and settles against the
+// owner's ceiling and against the global one, exactly as this budget's own
+// keyed methods do.
+func (k *KeyedBudget) Owner(owner string) (Account, error) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if _, ok := k.owners[owner]; !ok {
+		return nil, fmt.Errorf("cost: account for owner %q: %w", owner, ErrUnknownOwner)
+	}
+	return ownerAccount{keyed: k, owner: owner}, nil
+}
+
+// ownerAccount drives one owner of a keyed budget through the Account shape
+// the meter consumes.
+type ownerAccount struct {
+	keyed *KeyedBudget
+	owner string
+}
+
+func (a ownerAccount) Reserve(estimate Price) error {
+	return a.keyed.Reserve(a.owner, estimate)
+}
+
+func (a ownerAccount) Settle(reserved, actual Price) error {
+	return a.keyed.Settle(a.owner, reserved, actual)
+}
+
+func (a ownerAccount) Release(reserved Price) {
+	_ = a.keyed.Release(a.owner, reserved) // the owners map only grows, so the refusal cannot fire for a built account
+}
