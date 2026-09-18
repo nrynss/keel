@@ -261,3 +261,29 @@ func TestExpiredOpenListsOnlyPastCapOpenRows(t *testing.T) {
 		t.Fatalf("expired open without a limit error = %v, want ErrInvalid", err)
 	}
 }
+
+// TestExpiredOpenListsPastCapClosingRows pins that the sweep read returns
+// a stranded closing row beside the open ones, and still skips live and
+// settled rows.
+func TestExpiredOpenListsPastCapClosingRows(t *testing.T) {
+	store := openStore(t, filepath.Join(t.TempDir(), "lease.db"))
+	ctx := t.Context()
+	stranded := sampleLease("stranded")
+	stranded.State = lease.StateClosing
+	stranded.ExpiresAt = base.Add(-time.Minute)
+	liveClosing := sampleLease("live-closing")
+	liveClosing.State = lease.StateClosing
+	liveClosing.ExpiresAt = base.Add(time.Hour)
+	for _, row := range []lease.Lease{stranded, liveClosing} {
+		if err := store.Create(ctx, row); err != nil {
+			t.Fatalf("create %s: %v", row.ID, err)
+		}
+	}
+	got, err := store.ExpiredOpen(ctx, base, 10)
+	if err != nil {
+		t.Fatalf("expired open: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "stranded" {
+		t.Fatalf("expired open = %v, want [stranded]", got)
+	}
+}

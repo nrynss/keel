@@ -189,10 +189,13 @@ func (s *Store) CloseIfOpen(ctx context.Context, l lease.Lease) (bool, error) {
 	return true, nil
 }
 
-// ExpiredOpen lists every row that still reads open with a deadline at or
-// before now, oldest deadline first. The limit bounds the pass, so one call
-// never loads the whole table. A cancelled context stops the read and
-// returns no rows rather than the rows it had already decoded.
+// ExpiredOpen lists every row that still reads open or closing with a
+// deadline at or before now, oldest deadline first. Closing rows land here
+// because a closer may die between the claim write and the final write, and
+// the stranded row must expire with the ordinary open ones. The limit
+// bounds the pass, so one call never loads the whole table. A cancelled
+// context stops the read and returns no rows rather than the rows it had
+// already decoded.
 func (s *Store) ExpiredOpen(ctx context.Context, now time.Time, limit int) ([]lease.Lease, error) {
 	if limit <= 0 {
 		return nil, fmt.Errorf("sqlitestore: expired open: %w: limit must be positive", lease.ErrInvalid)
@@ -200,8 +203,8 @@ func (s *Store) ExpiredOpen(ctx context.Context, now time.Time, limit int) ([]le
 	rows, err := s.db.Reader().QueryContext(ctx,
 		`SELECT id, state, opened_at, expires_at, closed_at,
 			estimate_nd, settled_nd, reported_nd, reconciled, kind, owner
-		FROM lease_entry WHERE state = ? AND expires_at <= ? ORDER BY expires_at, id LIMIT ?`,
-		string(lease.StateOpen), now.UnixNano(), limit)
+		FROM lease_entry WHERE state IN (?, ?) AND expires_at <= ? ORDER BY expires_at, id LIMIT ?`,
+		string(lease.StateOpen), string(lease.StateClosing), now.UnixNano(), limit)
 	if err != nil {
 		return nil, fmt.Errorf("sqlitestore: expired open: %w", err)
 	}

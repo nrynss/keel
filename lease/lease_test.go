@@ -705,3 +705,79 @@ func TestReclaimOfAnUnknownLeaseReportsIt(t *testing.T) {
 		t.Fatalf("reclaim of a missing lease error = %v, want ErrUnknownLease", err)
 	}
 }
+
+// TestStrandedClosingLeaseExpiresPastItsCap strands one row in closing the
+// way a dead closer leaves it, then pins that a past-cap touch expires it
+// through ordinary calls. The retry settles nothing, so the stranded spend
+// stays booked exactly once and the slot frees.
+func TestStrandedClosingLeaseExpiresPastItsCap(t *testing.T) {
+	path := t.TempDir() + "/lease.db"
+	clock := &testClock{at: base}
+	first, meter, store := fixture(t, path, 1, 100000, clock)
+	ctx := t.Context()
+	got := openLease(t, first, 100)
+	row, err := store.Get(ctx, got.ID)
+	if err != nil {
+		t.Fatalf("read the open row: %v", err)
+	}
+	row.State = lease.StateClosing
+	claimed, err := store.CloseIfOpen(ctx, row)
+	if err != nil {
+		t.Fatalf("claim the row: %v", err)
+	}
+	if !claimed {
+		t.Fatalf("claim the row = false, want true")
+	}
+	clock.advance(61 * time.Minute)
+	db := openDB(t, path)
+	secondStore, err := leasesql.Open(t.Context(), leasesql.Config{
+		DB:     db,
+		Logger: slog.New(slog.DiscardHandler),
+	})
+	if err != nil {
+		t.Fatalf("reopen lease store: %v", err)
+	}
+	secondQuota, err := lease.NewQuota(1)
+	if err != nil {
+		t.Fatalf("new quota: %v", err)
+	}
+	secondMeter := newFakeMeter(t, 100000)
+	second, err := lease.New(lease.Config{
+		Quota: secondQuota,
+		Meter: secondMeter,
+		Store: secondStore,
+		Cap:   time.Hour,
+		Kind:  "session",
+		Now:   clock.now,
+		Log:   slog.New(slog.DiscardHandler),
+	})
+	if err != nil {
+		t.Fatalf("new second manager: %v", err)
+	}
+	freed, err := second.Reclaim(t.Context(), nil)
+	if err != nil {
+		t.Fatalf("reclaim the stranded row: %v", err)
+	}
+	if freed != 1 {
+		t.Fatalf("reclaimed = %d, want 1", freed)
+	}
+	read, err := second.Inspect(t.Context(), got.ID)
+	if err != nil {
+		t.Fatalf("inspect the stranded lease: %v", err)
+	}
+	if read.State != lease.StateExpired {
+		t.Fatalf("stranded state = %q, want expired", read.State)
+	}
+	if _, err := second.Close(t.Context(), got.ID, 110); !errors.Is(err, lease.ErrInvalid) {
+		t.Fatalf("close of the stranded lease error = %v, want ErrInvalid", err)
+	}
+	if _, err := second.Reconcile(t.Context(), got.ID, 110); !errors.Is(err, lease.ErrInvalid) {
+		t.Fatalf("reconcile of the stranded lease error = %v, want ErrInvalid", err)
+	}
+	if got := secondMeter.meterSpent(); got != 0 {
+		t.Fatalf("second manager spent = %d, want 0, expiry settles nothing", got)
+	}
+	if got := meter.meterSpent(); got != 100 {
+		t.Fatalf("first manager spent = %d, want 100, the open estimate only", got)
+	}
+}
