@@ -271,6 +271,11 @@ func (e *Eraser) resume(rec job.Record) (job.Func, error) {
 		return nil, fmt.Errorf("erase: resume %s: %w", rec.ID, err)
 	}
 	return func(ctx context.Context, progress func(job.Progress)) ([]byte, error) {
+		// The inherited ledger lands on this attempt's record before
+		// any work starts. A restart that catches the attempt during
+		// the rebuild then finds a snapshot to resume from, instead
+		// of a record whose ref lives only in memory.
+		e.publish(progress, s)
 		targets, err := e.source(ctx, s.Ref)
 		if err != nil {
 			return nil, fmt.Errorf("erase: source %s: %w", s.Ref, err)
