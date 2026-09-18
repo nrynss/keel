@@ -1061,3 +1061,132 @@ func TestCloseLosesToAFinishedSweep(t *testing.T) {
 		t.Fatalf("inspect state = %q, want expired", read.State)
 	}
 }
+
+// failingMeter refuses one close settle, so the close under test reports a
+// settle failure while a sweep runs past the cap mid close.
+type failingMeter struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+// Call parks one close inside the seam, then refuses the settle without
+// booking anything, so the sweep expiry stands alone.
+func (f *failingMeter) Call(_ context.Context, _ cost.Price, _, _ string, _ cost.Work) (cost.Usage, error) {
+	f.entered <- struct{}{}
+	<-f.release
+	return cost.Usage{}, errors.New("lease: probe refused settle")
+}
+
+// TestFailedSettleKeepsAFinishedSweepExpiry pins that a close whose settle
+// fails after a sweep already expired its closing row leaves the expired row
+// alone. The close still reports its settle failure, the row stays expired
+// with nothing booked, and the slot frees exactly once through the sweep.
+func TestFailedSettleKeepsAFinishedSweepExpiry(t *testing.T) {
+	path := t.TempDir() + "/lease.db"
+	clock := &testClock{at: base}
+	ctx := t.Context()
+	db := openDB(t, path)
+	store, err := leasesql.Open(ctx, leasesql.Config{
+		DB:     db,
+		Logger: slog.New(slog.DiscardHandler),
+	})
+	if err != nil {
+		t.Fatalf("open lease store: %v", err)
+	}
+	meter := newFakeMeter(t, 100000)
+	openQuota, err := lease.NewQuota(2)
+	if err != nil {
+		t.Fatalf("new quota: %v", err)
+	}
+	opener, err := lease.New(lease.Config{
+		Quota: openQuota,
+		Meter: meter.meter,
+		Store: store,
+		Cap:   time.Hour,
+		Kind:  "session",
+		Now:   clock.now,
+		Log:   slog.New(slog.DiscardHandler),
+	})
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	got := openLease(t, opener, 100)
+	failer := &failingMeter{entered: make(chan struct{}, 1), release: make(chan struct{})}
+	closeQuota, err := lease.NewQuota(2)
+	if err != nil {
+		t.Fatalf("new quota: %v", err)
+	}
+	closer, err := lease.New(lease.Config{
+		Quota: closeQuota,
+		Meter: failer,
+		Store: store,
+		Cap:   time.Hour,
+		Kind:  "session",
+		Now:   clock.now,
+		Log:   slog.New(slog.DiscardHandler),
+	})
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	closeDone := make(chan error, 1)
+	go func() {
+		_, err := closer.Close(context.Background(), got.ID, 110)
+		closeDone <- err
+	}()
+	select {
+	case <-failer.entered:
+	case <-time.After(10 * time.Second):
+		close(failer.release)
+		t.Fatalf("close did not reach the seam")
+	}
+	clock.advance(61 * time.Minute)
+	sweeper, _, _ := fixture(t, path, 2, 100000, clock)
+	freed, err := sweeper.Reclaim(context.Background(), nil)
+	if err != nil {
+		close(failer.release)
+		t.Fatalf("sweep: %v", err)
+	}
+	if freed != 1 {
+		close(failer.release)
+		t.Fatalf("sweep freed = %d, want 1", freed)
+	}
+	mid, err := store.Get(ctx, got.ID)
+	if err != nil {
+		close(failer.release)
+		t.Fatalf("read swept row: %v", err)
+	}
+	if mid.State != lease.StateExpired {
+		close(failer.release)
+		t.Fatalf("swept state = %q, want expired", mid.State)
+	}
+	close(failer.release)
+	var closeErr error
+	select {
+	case closeErr = <-closeDone:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("close did not finish")
+	}
+	if closeErr == nil {
+		t.Fatalf("failed close error = nil, want the settle failure")
+	}
+	final, err := store.Get(ctx, got.ID)
+	if err != nil {
+		t.Fatalf("read final row: %v", err)
+	}
+	if final.State != lease.StateExpired {
+		t.Fatalf("final state = %q, want expired", final.State)
+	}
+	if final.Settled != 0 || final.Reported != 0 {
+		t.Fatalf("final settled = %d at %d, want 0 at 0", final.Settled, final.Reported)
+	}
+	if got := meter.meterSpent(); got != 100 {
+		t.Fatalf("spent = %d, want 100, the open estimate only", got)
+	}
+	read, err := sweeper.Inspect(ctx, got.ID)
+	if err != nil {
+		t.Fatalf("inspect: %v", err)
+	}
+	if read.State != lease.StateExpired {
+		t.Fatalf("inspect state = %q, want expired", read.State)
+	}
+}

@@ -401,11 +401,15 @@ func (m *Manager) Close(ctx context.Context, id string, price cost.Price) (Lease
 }
 
 // releaseClaim returns a closing row to open after the settle failed, so the
-// next close may try again. It logs and keeps the claim when the write
-// fails, because the stored row still names the loser as closing.
+// next close may try again. It writes only while the stored row still reads
+// closing, so a sweep that expired the row first keeps its terminal state.
+// A row the sweep already moved stays as the sweep left it, and the caller
+// still reports the settle failure it holds. It logs and keeps the claim
+// when the write fails, because the stored row still names the closer as
+// closing.
 func (m *Manager) releaseClaim(ctx context.Context, claimed Lease) {
 	claimed.State = StateOpen
-	if err := m.store.Update(ctx, claimed); err != nil {
+	if _, err := m.store.CloseIfClosing(ctx, claimed); err != nil {
 		m.log.ErrorContext(ctx, "lease: release claim", "id", claimed.ID, "error", err)
 	}
 }
