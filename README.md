@@ -15,7 +15,7 @@ nothing logs on its own, and nothing panics.
 ## Install
 
 ```bash
-go get github.com/nrynss/keel@v0.2.0
+go get github.com/nrynss/keel@v0.3.0
 ```
 
 Go 1.27 or newer. The `ffmpeg` package runs the `ffmpeg` and `ffprobe` binaries, so install those
@@ -37,12 +37,19 @@ else is pure Go, and `CGO_ENABLED=0` builds the whole module.
 | `upload` | Resumable chunked uploads that land in `mediastore`, resumable by id after a dropped connection |
 | `sqlite` | One SQLite file with WAL, a writer handle, a read-only reader pool, namespaced migrations and online backup |
 | `ffmpeg` | ffmpeg and ffprobe bound to a context, with a bounded wait on shutdown |
-| `cost` | Money as integer nanodollars, a ledger of charges, and a budget that refuses before a call |
+| `cost` | Money as integer nanodollars, a ledger of charges, budgets that refuse before a call, keyed budgets that divide one pool by owner, and a meter that runs one paid call |
+| `flag` | Runtime flags an operator flips without a restart, read through to the store with a declared default for a missing row |
+| `caption` | Word timings to SRT and WebVTT subtitle files as a pure function, with cues grouped by line length and duration |
+| `erase` | A delete that finishes, fanned out over consumer targets with per-target progress, restart-safe resume, and a stuck report that names what is owed |
+| `edl` | A cut list rendered into one audio file, with merged ranges, crossfades or cuts at the joins, and two-pass loudness normalisation |
+| `waveform` | A still plus audio rendered to one video, with the waveform drawn over the scaled and padded still |
+| `lease` | Paid sessions with a time cap, a quota, a caller supplied kill switch, settle at close, provider reconciliation, and reclaim of abandoned rows |
 | `config` | TOML settings, and secret references that resolve from the environment, a file, a directory or a command, never holding a value in the file |
 | `config/source` | The five built-in secret sources that a `config.Registry` carries |
 
 The stores that need SQLite live one directory down, in `job/sqlitestore`,
-`mediastore/sqlitestore` and `cost/sqlitestore`. Only those packages import a SQLite driver, so an
+`mediastore/sqlitestore`, `cost/sqlitestore`, `flag/sqlitestore` and
+`lease/sqlitestore`. Only those packages import a SQLite driver, so an
 app that uses `gate` alone never compiles one. The TOML parser stays the same way behind `config`
 and `config/source`, so an app that uses `gate` alone never compiles it either.
 
@@ -86,7 +93,9 @@ jobID, err := runner.Start(ctx, func(ctx context.Context, progress func(job.Prog
 The job keeps the request's values and drops its cancellation, so a client that goes away does not
 kill the work. State lives in SQLite, so a restart does not lose it. Unfinished work comes back as
 `interrupted` rather than running again, because a repeat of a paid call spends the money twice. A
-kind that is safe to repeat opts in.
+kind that is safe to repeat opts in. A replacement attempt inherits the interrupted record's
+progress snapshot, so a resume hook rebuilds from the last report even when the replacement dies
+before its first one or waits queued at a saturated kind.
 
 The browser follows the job over server-sent events:
 
@@ -145,6 +154,101 @@ budget.Settle(cost.USD(4.50), actual)
 
 `cost.Price` counts nanodollars in an `int64`, so no rounding creeps in. `cost/sqlitestore` keeps
 the ledger and the reservations across a restart, and a reservation that expires releases itself.
+A `cost.KeyedBudget` divides one pool by owner under a global ceiling, so one owner cannot spend
+another owner's headroom. Each owner reserves and settles through its own account from `Owner`.
+A `cost.Meter` runs one paid call against an account: it reserves the estimate, runs the work,
+settles the measured price, and frees the reservation on every failure path. A call that reports
+no usage settles at its estimate and says so in the returned `Usage`.
+
+### Flip a switch without a restart
+
+```go
+paid := flag.Bool{Name: "paid_calls", Default: true, Help: "switch paid calls on"}
+on, _, err := store.Bool(ctx, paid)
+if _, err := store.SetBool(ctx, paid, false); err != nil {
+	return err // the operator flipped it, no deploy involved
+}
+```
+
+`flag` declares one boolean or small text value with the time it last changed. Every read goes
+through to the store, because a check is one indexed row and a cache adds an invalidation nobody
+tests. A name with no stored value reads as its declared default, so a missing row is never a
+silent off. `flag/sqlitestore` owns its namespaced migration, like every other store here.
+
+### Render a transcript as subtitles
+
+```go
+cues := caption.Group(words, caption.Config{LineLength: 40, MaxDuration: 3 * time.Second})
+if err := caption.SRT(w, cues); err != nil {
+	return err
+}
+```
+
+`caption` turns word timings into SRT and WebVTT as a pure function that writes to an
+`io.Writer`. `Group` joins words into cues under a line length and a duration cap, and it never
+splits a word. One cue list renders to either format. Times format exactly with no floating point
+drift, so a cue at one hour reads `01:00:00,000` in SRT and `01:00:00.000` in WebVTT.
+
+### Delete until every target confirms
+
+```go
+eraser, err := erase.New(source, erase.Config{})
+jobID, err := eraser.Start(ctx, runner, ref, targets)
+report, err := eraser.Inspect(ctx, runner, jobID)
+```
+
+`erase` fans a delete out over targets the consumer registers. The library owns the fan-out, the
+retry, and the record of which targets confirmed. It never owns the list, so a `Source` rebuilds
+the list from the ref when a run resumes. Progress is per target, so a resumed run retries only
+what has not confirmed. A target that reports already gone counts as confirmed, because deleting
+repeats safely. A target that fails forever leaves a stuck erasure, and `Report` names every
+target still owed a delete. The work runs as a `job` kind, so cancellation, limits and resumption
+come from there.
+
+### Render a cut list into one audio file
+
+```go
+err := edl.Render(ctx, tools, src, edl.Config{Crossfade: 2 * time.Second}, dst,
+	edl.Segment{Start: time.Second, End: 10 * time.Second})
+```
+
+`edl` cuts the kept ranges out of one source file and writes one normalised audio file. Ranges
+that touch or overlap merge first, so no zero length range reaches the filter graph. A join
+carries the configured crossfade when both neighbours are long enough, and a hard cut otherwise.
+Loudness normalises in two passes: the first measures through the loudnorm filter, and the second
+applies the numbers the tool itself wrote. Pin ffmpeg 9.0.1 for this package, as the Install
+section says: the duration and loudness pins assert exactly on that version. Every invocation
+carries the caller's context, so a cancelled render stops the child.
+
+### Render a still plus audio to video
+
+```go
+err := waveform.Render(ctx, tools, waveform.Config{}, "still.png", "tone.wav", "out.mkv")
+```
+
+`waveform` renders one still and one audio file into a video with the waveform drawn over the
+still. The default frame is 1920 by 1080. The still scales to fit and pads out to the exact
+frame, so another aspect ratio keeps its shape rather than stretching. The audio stream copies
+into the output and never passes an encoder. Pin ffmpeg 9.0.1 for this package, as the Install
+section says. Every render carries the caller context, so a cancelled render stops the child.
+
+### Bound a paid session with a lease
+
+```go
+manager, err := lease.New(lease.Config{Quota: quota, Meter: meter, Store: store, Cap: time.Hour})
+opened, err := manager.Open(ctx, "team-a", cost.USD(0.10), "")
+closed, err := manager.Close(ctx, opened.ID, cost.USD(0.12))
+reconciled, err := manager.Reconcile(ctx, opened.ID, cost.USD(0.15))
+```
+
+`lease` runs paid sessions that last minutes rather than one call. `Open` counts the lease
+against a quota and against a budget through the paid call seam, and it carries a time cap that
+expires on its own as a row comparison against the stored deadline. A caller supplied reason
+refuses new leases at once, which pairs with `flag` without importing it. `Close` settles the
+reported price through the same seam. `Reconcile` applies the provider reported price as the
+truth and keeps both numbers on the record. A dead process leaves its lease behind, and a later
+call reclaims the slot once the cap has passed. `lease/sqlitestore` owns its namespaced
+migration, like every other store here.
 
 ### Configure with a file that holds no secret value
 
@@ -360,10 +464,11 @@ go test -run Example -v ./...
 
 ## Versioning
 
-Keel is on v0. The exported API is frozen in `api/v0.2.0.txt` with its `api/v0.2.0.export`
+Keel is on v0. The exported API is frozen in `api/v0.3.0.txt` with its `api/v0.3.0.export`
 baseline, and a check in CI fails on any change to them. The records are frozen for
-`linux/amd64`. They cover the surface the release shipped, including `config` and
-`config/source`. Once v1 lands, a breaking change will need a major version.
+`linux/amd64`. They cover the surface the release shipped, including `flag`, `caption`,
+`erase`, `edl`, `waveform`, `lease`, and the `cost` keyed budgets with the paid call seam.
+Once v1 lands, a breaking change will need a major version.
 
 ## Development
 

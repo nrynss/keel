@@ -1,3 +1,62 @@
+########## github.com/nrynss/keel/caption
+package caption // import "github.com/nrynss/keel/caption"
+
+Package caption renders word timings as SRT and WebVTT subtitles.
+
+Words carry a text and a start and end time. Group joins words into cues that
+respect a line length and a maximum duration, and never splits a word. One cue
+list renders to either format through SRT or WebVTT.
+
+All times are time.Duration values, so formatting never sees a float and cannot
+drift at an hour boundary.
+
+FUNCTIONS
+
+func SRT(w io.Writer, cues []Cue) error
+    SRT writes cues as SubRip text to w. Cues number from one, and times use
+    a comma before the milliseconds. The writer receives the exact bytes,
+    with no trailing blank line beyond the one that closes the last cue.
+
+func WebVTT(w io.Writer, cues []Cue) error
+    WebVTT writes cues in the WebVTT format to w. The output starts with the
+    WEBVTT header, and times use a full stop before the milliseconds.
+
+
+TYPES
+
+type Config struct {
+	// LineLength is the maximum character count of one display line.
+	LineLength int
+	// MaxDuration is the longest time span one cue may cover.
+	MaxDuration time.Duration
+}
+    Config controls how words group into cues. The zero value is usable and
+    gives a line length of 42 characters and a maximum duration of 5 seconds.
+
+type Cue struct {
+	Start time.Duration
+	End   time.Duration
+	Lines []string
+}
+    Cue is one subtitle block. Lines holds one or more display lines. A cue
+    never carries a word split across lines.
+
+func Group(words []Word, cfg Config) []Cue
+    Group joins words into cues. A word is never split and never crosses a cue
+    boundary. A word longer than the line length gets a line of its own and its
+    own cue, because adding any neighbour would exceed the line length.
+
+type Word struct {
+	// Text is the word as spoken, without surrounding whitespace.
+	Text string
+	// Start is the offset from the start of the media.
+	Start time.Duration
+	// End is the offset from the start of the media. It must not be before Start.
+	End time.Duration
+}
+    Word is one transcribed word with its timing.
+
+
 ########## github.com/nrynss/keel/config
 package config // import "github.com/nrynss/keel/config"
 
@@ -992,6 +1051,248 @@ func (s *Store) TotalForRef(ctx context.Context, ref string) (cost.Price, error)
     range.
 
 
+########## github.com/nrynss/keel/edl
+package edl // import "github.com/nrynss/keel/edl"
+
+Package edl renders an edit decision list into one audio file.
+
+A list holds kept time ranges of one source file. Render merges ranges that
+touch or overlap, joins the merged ranges with crossfades or hard cuts,
+and normalises loudness in two passes. The first pass asks the loudnorm filter
+to measure the cut. The second pass applies the measured numbers and writes
+the output. The measured numbers are read from the stats file the tool itself
+writes, never guessed.
+
+The input is times, not words. A caller that works from words converts them
+first. The package invokes ffmpeg and ffprobe only through the ffmpeg package,
+and every invocation carries the caller's context, so a cancelled render stops
+the child process.
+
+When ffmpeg normalises linearly, the rendered duration equals the kept ranges
+minus the crossfade overlaps, and the output keeps the sample rate and channel
+layout of the source. ffmpeg parses durations at microsecond precision, so finer
+detail in a range is lost.
+
+VARIABLES
+
+var ErrInvalidSegment = errors.New("edl: invalid segment")
+    ErrInvalidSegment reports a kept range whose start is negative or whose end
+    does not come after its start.
+
+var ErrInvalidTarget = errors.New("edl: invalid loudness target")
+    ErrInvalidTarget reports a loudness target outside the range loudnorm
+    accepts, which is -70 to -5 LUFS.
+
+var ErrNoDestination = errors.New("edl: no destination")
+    ErrNoDestination reports an empty output path.
+
+var ErrNoMeasurement = errors.New("edl: loudness measurement missing")
+    ErrNoMeasurement reports that the measure pass left no usable stats.
+    The tool ran but its output held nothing the apply pass can use. Silence
+    measures as -inf, so that path reports this error too.
+
+var ErrNoSegments = errors.New("edl: no segments")
+    ErrNoSegments reports an empty cut list. A render needs at least one kept
+    range.
+
+
+FUNCTIONS
+
+func Render(ctx context.Context, tools ffmpeg.Tools, src string, cfg Config, dst string, segments ...Segment) error
+    Render cuts the kept ranges out of the source file and writes one normalised
+    audio file to dst.
+
+    Ranges that touch or overlap merge before anything renders, so no zero
+    length or negative range reaches the filter graph. Each join between two
+    merged ranges carries the configured crossfade when both neighbours are
+    long enough, and a hard cut otherwise. The output keeps the sample rate and
+    channel layout of the source when ffmpeg normalises linearly.
+
+    A missing binary reports ffmpeg.ErrNotFound, a failing pass reports
+    ffmpeg.ErrFailed, and a cancelled context stops the child and reports the
+    context error.
+
+
+TYPES
+
+type Config struct {
+	// Crossfade is the fade length at a join. A join carries the fade only
+	// when both neighbours are at least this long, and a shorter neighbour
+	// makes the join a cut.
+	Crossfade time.Duration
+	// Target is the integrated loudness the render aims at, in LUFS. Zero
+	// means the loudnorm default of -24. The loudness range and true peak
+	// targets stay at the loudnorm defaults.
+	Target float64
+}
+    Config controls a render. The zero value renders a hard cut at every join
+    and targets the loudnorm default of -24 LUFS.
+
+type Segment struct {
+	Start time.Duration
+	End   time.Duration
+}
+    Segment is one kept time range of the source. Start is inclusive and End is
+    exclusive. End must come after Start, and Start must not be negative.
+
+
+########## github.com/nrynss/keel/erase
+package erase // import "github.com/nrynss/keel/erase"
+
+Package erase fans a delete out over named targets until every one confirms.
+
+A delete that touches rows, blobs and a remote provider is not done when the
+first target answers. It is done when every target confirms, and it must survive
+a restart in between. Deleting is safe to repeat, so the erasure repeats every
+delete that has not confirmed. A target that reports already gone with ErrGone
+counts as confirmed too.
+
+The consumer registers the targets. The library owns the fan-out, the retry
+and the record of which targets confirmed. It never owns the list, so a Source
+rebuilds the list from the ref when a run resumes.
+
+The work runs as a job kind, so cancellation, per kind limits and resumption
+after a restart come from the job package. Every confirmation lands in the job
+record, so a resumed run retries only what has not confirmed, and Inspect reads
+the ledger back at any time. A run that ends with targets that never confirmed
+is a stuck erasure: the job fails, and Report names every target still owed a
+delete. Nothing turns a stuck erasure into a success.
+
+CONSTANTS
+
+const KindName = "erase"
+    KindName is the job kind every erasure runs under. Register the value the
+    Kind method returns under this name in job.Config.Kinds before the Runner
+    opens, because a kind that declares no resume work is never resumed.
+
+
+VARIABLES
+
+var (
+	// ErrGone is returned by a Target whose object is already absent. An
+	// erasure counts that answer as a confirmation, because deleting is
+	// safe to repeat. Wrap it with %w so errors.Is finds it.
+	ErrGone = errors.New("erase: target already gone")
+
+	// ErrInvalid is returned for unusable input, such as a nil source, a
+	// nil runner, or a target list with an empty or repeated name.
+	ErrInvalid = errors.New("erase: invalid input")
+
+	// ErrStuck is carried by the error a run returns when targets spent
+	// their tries without confirming. The message names every target the
+	// erasure is still owed.
+	ErrStuck = errors.New("erase: stuck targets")
+
+	// ErrNoSnapshot is returned by Inspect for an erasure whose records
+	// carry no progress snapshot, because every run ended before its
+	// first report landed.
+	ErrNoSnapshot = errors.New("erase: no recorded snapshot")
+)
+    Sentinel errors. Every failure path this package produces wraps one of
+    these, so callers branch with errors.Is.
+
+
+TYPES
+
+type Config struct {
+	// TargetAttempts is the tries one target gets within one run before
+	// the erasure names it stuck. Zero or negative means
+	// defaultTargetAttempts.
+	TargetAttempts int
+
+	// RetryDelay separates two tries of the same target. Zero retries at
+	// once.
+	RetryDelay time.Duration
+
+	// FanOut is the number of targets deleted at once. Zero or negative
+	// means defaultFanOut.
+	FanOut int
+
+	// MaxAttempts is the number of attempts one erasure may make across
+	// restarts. Zero or negative means defaultMaxAttempts.
+	MaxAttempts int
+
+	// Log receives one line per failed try. Nil means slog.Default.
+	Log *slog.Logger
+}
+    Config configures New.
+
+type Eraser struct {
+	// Has unexported fields.
+}
+    Eraser runs erasures as jobs of one kind on a job Runner. Create it with
+    New. Eraser is safe for concurrent use, because every field is read-only
+    after New returns.
+
+func New(source Source, cfg Config) (*Eraser, error)
+    New returns an Eraser that runs erasures over the target lists source
+    rebuilds. Source must not be nil, because a run that resumes can only delete
+    what the consumer still names.
+
+func (e *Eraser) Inspect(ctx context.Context, r *job.Runner, id string) (Report, error)
+    Inspect reads one erasure's ledger from r's records. The id is the job id
+    Start returned, or any attempt id of the same logical job, because the last
+    attempt that reported carries the fullest ledger. An erasure whose records
+    carry no snapshot reports ErrNoSnapshot.
+
+func (e *Eraser) Kind() job.Kind
+    Kind returns the job kind that runs erasures. Register it under KindName in
+    job.Config.Kinds before opening the Runner, because a kind that declares
+    no resume work is never resumed. The kind is idempotent, because deleting
+    is safe to repeat. Its Limit stays at the job package's default, so a
+    consumer that wants another bound edits Limit on the returned value before
+    registering it.
+
+func (e *Eraser) Start(ctx context.Context, r *job.Runner, ref string, targets []Target) (string, error)
+    Start runs one erasure over targets as a job of KindName on r and returns
+    the job id at once. ref is the application key Source receives when a
+    restart rebuilds the list. Every name must be non-empty and unique,
+    and the list must not be empty, because an erasure over nothing is never
+    what a caller means. r must be the Runner the kind returned by Kind is
+    registered under, because a restart rebuilds the work through it. A Runner
+    opened without the kind still runs the erasure, but a restart leaves it
+    interrupted.
+
+type Report struct {
+	// Ref is the application key Start received.
+	Ref string
+
+	// Confirmed lists every target that confirmed, in name order.
+	Confirmed []string
+
+	// Stuck lists every registered target with no confirmation, in name
+	// order. Empty means the erasure is complete.
+	Stuck []string
+}
+    Report is one erasure's ledger as Inspect read it from the job records.
+
+func (rep Report) Complete() bool
+    Complete reports whether every registered target confirmed. Only a complete
+    erasure may be reported as erased.
+
+type Source func(ctx context.Context, ref string) ([]Target, error)
+    Source rebuilds the target list of one erasure from the ref Start received.
+    The consumer owns the list, so only the consumer can rebuild it for a run
+    that resumes after a restart. A Source returns the same list for the same
+    ref, because a target the list drops while it is still unconfirmed fails the
+    erasure as stuck.
+
+type Target interface {
+	// Name identifies the target in progress reports and in a stuck
+	// report. It must be non-empty and unique within one erasure.
+	Name() string
+
+	// Delete removes the target's object. A nil return confirms the
+	// delete, and an error carrying ErrGone confirms it too, because the
+	// object is already absent. Delete must be safe to call again,
+	// because a run that resumes repeats every delete that has not
+	// confirmed.
+	Delete(ctx context.Context) error
+}
+    Target is one named delete operation the consumer supplies. The library
+    decides when Delete runs, and never owns the list of targets.
+
+
 ########## github.com/nrynss/keel/ffmpeg
 package ffmpeg // import "github.com/nrynss/keel/ffmpeg"
 
@@ -1061,6 +1362,158 @@ type Tools struct {
 }
     Tools names the ffmpeg and ffprobe executables. The zero value looks both up
     on the PATH. Set a field to pin an absolute path or a specific build.
+
+
+########## github.com/nrynss/keel/flag
+package flag // import "github.com/nrynss/keel/flag"
+
+Package flag declares runtime flags an operator flips while the process runs. A
+flag has a name, a boolean or a small text value, and the time it last changed.
+Every read goes through to the store, because a flag check is one indexed row
+and a cache adds an invalidation nobody would test. A flag missing from the
+store reads as its declared default, so a row that does not exist yet is never a
+silent off.
+
+VARIABLES
+
+var ErrInvalid = errors.New("flag: invalid declaration")
+    ErrInvalid is returned for a declaration this package cannot honour, such as
+    an empty name.
+
+var ErrKind = errors.New("flag: value kind does not match the declaration")
+    ErrKind is returned when the stored value of a flag does not match the kind
+    its declaration states, for example a text value read as a bool.
+
+
+TYPES
+
+type Bool struct {
+	// Name identifies the flag. It must not be empty.
+	Name string
+
+	// Default is what the flag reads as before anyone has set it.
+	Default bool
+
+	// Help explains what the flag switches, for operator tooling.
+	Help string
+}
+    Bool declares one boolean runtime flag. The zero value is not useful,
+    a declaration always carries a name.
+
+type Store interface {
+	// Bool reads f and reports its value and the time it last changed.
+	Bool(ctx context.Context, f Bool) (bool, time.Time, error)
+
+	// SetBool stores value for f and reports the change time. A cancelled
+	// context stops the write, so the flag keeps its old value.
+	SetBool(ctx context.Context, f Bool, value bool) (time.Time, error)
+
+	// Text reads f and reports its value and the time it last changed.
+	Text(ctx context.Context, f Text) (string, time.Time, error)
+
+	// SetText stores value for f and reports the change time. A cancelled
+	// context stops the write, so the flag keeps its old value.
+	SetText(ctx context.Context, f Text, value string) (time.Time, error)
+}
+    Store reads and writes flag values through to their persistence. The
+    sqlitestore package provides one over SQLite, and a test can supply its own.
+    Every read resolves the value now, and a name with no stored value reads as
+    the declaration's default with the zero time.
+
+type Text struct {
+	// Name identifies the flag. It must not be empty.
+	Name string
+
+	// Default is what the flag reads as before anyone has set it. It may
+	// be the empty string.
+	Default string
+
+	// Help explains what the flag switches, for operator tooling.
+	Help string
+}
+    Text declares one small-text runtime flag. The zero value is not useful,
+    a declaration always carries a name.
+
+
+########## github.com/nrynss/keel/flag/sqlitestore
+package sqlitestore // import "github.com/nrynss/keel/flag/sqlitestore"
+
+Package sqlitestore persists runtime flags over SQLite.
+
+The package owns one schema. It applies it through the sqlite package's
+migration runner under its own namespace, so the ledger records what ran and a
+second open on the same database changes nothing.
+
+Reads go through to the database every time. A flag check is one indexed
+primary-key lookup, so a cache would add an invalidation problem for no
+measurable gain. An operator's flip must be visible to the next read without a
+restart.
+
+A value row records the kind its writer declared. A read whose declaration
+names a different kind fails rather than guessing, so a boolean flag can never
+silently return text. A name with no row reads as the declaration's default,
+which keeps a flag nobody has set from acting like a stored false.
+
+This package is one of the few allowed to import the SQLite driver. The flag
+declarations themselves stay in the flag package.
+
+VARIABLES
+
+var ErrInvalid = errors.New("sqlitestore: invalid config")
+    ErrInvalid is returned for an argument this package cannot honour, such as a
+    nil database.
+
+
+TYPES
+
+type Config struct {
+	// DB is the open database. It must not be nil, and this package never
+	// closes it.
+	DB *sqlite.DB
+
+	// Namespace overrides the migration ledger namespace. Empty means the
+	// one this package owns.
+	Namespace string
+
+	// Now supplies the clock that stamps flag changes. Nil means
+	// time.Now.
+	Now func() time.Time
+
+	// Logger receives the open record. Nil means slog.Default.
+	Logger *slog.Logger
+}
+    Config configures Open.
+
+type Store struct {
+	// Has unexported fields.
+}
+    Store persists flag values over one database. Create it with Open,
+    because the zero value has no database. Store is safe for concurrent use,
+    and satisfies flag.Store.
+
+func Open(ctx context.Context, cfg Config) (*Store, error)
+    Open applies the flag schema to cfg.DB and returns the store. A cancelled
+    context stops the open and no store comes back, but the schema and its
+    migration ledger row may already have landed. Those bytes are inert, so a
+    caller may retry the open and a second open on the same file is unaffected.
+
+func (s *Store) Bool(ctx context.Context, f flag.Bool) (bool, time.Time, error)
+    Bool reads f through to the database. A name with no row reads as the
+    declaration's default with the zero time. A row written under a different
+    kind reports an error matching flag.ErrKind.
+
+func (s *Store) SetBool(ctx context.Context, f flag.Bool, value bool) (time.Time, error)
+    SetBool stores value for f and reports the change time. A cancelled context
+    stops the write, so the flag keeps its old value.
+
+func (s *Store) SetText(ctx context.Context, f flag.Text, value string) (time.Time, error)
+    SetText stores value for f and reports the change time. A cancelled context
+    stops the write, so the flag keeps its old value.
+
+func (s *Store) Text(ctx context.Context, f flag.Text) (string, time.Time, error)
+    Text reads f through to the database. A name with no row reads as the
+    declaration's default with the zero time. A row written under a different
+    kind reports an error matching flag.ErrKind.
 
 
 ########## github.com/nrynss/keel/gate
@@ -1623,6 +2076,345 @@ func (s *Store) Unfinished(ctx context.Context) ([]job.Record, error)
     Unfinished returns every record that has not reached a terminal state,
     oldest first, so a restart can interrupt a running record and queue a queued
     one again.
+
+
+########## github.com/nrynss/keel/lease
+package lease // import "github.com/nrynss/keel/lease"
+
+Package lease runs paid sessions that last minutes rather than one call.
+A session rents one quota slot for a bounded time. Open counts the lease against
+a quota and against a budget through the paid call seam, so the opening estimate
+holds spend before the session runs. Close settles the reported duration through
+the same seam. Reconcile later applies the provider reported price as the truth
+and keeps both numbers on the record. A lease expires on its own. Expiry is a
+row comparison against the stored deadline, so no process must stay alive for
+it to hold. A dead process leaves its lease behind, and a later call reclaims
+the slot once the cap has passed. A caller supplied reason refuses new leases at
+once, which pairs with runtime flags without importing them.
+
+VARIABLES
+
+var ErrInvalid = errors.New("lease: invalid input")
+    ErrInvalid reports unusable input, such as a nil dependency or a lease that
+    is already closed.
+
+var ErrNegativePrice = errors.New("lease: negative price")
+    ErrNegativePrice reports a close or reconcile with a price below zero,
+    because a refund is a separate charge and never a negative booking.
+
+var ErrQuota = errors.New("lease: quota exhausted")
+    ErrQuota reports an open that found no free quota slot.
+
+var ErrRefused = errors.New("lease: lease refused")
+    ErrRefused reports an open that the kill switch refused. The message carries
+    the reason the caller supplied.
+
+var ErrUnknownLease = errors.New("lease: unknown lease")
+    ErrUnknownLease reports an operation that names a lease the store holds no
+    record for.
+
+
+TYPES
+
+type Config struct {
+	// Quota bounds how many leases may stay open at once. It must not be
+	// nil.
+	Quota *Quota
+	// Meter settles the open estimate and the close price through the
+	// paid call seam. It must not be nil.
+	Meter Meter
+	// Store keeps the lease rows. It must not be nil.
+	Store Store
+	// Cap bounds how long one lease may stay open. Zero or negative
+	// means defaultCap.
+	Cap time.Duration
+	// Kind names the billed operation on the ledger rows the seam
+	// writes. Empty means defaultKind.
+	Kind string
+	// Now supplies the clock that stamps leases and judges expiry. Nil
+	// means time.Now.
+	Now func() time.Time
+	// NewID mints lease ids. Nil means id.New.
+	NewID func() (string, error)
+	// Log receives one line per refused open and per expired lease. Nil
+	// means slog.Default.
+	Log *slog.Logger
+}
+    Config configures a Manager.
+
+type Lease struct {
+	// ID identifies the lease.
+	ID string
+	// State is where the lease stands.
+	State State
+	// OpenedAt is when the lease opened.
+	OpenedAt time.Time
+	// ExpiresAt is the instant the cap passes and the slot frees.
+	ExpiresAt time.Time
+	// ClosedAt is when the lease closed, or the zero time while open.
+	ClosedAt time.Time
+	// Estimate is the price Open reserved against the budget.
+	Estimate cost.Price
+	// Settled is the booked price. Close writes the reported price here,
+	// and Reconcile overwrites it with the provider number.
+	Settled cost.Price
+	// Reported is the holder reported price Close booked. Reconcile
+	// keeps it beside the provider number it overwrites Settled with.
+	Reported cost.Price
+	// Reconciled reports whether Reconcile has applied the provider
+	// number.
+	Reconciled bool
+	// Kind names the billed operation on the ledger rows.
+	Kind string
+	// Owner names the budget owner, or empty for the shared pool.
+	Owner string
+}
+    Lease is one paid session. Open returns it, and Inspect reads it back.
+    Settled carries the price Close booked. After Reconcile, Settled carries the
+    provider number, while Reported keeps the holder reported one.
+
+type Manager struct {
+	// Has unexported fields.
+}
+    Manager opens, closes and reconciles paid session leases. Create it with
+    New. A Manager is safe for concurrent use, because the quota, the meter and
+    the store each are. Close claims the row before it settles, so two closers
+    of one lease never settle twice in any process.
+
+func New(cfg Config) (*Manager, error)
+    New returns a Manager that runs leases over cfg. It reports ErrInvalid when
+    the quota, the meter or the store is nil, because a lease that could not
+    bound, settle or remember a session would only pretend to.
+
+func (m *Manager) Active() int
+    Active reports how many quota slots the manager holds now.
+
+func (m *Manager) Close(ctx context.Context, id string, price cost.Price) (Lease, error)
+    Close ends the open lease id at the holder reported price. It claims the
+    row, then settles the real duration through the seam and frees the quota
+    slot. A past-cap lease expires first and frees its slot on the way out,
+    then Close still reports ErrInvalid, because the session never closed in
+    time. That expiry covers a closing row stranded by a dead closer too,
+    and the retry reports ErrInvalid without settling, because the settle
+    may already have run. One session books its close price at most once.
+    The claim writes closing only when the row still reads open, so the second
+    closer of one lease loses the claim and reports ErrInvalid without settling.
+    The final write lands only while the row still reads closing, so a sweep
+    that expired the row first makes the late close report ErrInvalid without
+    touching the stored row. The claim covers every process, because the store
+    compares while it writes.
+
+func (m *Manager) Inspect(ctx context.Context, id string) (Lease, error)
+    Inspect reads the lease stored under id. A lease whose cap has passed reads
+    as expired and frees its quota slot, even when no process touched it since
+    it opened. The stored row moves to expired too, so the fact survives a
+    restart.
+
+func (m *Manager) Open(ctx context.Context, owner string, estimate cost.Price, kill string) (Lease, error)
+    Open starts one lease for owner. A non-empty kill refuses the open at once
+    with ErrRefused carrying the reason, before the lease takes a quota slot
+    or touches the budget. Otherwise Open takes a quota slot, then settles the
+    estimate through the seam, so a refused budget frees the slot it just took.
+    The lease row lands in the store before Open returns, so a crash after Open
+    still leaves a reclaimable lease.
+
+func (m *Manager) Reclaim(ctx context.Context, ids []string) (int, error)
+    Reclaim frees the quota slot of every lease whose cap has passed while it
+    still reads open or closing. It reports how many slots it freed. An empty
+    id list sweeps the store for every such row, so a lease whose id nobody kept
+    still frees its row on disk. That sweep covers a closing row stranded by a
+    dead closer, which expires like an open one. A named list reclaims exactly
+    those ids and reports ErrUnknownLease for the first id the store never held,
+    so a misspelled id never reads as success. A dead process leaves its lease
+    behind, and the next call reclaims the slot without that process. Each
+    reclaimed row moves to expired in the store, so the fact survives a restart.
+    Reclaim books nothing, because expiry never settles a price.
+
+func (m *Manager) Reconcile(ctx context.Context, id string, provider cost.Price) (Lease, error)
+    Reconcile applies the provider reported price to the closed lease id.
+    The provider number is the truth, so Settled carries it afterwards, while
+    Reported keeps the holder reported price Close booked. Both stay observable
+    on the returned lease and in the store. Reconcile may raise or lower the
+    settled price. It writes the row only and books nothing further, because
+    the budget already holds the estimate and the reported price as facts,
+    while the row carries the truth. It reports ErrInvalid for a lease that is
+    not closed or that already reconciled.
+
+type Meter interface {
+	// Call runs work as one paid call. It reserves the estimate before
+	// the work runs and settles what the work reports.
+	Call(ctx context.Context, estimate cost.Price, kind, ref string, work cost.Work) (cost.Usage, error)
+}
+    Meter is the paid call seam an opener settles through. It matches the
+    shape of the seam the cost package publishes, so the lease opens and closes
+    through the real seam.
+
+type Quota struct {
+	// Has unexported fields.
+}
+    Quota bounds how many leases may stay open at once. The zero value is not
+    usable, because it carries no limit. Quota is safe for concurrent use.
+
+func NewQuota(n int) (*Quota, error)
+    NewQuota returns a Quota that admits at most n open leases. It reports
+    ErrInvalid when n is not positive, because a quota with no slot admits
+    nothing and only misleads the caller.
+
+type State string
+    State names where one lease stands.
+
+const (
+	// StateOpen marks a lease that still holds its quota slot.
+	StateOpen State = "open"
+	// StateClosing marks a lease one closer claimed while it settles.
+	StateClosing State = "closing"
+	// StateClosed marks a lease the holder closed with a reported price.
+	StateClosed State = "closed"
+	// StateExpired marks a lease whose cap passed before it closed.
+	StateExpired State = "expired"
+)
+    Lease states name where one lease stands. A lease moves from open to closed
+    or expired, and a closed lease may later reconcile. Closing marks a lease
+    one closer claimed while it settles, so a second closer loses the claim
+    without settling. Expired is terminal like closed, because the session never
+    ran past its cap.
+
+type Store interface {
+	// Create writes a fresh open lease row.
+	Create(ctx context.Context, lease Lease) error
+	// Get reads the lease stored under id, or an error matching
+	// ErrUnknownLease.
+	Get(ctx context.Context, id string) (Lease, error)
+	// Update writes back the lease stored under id, or an error matching
+	// ErrUnknownLease.
+	Update(ctx context.Context, lease Lease) error
+	// CloseIfOpen writes back lease only when the stored row still reads
+	// open. It reports true when it wrote, or false with no error when the
+	// row already moved on. An unknown id reports an error matching
+	// ErrUnknownLease. Stores must compare while they write, so a loser
+	// that read open earlier still loses.
+	CloseIfOpen(ctx context.Context, lease Lease) (bool, error)
+	// CloseIfClosing writes back lease only when the stored row still
+	// reads closing. It reports true when it wrote, or false with no error
+	// when the row already moved to closed or expired. An unknown id
+	// reports an error matching ErrUnknownLease. Stores must compare while
+	// they write, so a late finish never overwrites a row the sweep moved.
+	CloseIfClosing(ctx context.Context, lease Lease) (bool, error)
+	// ExpireIfOpenOrClosing writes back lease only when the stored row
+	// still reads open or closing. It reports true when it wrote, or false
+	// with no error when the row already moved to closed or expired. An
+	// unknown id reports an error matching ErrUnknownLease. Stores must
+	// compare while they write, so a late sweep never overwrites a close
+	// that already finished.
+	ExpireIfOpenOrClosing(ctx context.Context, lease Lease) (bool, error)
+	// ExpiredOpen lists every row that still reads open or closing with a
+	// deadline at or before now, so a call that names no id still finds
+	// abandoned rows and rows a dead closer stranded. The order is row
+	// order, and the cap bounds the count.
+	ExpiredOpen(ctx context.Context, now time.Time, limit int) ([]Lease, error)
+}
+    Store keeps lease rows durably. The opener writes and reads through it,
+    and expiry is judged from the stored deadlines, so no process must stay
+    alive for a cap to hold. Close writes only when the row still reads open,
+    so two closers of one lease never settle twice across processes.
+
+
+########## github.com/nrynss/keel/lease/sqlitestore
+package sqlitestore // import "github.com/nrynss/keel/lease/sqlitestore"
+
+Package sqlitestore keeps lease rows in SQLite. The package owns one schema,
+applied through the sqlite migration runner under its own namespace, so a
+second open changes nothing. Expiry is a comparison against the stored deadline
+on every read, so no process must stay alive for a cap to hold, and the fact
+survives a restart on disk. A cancelled context stops a call before it commits.
+The call fails and stores nothing, so a caller may retry it, and a read returns
+no result rather than the rows it had already decoded. This package is one of
+the few allowed to import the SQLite driver. All lease arithmetic stays in the
+lease package.
+
+VARIABLES
+
+var ErrInvalid = errors.New("sqlitestore: invalid config")
+    ErrInvalid is returned for an argument this package cannot honour, such as a
+    nil database.
+
+
+TYPES
+
+type Config struct {
+	// DB is the open database. It must not be nil, and this package never
+	// closes it.
+	DB *sqlite.DB
+
+	// Namespace overrides the migration ledger namespace. Empty means the
+	// one this package owns.
+	Namespace string
+
+	// Logger receives the open record. Nil means slog.Default.
+	Logger *slog.Logger
+}
+    Config configures Open.
+
+type Store struct {
+	// Has unexported fields.
+}
+    Store keeps lease rows over one database. Create it with Open, because the
+    zero value has no database. Store is safe for concurrent use, and satisfies
+    lease.Store.
+
+func Open(ctx context.Context, cfg Config) (*Store, error)
+    Open applies the lease schema to cfg.DB and returns the store. A cancelled
+    context stops the open and no store comes back, but the schema and its
+    migration ledger row may already have landed. Those bytes are inert, so a
+    caller may retry the open and a second open on the same file is unaffected.
+
+func (s *Store) CloseIfClosing(ctx context.Context, l lease.Lease) (bool, error)
+    CloseIfClosing writes back lease only when the stored row still reads
+    closing. It reports true when it wrote. It reports false with no error
+    when the row already moved to closed or expired, and the stored row
+    stays as the winner left it. An unknown id reports an error matching
+    lease.ErrUnknownLease. The compare and the write share one statement,
+    so a late finish never overwrites a sweep that already expired the row.
+
+func (s *Store) CloseIfOpen(ctx context.Context, l lease.Lease) (bool, error)
+    CloseIfOpen writes back lease only when the stored row still reads open.
+    It reports true when it wrote the closed row. It reports false with no
+    error when the row already reads closed or expired, and the stored row
+    stays as the winner left it. An unknown id reports an error matching
+    lease.ErrUnknownLease. The compare and the write share one statement,
+    so two processes closing one lease leave exactly one winner.
+
+func (s *Store) Create(ctx context.Context, l lease.Lease) error
+    Create writes a fresh open lease row. It reports an error matching
+    lease.ErrInvalid when the lease carries no id, because a row with no key is
+    never what a caller means.
+
+func (s *Store) ExpireIfOpenOrClosing(ctx context.Context, l lease.Lease) (bool, error)
+    ExpireIfOpenOrClosing writes back lease only when the stored row still
+    reads open or closing. It reports true when it wrote. It reports false with
+    no error when the row already moved to closed or expired, and the stored
+    row stays as the winner left it. An unknown id reports an error matching
+    lease.ErrUnknownLease. The compare and the write share one statement,
+    so a late sweep never overwrites a close that already finished.
+
+func (s *Store) ExpiredOpen(ctx context.Context, now time.Time, limit int) ([]lease.Lease, error)
+    ExpiredOpen lists every row that still reads open or closing with a deadline
+    at or before now, oldest deadline first. Closing rows land here because a
+    closer may die between the claim write and the final write, and the stranded
+    row must expire with the ordinary open ones. The limit bounds the pass,
+    so one call never loads the whole table. A cancelled context stops the read
+    and returns no rows rather than the rows it had already decoded.
+
+func (s *Store) Get(ctx context.Context, id string) (lease.Lease, error)
+    Get reads the lease stored under id. It returns the stored row unchanged.
+    The manager judges expiry from the stored deadline on every touch,
+    so the fact holds with no process involved and survives a restart on disk.
+    An unknown id reports an error matching lease.ErrUnknownLease.
+
+func (s *Store) Update(ctx context.Context, l lease.Lease) error
+    Update writes back the lease stored under id. An unknown id reports an
+    error matching lease.ErrUnknownLease. A cancelled context stops the write,
+    so the old row stays.
 
 
 ########## github.com/nrynss/keel/mediastore
@@ -2353,6 +3145,66 @@ func (h *Handler) Sweep() (int, error)
     any staging directory left behind by a previous process, and reports how
     many it removed. Start calls it on a ticker; a caller that left Start
     uncalled calls it directly.
+
+
+########## github.com/nrynss/keel/waveform
+package waveform // import "github.com/nrynss/keel/waveform"
+
+Package waveform renders a still image and an audio file into one video with the
+waveform of that audio drawn over the still.
+
+One ffmpeg invocation builds the whole video. The still is scaled to fit the
+output frame and padded out to it, so a still of another aspect ratio keeps
+its shape rather than stretching. The audio stream is copied into the output
+container and never passes an encoder, so the output path must name a container
+that carries the input codec. Matroska carries every common one.
+
+Every render carries the caller context into the command, so a cancelled context
+stops the child process.
+
+VARIABLES
+
+var ErrOddFrameSize = errors.New("waveform: frame size must be even")
+    ErrOddFrameSize reports a Config.Width or Config.Height above zero that is
+    odd. The yuv420p output stores colour in pixel pairs, so an odd value cannot
+    render at the size the caller asked for. A caller that wants to correct its
+    config matches it with errors.Is.
+
+
+FUNCTIONS
+
+func Render(ctx context.Context, tools ffmpeg.Tools, cfg Config, still, audio, out string) error
+    Render draws the audio waveform over the still image and writes one video
+    to out. The frame size and both colours come from cfg. An odd cfg.Width or
+    cfg.Height reports ErrOddFrameSize before any process starts.
+
+    The audio stream is copied, never encoded, so out must name a container
+    that carries the input codec. Matroska carries every common one. The output
+    duration equals the input duration for PCM audio. A copied lossy stream
+    adds the priming window of its codec, for example 23 milliseconds for AAC
+    at 44100 Hz. A missing binary reports ffmpeg.ErrNotFound and a failed run
+    reports ffmpeg.ErrFailed. The context kills the child when it ends.
+
+
+TYPES
+
+type Config struct {
+	// Width is the output frame width in pixels. The value must be even,
+	// because the yuv420p output stores colour in pixel pairs. An odd value
+	// reports ErrOddFrameSize. Zero or less means 1920.
+	Width int
+	// Height is the output frame height in pixels. The value must be even,
+	// because the yuv420p output stores colour in pixel pairs. An odd value
+	// reports ErrOddFrameSize. Zero or less means 1080.
+	Height int
+	// WaveColor is the colour the waveform is drawn in. Any colour name
+	// ffmpeg accepts works. Empty means white.
+	WaveColor string
+	// PadColor fills the bars the padding adds. Empty means black.
+	PadColor string
+}
+    Config carries the frame size and the two colours of one render. The zero
+    value draws a white waveform over a 1920 by 1080 frame padded with black.
 
 
 ########## github.com/nrynss/keel/wire

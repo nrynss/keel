@@ -48,8 +48,8 @@ apidiff_version="v0.0.0-20260908205506-85c1c2202aba"
 # transcript and a human reads no export data, so the formats stay separate on
 # purpose. A compatible addition updates the transcript. An incompatible
 # change fails against the release export.
-api_doc="api/next.txt"
-api_export="api/v0.2.0.export"
+api_doc="api/v0.3.0.txt"
+api_export="api/v0.3.0.export"
 
 # Both records are taken from one frozen build context, linux/amd64, which is
 # also the context CI runs on. The transcript is generated under it, so the same
@@ -277,10 +277,12 @@ header "11/11 api"
 # reads the change rows from both views, drops duplicate rows, and judges
 # every merged row once. A row passes only against the pair variables or the
 # transcript path that HEAD gated, which it reads from HEAD, so no record
-# name is hardcoded. The release move stages the successor of the old
-# transcript path. The guard hashes that successor in the index, the copy
-# the commit carries, and accepts the deletion only on a byte-identical
-# match, so a missing index entry fails. After the rows the guard asks the
+# name is hardcoded. The regeneration runs before the rows, so the deletion
+# sanction compares the staged successor against fresh bytes. The release
+# move stages the successor of the old transcript path. The guard compares
+# that staged copy, the bytes the commit carries, against the regeneration
+# and accepts the deletion only on a byte-identical match, so a stale or
+# dishonest successor fails. After the rows the guard asks the
 # index for the old path and refuses it by name. A cached row on the
 # transcript or the export also arms an index-side content judge over the
 # staged bytes. The worktree view arms nothing, because the commit carries
@@ -294,6 +296,9 @@ cached_doc_rows=$(git diff --cached --name-status --no-renames HEAD -- "${api_do
 case "${cached_doc_rows}" in *[MA]*) doc_row=1 ;; esac
 cached_export_rows=$(git diff --cached --name-status --no-renames HEAD -- "${api_export}" | cut -f1 | sort -u | tr -d '\n')
 case "${cached_export_rows}" in *A*) export_row=1 ;; esac
+api_tmp=$(mktemp -d)
+trap 'rm -rf "$api_tmp"' EXIT
+regenerate_api_doc "$api_tmp/regen.txt"
 rows=$({
     git diff --name-status --no-renames HEAD -- api/
     git diff --cached --name-status --no-renames HEAD -- api/
@@ -311,10 +316,10 @@ if [ -n "$rows" ] || stale_index; then
             [ "$path" = "$api_doc" ] || [ "$path" = "$api_export" ] || \
                 fail "11/11 api" "a new record under api/ was added: ${path}, only the release pair ${api_doc} and ${api_export} may appear"
         elif [ "$status" = "D" ]; then
-            successor_blob=$(git rev-parse ":${api_doc}" 2>/dev/null) || true
             if [ "$path" = "$doc_at_head" ] && [ -n "$doc_at_head" ] \
-                    && [ "$doc_at_head" != "$api_doc" ] && [ -n "$successor_blob" ] \
-                    && [ "$successor_blob" = "$(git rev-parse "HEAD:${path}")" ]; then
+                    && [ "$doc_at_head" != "$api_doc" ] \
+                    && git show ":${api_doc}" > "$api_tmp/successor.txt" 2>/dev/null \
+                    && cmp -s "$api_tmp/successor.txt" "$api_tmp/regen.txt"; then
                 continue
             fi
             fail "11/11 api" "a released record under api/ was deleted: ${path}, only the move to ${api_doc} is sanctioned"
@@ -326,10 +331,7 @@ if [ -n "$rows" ] || stale_index; then
         fail "11/11 api" "the stale record ${doc_at_head} is still staged, a release leaves no record at the old transcript path"
     fi
 fi
-api_tmp=$(mktemp -d)
-trap 'rm -rf "$api_tmp"' EXIT
-regenerate_api_doc "$api_tmp/$(basename "$api_doc")"
-if ! diff -u "$api_doc" "$api_tmp/$(basename "$api_doc")"; then
+if ! diff -u "$api_doc" "$api_tmp/regen.txt"; then
     fail "11/11 api" "the exported API differs from ${api_doc}, see the diff above"
 fi
 # A cached transcript row only cleared the path rules. The cached view
