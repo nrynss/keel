@@ -1064,11 +1064,11 @@ func costTablesOn(t *testing.T, path string) []string {
 
 // assertWholeCostSchema checks that a cancelled open left a schema a retry can
 // complete. The migration runner creates the ledger table first and applies
-// each file in one transaction, so the cost tables on disk are either absent,
-// the ledger alone, the first file's data tables alone, or every data table.
-// A database that carries any table of the first file carries all of them,
-// because one file commits as a unit, and it may or may not carry the owner
-// table the second file adds.
+// each file in one transaction. The cost tables on disk are therefore either
+// absent, the ledger alone, the first file's data tables alone, or every
+// data table. A database that carries any table of the first file carries
+// all of them, because one file commits as a unit. It may or may not carry
+// the owner table the second file adds.
 func assertWholeCostSchema(t *testing.T, deadline int, tables []string) {
 	t.Helper()
 	if len(tables) == 0 {
@@ -1099,13 +1099,14 @@ func assertWholeCostSchema(t *testing.T, deadline int, tables []string) {
 }
 
 // TestCancelledOpenLeavesTheSchemaAndRetrySucceeds pins what a cancelled open
-// leaves on disk. Open writes the schema and the ceiling before it returns, so
-// a deadline that lands after the migration runner commits leaves the schema,
-// its ledger row and the ceiling behind while Open reports no store. The test
-// sweeps deadlines over fresh databases, lists the cost tables over a
-// connection the package never touches, and retries each failed open with a
-// live context. The leftover must be a whole schema state, the retry must
-// succeed, and a second open on the same file must be unaffected.
+// leaves on disk. Open writes the schema and the ceiling before it returns.
+// A deadline that lands after the migration runner commits therefore leaves
+// the schema, its ledger row and the ceiling behind while Open reports no
+// store. The test sweeps deadlines over fresh databases, lists the cost
+// tables over a connection the package never touches, and retries each
+// failed open with a live context. The leftover must be a whole schema
+// state, the retry must succeed, and a second open on the same file must be
+// unaffected.
 func TestCancelledOpenLeavesTheSchemaAndRetrySucceeds(t *testing.T) {
 	const sweep = 400
 	dir := t.TempDir()

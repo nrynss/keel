@@ -19,15 +19,15 @@
 // database refused the statement for a reason of its own first.
 //
 // The store enforces the ceiling when it reserves, so concurrent callers never
-// hold more than the headroom, and it does not enforce it when it settles,
+// hold more than the headroom. It does not enforce it when it settles,
 // because a booking records what a call actually cost. A booking that
 // overshoots can therefore push booked spend past the ceiling, exactly as the
 // in-memory cost.Budget does.
 //
 // A KeyedBudget over the same store adds a ceiling per owner. The owner
 // ceilings live in their own table beside the one global ceiling, and every
-// keyed hold also counts against the global one, so an owner that exhausts
-// its share never touches another owner's headroom. The empty owner key
+// keyed hold also counts against the global one. An owner that exhausts its
+// share therefore never touches another owner's headroom. The empty owner key
 // names the unkeyed budget the store itself keeps, so the keyed budget
 // refuses it.
 //

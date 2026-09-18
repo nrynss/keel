@@ -35,10 +35,10 @@ func mustKeyedRemaining(t *testing.T, k *KeyedBudget, owner string) Price {
 }
 
 // TestKeyedBudgetDividesOnePoolBetweenOwners drives two owners through one
-// keyed budget and pins the three bounds a consumer relies on. Exhausting one
-// owner leaves the other's headroom untouched, the global ceiling refuses
-// when the owners' sum passes it, and a released reservation returns headroom
-// to the owner that released it and to nobody else.
+// keyed budget and pins the three bounds a consumer relies on. Exhausting
+// one owner leaves the other's headroom untouched, and the global ceiling
+// refuses when the owners' sum passes it. A released reservation returns
+// headroom to the owner that released it and to nobody else.
 func TestKeyedBudgetDividesOnePoolBetweenOwners(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -164,8 +164,8 @@ func TestKeyedBudgetDividesOnePoolBetweenOwners(t *testing.T) {
 
 // TestKeyedBudgetRefusesUnregisteredOwners pins that every owner-keyed
 // operation refuses an owner no ceiling was set for, so a typo cannot spend
-// against an unbounded account, and that a ceiling below zero is refused
-// where a budget's own limit is.
+// against an unbounded account. It also pins that a ceiling below zero is
+// refused where a budget's own limit is.
 func TestKeyedBudgetRefusesUnregisteredOwners(t *testing.T) {
 	k := mustKeyed(t, Dollar)
 	if err := k.Reserve("ghost", Cent); !errors.Is(err, ErrUnknownOwner) {

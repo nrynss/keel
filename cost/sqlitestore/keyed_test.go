@@ -49,8 +49,8 @@ func mustOwnerRemaining(t *testing.T, keyed *sqlitestore.KeyedBudget, owner stri
 
 // TestKeyedBudgetDividesOneStoreBetweenOwners drives two owners through one
 // keyed budget over one store and pins the three bounds a consumer relies
-// on. Exhausting one owner leaves the other's headroom untouched, the global
-// ceiling refuses when the owners' sum passes it, and a released hold
+// on. Exhausting one owner leaves the other's headroom untouched, and the
+// global ceiling refuses when the owners' sum passes it. A released hold
 // returns headroom to the owner that released it and to nobody else.
 func TestKeyedBudgetDividesOneStoreBetweenOwners(t *testing.T) {
 	tests := []struct {
@@ -259,8 +259,8 @@ func TestKeyedCeilingsSurviveARestart(t *testing.T) {
 
 // TestKeyedBudgetRefusals pins the refusals a caller must classify. An owner
 // no ceiling was set for matches cost.ErrUnknownOwner, a ceiling below zero
-// matches cost.ErrNegativeLimit, and the empty key matches ErrInvalid,
-// because the empty key names the unkeyed budget the store keeps.
+// matches cost.ErrNegativeLimit, and the empty key matches ErrInvalid. The
+// empty key refuses because it names the unkeyed budget the store keeps.
 func TestKeyedBudgetRefusals(t *testing.T) {
 	keyed, _ := openKeyed(t, filepath.Join(t.TempDir(), "cost.db"), withLimit(1000))
 	ctx := t.Context()

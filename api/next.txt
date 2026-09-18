@@ -577,10 +577,10 @@ func (c Charge) Total() (Price, error)
 type KeyedBudget struct {
 	// Has unexported fields.
 }
-    KeyedBudget bounds the spend of several owners that share one pool.
-    Every owner carries a ceiling of its own, and one global ceiling bounds the
-    sum of what all owners spend and hold together, so an owner that exhausts
-    its share never touches another owner's headroom. The owner key is whatever
+    KeyedBudget bounds the spend of several owners that share one pool. Every
+    owner carries a ceiling of its own, and one global ceiling bounds the sum of
+    what all owners spend and hold together. An owner that exhausts its share
+    therefore never touches another owner's headroom. The owner key is whatever
     string the caller uses to name an owner. Build one with NewKeyedBudget.
     Every method is safe for concurrent use.
 
@@ -706,17 +706,17 @@ open on the same file is unaffected. The failure wraps context.Canceled or
 context.DeadlineExceeded unless the database refused the statement for a reason
 of its own first.
 
-The store enforces the ceiling when it reserves, so concurrent callers never
-hold more than the headroom, and it does not enforce it when it settles,
+The store enforces the ceiling when it reserves, so concurrent callers
+never hold more than the headroom. It does not enforce it when it settles,
 because a booking records what a call actually cost. A booking that overshoots
 can therefore push booked spend past the ceiling, exactly as the in-memory
 cost.Budget does.
 
 A KeyedBudget over the same store adds a ceiling per owner. The owner ceilings
 live in their own table beside the one global ceiling, and every keyed hold also
-counts against the global one, so an owner that exhausts its share never touches
-another owner's headroom. The empty owner key names the unkeyed budget the store
-itself keeps, so the keyed budget refuses it.
+counts against the global one. An owner that exhausts its share therefore never
+touches another owner's headroom. The empty owner key names the unkeyed budget
+the store itself keeps, so the keyed budget refuses it.
 
 This package is one of the few allowed to import the SQLite driver. The ledger
 arithmetic itself stays in the cost package, and every total is summed through a
@@ -763,8 +763,8 @@ type KeyedBudget struct {
 }
     KeyedBudget bounds the spend of several owners over one durable store.
     It sits over the same tables, the same global ceiling and the same expiry
-    the store keeps, and adds a ceiling per owner, so an owner that exhausts its
-    share never touches another owner's headroom while the global ceiling still
+    the store keeps, and adds a ceiling per owner. An owner that exhausts its
+    share never touches another owner's headroom, while the global ceiling still
     bounds them all together. The empty owner key names the unkeyed budget Store
     itself keeps, so a keyed budget refuses it. Create one with NewKeyedBudget.
     A KeyedBudget is safe for concurrent use, as Store is.
@@ -775,10 +775,12 @@ func NewKeyedBudget(store *Store) *KeyedBudget
 
 func (k *KeyedBudget) Release(ctx context.Context, owner string, r Reservation) error
     Release frees a hold owner never spent. It reports ErrInvalid when owner is
-    empty and an error matching cost.ErrUnknownOwner when no ceiling was set for
-    owner. A hold that already expired or was already settled frees nothing,
-    and that is not an error, as Store.Release does. A cancelled context stops
-    the release, so the hold stays until its expiry frees it.
+    empty and an error matching cost.ErrUnknownOwner when no ceiling was set
+    for owner. A zero reservation names no hold, so the owner checks do not run
+    and the release frees nothing. A hold that already expired or was already
+    settled frees nothing, and that is not an error, as Store.Release does.
+    A cancelled context stops the release, so the hold stays until its expiry
+    frees it.
 
 func (k *KeyedBudget) Remaining(ctx context.Context, owner string) (cost.Price, error)
     Remaining returns the headroom owner still has under its own ceiling.
@@ -791,10 +793,10 @@ func (k *KeyedBudget) Remaining(ctx context.Context, owner string) (cost.Price, 
 
 func (k *KeyedBudget) Reserve(ctx context.Context, owner string, estimate cost.Price) (Reservation, error)
     Reserve commits estimate against owner's ceiling and against the store's
-    global ceiling, and returns the hold. It reports ErrInvalid when owner
-    is empty, an error matching cost.ErrUnknownOwner when no ceiling was set
-    for owner, and an error matching cost.ErrOverBudget when either bound
-    would be passed, committing nothing then. It reports an error matching
+    global ceiling, and returns the hold. It reports ErrInvalid when owner is
+    empty and an error matching cost.ErrUnknownOwner when no ceiling was set
+    for owner. It reports an error matching cost.ErrOverBudget when either bound
+    would be passed, and commits nothing then. It reports an error matching
     cost.ErrNegativeEstimate for a negative estimate. The checks and the insert
     share one transaction, so concurrent callers never overspend either bound.
     The hold expires after the configured TTL, as every hold on the store does.
@@ -802,20 +804,20 @@ func (k *KeyedBudget) Reserve(ctx context.Context, owner string, estimate cost.P
 
 func (k *KeyedBudget) SetLimit(ctx context.Context, owner string, limit cost.Price) error
     SetLimit gives owner a ceiling of its own, or replaces the ceiling it has.
-    The row is created on the first call and updated on every later one,
-    so the owner's booked spend survives the change, as the store's own ceiling
-    does across an open. It reports an error matching cost.ErrNegativeLimit when
-    limit is below zero, and ErrInvalid when owner is empty. A cancelled context
-    stops the write, so no ceiling is set.
+    The row is created on the first call and updated on every later one, so the
+    owner's booked spend survives the change. The store's own ceiling survives
+    an open the same way. It reports an error matching cost.ErrNegativeLimit
+    when limit is below zero, and ErrInvalid when owner is empty. A cancelled
+    context stops the write, so no ceiling is set.
 
 func (k *KeyedBudget) Settle(ctx context.Context, owner string, r Reservation, actual cost.Price) error
     Settle books the price owner's call actually cost and frees its hold.
-    It reports ErrInvalid when owner is empty, an error matching
-    cost.ErrUnknownOwner when no ceiling was set for owner, and an error
+    It reports ErrInvalid when owner is empty and an error matching
+    cost.ErrUnknownOwner when no ceiling was set for owner. It reports an error
     matching cost.ErrOverflow when actual would push either booked spend past
-    the int64 range, committing nothing then. The booking lands on the global
-    pool and on the owner's own account, because both ceilings read the same
-    fact. A hold that already expired or belongs to another owner frees nothing,
+    the int64 range, and commits nothing then. The booking lands on the global
+    pool and on the owner's own account, because both ceilings read the fact.
+    A hold that already expired or belongs to another owner frees nothing,
     and that is not an error. A cancelled context stops the settle, so nothing
     is booked.
 

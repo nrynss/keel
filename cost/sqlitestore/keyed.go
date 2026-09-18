@@ -13,8 +13,8 @@ import (
 
 // KeyedBudget bounds the spend of several owners over one durable store. It
 // sits over the same tables, the same global ceiling and the same expiry the
-// store keeps, and adds a ceiling per owner, so an owner that exhausts its
-// share never touches another owner's headroom while the global ceiling
+// store keeps, and adds a ceiling per owner. An owner that exhausts its
+// share never touches another owner's headroom, while the global ceiling
 // still bounds them all together. The empty owner key names the unkeyed
 // budget Store itself keeps, so a keyed budget refuses it. Create one with
 // NewKeyedBudget. A KeyedBudget is safe for concurrent use, as Store is.
@@ -36,10 +36,10 @@ func emptyOwner(op string) error {
 
 // SetLimit gives owner a ceiling of its own, or replaces the ceiling it has.
 // The row is created on the first call and updated on every later one, so
-// the owner's booked spend survives the change, as the store's own ceiling
-// does across an open. It reports an error matching cost.ErrNegativeLimit
-// when limit is below zero, and ErrInvalid when owner is empty. A cancelled
-// context stops the write, so no ceiling is set.
+// the owner's booked spend survives the change. The store's own ceiling
+// survives an open the same way. It reports an error matching
+// cost.ErrNegativeLimit when limit is below zero, and ErrInvalid when owner
+// is empty. A cancelled context stops the write, so no ceiling is set.
 func (k *KeyedBudget) SetLimit(ctx context.Context, owner string, limit cost.Price) error {
 	if owner == "" {
 		return emptyOwner("set owner limit")
@@ -57,13 +57,13 @@ func (k *KeyedBudget) SetLimit(ctx context.Context, owner string, limit cost.Pri
 
 // Reserve commits estimate against owner's ceiling and against the store's
 // global ceiling, and returns the hold. It reports ErrInvalid when owner is
-// empty, an error matching cost.ErrUnknownOwner when no ceiling was set for
-// owner, and an error matching cost.ErrOverBudget when either bound would be
-// passed, committing nothing then. It reports an error matching
-// cost.ErrNegativeEstimate for a negative estimate. The checks and the
-// insert share one transaction, so concurrent callers never overspend either
-// bound. The hold expires after the configured TTL, as every hold on the
-// store does. A cancelled context stops the reserve, so no hold is taken.
+// empty and an error matching cost.ErrUnknownOwner when no ceiling was set
+// for owner. It reports an error matching cost.ErrOverBudget when either
+// bound would be passed, and commits nothing then. It reports an error
+// matching cost.ErrNegativeEstimate for a negative estimate. The checks and
+// the insert share one transaction, so concurrent callers never overspend
+// either bound. The hold expires after the configured TTL, as every hold on
+// the store does. A cancelled context stops the reserve, so no hold is taken.
 func (k *KeyedBudget) Reserve(ctx context.Context, owner string, estimate cost.Price) (Reservation, error) {
 	if owner == "" {
 		return Reservation{}, emptyOwner("reserve")
@@ -81,18 +81,6 @@ func (k *KeyedBudget) Reserve(ctx context.Context, owner string, estimate cost.P
 		`DELETE FROM cost_reservation WHERE expires_at <= ?`, now.UnixMilli()); err != nil {
 		return Reservation{}, fmt.Errorf("sqlitestore: reserve: purge expired: %w", err)
 	}
-	global, err := loadState(ctx, tx, now)
-	if err != nil {
-		return Reservation{}, fmt.Errorf("sqlitestore: reserve: %w", err)
-	}
-	globalRemaining, err := remainingOf(global)
-	if err != nil {
-		return Reservation{}, fmt.Errorf("sqlitestore: reserve: %w", err)
-	}
-	if estimate > globalRemaining {
-		return Reservation{}, fmt.Errorf("sqlitestore: reserve %s over remaining %s: %w",
-			estimate, globalRemaining, cost.ErrOverBudget)
-	}
 	owned, err := loadOwner(ctx, tx, owner, now)
 	if err != nil {
 		return Reservation{}, fmt.Errorf("sqlitestore: reserve: %w", err)
@@ -104,6 +92,18 @@ func (k *KeyedBudget) Reserve(ctx context.Context, owner string, estimate cost.P
 	if estimate > ownerRemaining {
 		return Reservation{}, fmt.Errorf("sqlitestore: reserve %s over owner remaining %s: %w",
 			estimate, ownerRemaining, cost.ErrOverBudget)
+	}
+	global, err := loadState(ctx, tx, now)
+	if err != nil {
+		return Reservation{}, fmt.Errorf("sqlitestore: reserve: %w", err)
+	}
+	globalRemaining, err := remainingOf(global)
+	if err != nil {
+		return Reservation{}, fmt.Errorf("sqlitestore: reserve: %w", err)
+	}
+	if estimate > globalRemaining {
+		return Reservation{}, fmt.Errorf("sqlitestore: reserve %s over remaining %s: %w",
+			estimate, globalRemaining, cost.ErrOverBudget)
 	}
 	reservationID, err := id.New()
 	if err != nil {
@@ -122,11 +122,11 @@ func (k *KeyedBudget) Reserve(ctx context.Context, owner string, estimate cost.P
 }
 
 // Settle books the price owner's call actually cost and frees its hold. It
-// reports ErrInvalid when owner is empty, an error matching
-// cost.ErrUnknownOwner when no ceiling was set for owner, and an error
-// matching cost.ErrOverflow when actual would push either booked spend past
-// the int64 range, committing nothing then. The booking lands on the global
-// pool and on the owner's own account, because both ceilings read the same
+// reports ErrInvalid when owner is empty and an error matching
+// cost.ErrUnknownOwner when no ceiling was set for owner. It reports an
+// error matching cost.ErrOverflow when actual would push either booked spend
+// past the int64 range, and commits nothing then. The booking lands on the
+// global pool and on the owner's own account, because both ceilings read the
 // fact. A hold that already expired or belongs to another owner frees
 // nothing, and that is not an error. A cancelled context stops the settle,
 // so nothing is booked.
@@ -181,9 +181,11 @@ func (k *KeyedBudget) Settle(ctx context.Context, owner string, r Reservation, a
 
 // Release frees a hold owner never spent. It reports ErrInvalid when owner
 // is empty and an error matching cost.ErrUnknownOwner when no ceiling was
-// set for owner. A hold that already expired or was already settled frees
-// nothing, and that is not an error, as Store.Release does. A cancelled
-// context stops the release, so the hold stays until its expiry frees it.
+// set for owner. A zero reservation names no hold, so the owner checks do
+// not run and the release frees nothing. A hold that already expired or was
+// already settled frees nothing, and that is not an error, as Store.Release
+// does. A cancelled context stops the release, so the hold stays until its
+// expiry frees it.
 func (k *KeyedBudget) Release(ctx context.Context, owner string, r Reservation) error {
 	if r.ID == "" {
 		return nil

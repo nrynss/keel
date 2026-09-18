@@ -12,10 +12,10 @@ var ErrUnknownOwner = errors.New("cost: unknown budget owner")
 
 // KeyedBudget bounds the spend of several owners that share one pool. Every
 // owner carries a ceiling of its own, and one global ceiling bounds the sum
-// of what all owners spend and hold together, so an owner that exhausts its
-// share never touches another owner's headroom. The owner key is whatever
-// string the caller uses to name an owner. Build one with NewKeyedBudget.
-// Every method is safe for concurrent use.
+// of what all owners spend and hold together. An owner that exhausts its
+// share therefore never touches another owner's headroom. The owner key is
+// whatever string the caller uses to name an owner. Build one with
+// NewKeyedBudget. Every method is safe for concurrent use.
 type KeyedBudget struct {
 	mu     sync.Mutex
 	global *Budget
