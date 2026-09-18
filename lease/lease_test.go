@@ -581,3 +581,127 @@ func TestAbandonedLeaseFreesItsSlotAcrossHandles(t *testing.T) {
 		t.Fatalf("open after reclaim = %q, want open", got.State)
 	}
 }
+
+// TestSecondCloseOfOneLeaseFails pins that two closes of one open lease
+// settle exactly once. The winner closes the lease, the loser reports
+// ErrInvalid, and the budget holds the open estimate plus one close price.
+func TestSecondCloseOfOneLeaseFails(t *testing.T) {
+	clock := &testClock{at: base}
+	manager, meter, _ := fixture(t, t.TempDir()+"/lease.db", 2, 1000, clock)
+	ctx := t.Context()
+
+	got := openLease(t, manager, 100)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	var okCount, invalidCount int
+	var mu sync.Mutex
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, err := manager.Close(context.Background(), got.ID, 110)
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case err == nil:
+				okCount++
+			case errors.Is(err, lease.ErrInvalid):
+				invalidCount++
+			default:
+				t.Errorf("close error = %v, want nil or ErrInvalid", err)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	if okCount != 1 {
+		t.Fatalf("successful closes = %d, want 1", okCount)
+	}
+	if invalidCount != 1 {
+		t.Fatalf("refused closes = %d, want 1", invalidCount)
+	}
+	if got := meter.meterSpent(); got != 210 {
+		t.Fatalf("spent = %d, want 210", got)
+	}
+	if got := meter.total(t); got != 210 {
+		t.Fatalf("ledger total = %d, want 210", got)
+	}
+	read, err := manager.Inspect(ctx, got.ID)
+	if err != nil {
+		t.Fatalf("inspect after the race: %v", err)
+	}
+	if read.State != lease.StateClosed {
+		t.Fatalf("state after the race = %q, want closed", read.State)
+	}
+}
+
+// TestReclaimWithoutIDsFreesAnAbandonedLease pins that Reclaim with an empty
+// list sweeps expired but open rows without settling any price. The test
+// drops every handle to the first manager, so no id passes across the
+// restart except through the rows on disk.
+func TestReclaimWithoutIDsFreesAnAbandonedLease(t *testing.T) {
+	path := t.TempDir() + "/lease.db"
+	clock := &testClock{at: base}
+	first, _, _ := fixture(t, path, 1, 1000, clock)
+	abandoned := openLease(t, first, 100)
+	abandonedID := abandoned.ID
+	clock.advance(61 * time.Minute)
+
+	db := openDB(t, path)
+	secondStore, err := leasesql.Open(t.Context(), leasesql.Config{
+		DB:     db,
+		Logger: slog.New(slog.DiscardHandler),
+	})
+	if err != nil {
+		t.Fatalf("reopen lease store: %v", err)
+	}
+	secondQuota, err := lease.NewQuota(1)
+	if err != nil {
+		t.Fatalf("new quota: %v", err)
+	}
+	secondMeter := newFakeMeter(t, 1000)
+	second, err := lease.New(lease.Config{
+		Quota: secondQuota,
+		Meter: secondMeter,
+		Store: secondStore,
+		Cap:   time.Hour,
+		Kind:  "session",
+		Now:   clock.now,
+		Log:   slog.New(slog.DiscardHandler),
+	})
+	if err != nil {
+		t.Fatalf("new second manager: %v", err)
+	}
+	freed, err := second.Reclaim(t.Context(), nil)
+	if err != nil {
+		t.Fatalf("reclaim: %v", err)
+	}
+	if freed != 1 {
+		t.Fatalf("reclaimed = %d, want 1", freed)
+	}
+	read, err := second.Inspect(t.Context(), abandonedID)
+	if err != nil {
+		t.Fatalf("inspect the abandoned lease: %v", err)
+	}
+	if read.State != lease.StateExpired {
+		t.Fatalf("abandoned state = %q, want expired", read.State)
+	}
+	if got := secondMeter.meterSpent(); got != 0 {
+		t.Fatalf("second manager spent = %d, want 0, expiry settles nothing", got)
+	}
+	if got := openLease(t, second, 100); got.State != lease.StateOpen {
+		t.Fatalf("open after reclaim = %q, want open", got.State)
+	}
+}
+
+// TestReclaimOfAnUnknownLeaseReportsIt pins that Reclaim over a lease the
+// store never held reports ErrUnknownLease, so a misspelled id never reads
+// as a quiet zero.
+func TestReclaimOfAnUnknownLeaseReportsIt(t *testing.T) {
+	clock := &testClock{at: base}
+	manager, _, _ := fixture(t, t.TempDir()+"/lease.db", 1, 1000, clock)
+	if _, err := manager.Reclaim(t.Context(), []string{"missing"}); !errors.Is(err, lease.ErrUnknownLease) {
+		t.Fatalf("reclaim of a missing lease error = %v, want ErrUnknownLease", err)
+	}
+}

@@ -46,11 +46,15 @@ var ErrNegativePrice = errors.New("lease: negative price")
 type State string
 
 // Lease states name where one lease stands. A lease moves from open to
-// closed or expired, and a closed lease may later reconcile. Expired is
-// terminal like closed, because the session never ran past its cap.
+// closed or expired, and a closed lease may later reconcile. Closing marks
+// a lease one closer claimed while it settles, so a second closer loses the
+// claim without settling. Expired is terminal like closed, because the
+// session never ran past its cap.
 const (
 	// StateOpen marks a lease that still holds its quota slot.
 	StateOpen State = "open"
+	// StateClosing marks a lease one closer claimed while it settles.
+	StateClosing State = "closing"
 	// StateClosed marks a lease the holder closed with a reported price.
 	StateClosed State = "closed"
 	// StateExpired marks a lease whose cap passed before it closed.
@@ -147,7 +151,8 @@ var _ Meter = (*cost.Meter)(nil)
 
 // Store keeps lease rows durably. The opener writes and reads through it,
 // and expiry is judged from the stored deadlines, so no process must stay
-// alive for a cap to hold.
+// alive for a cap to hold. Close writes only when the row still reads open,
+// so two closers of one lease never settle twice across processes.
 type Store interface {
 	// Create writes a fresh open lease row.
 	Create(ctx context.Context, lease Lease) error
@@ -157,6 +162,16 @@ type Store interface {
 	// Update writes back the lease stored under id, or an error matching
 	// ErrUnknownLease.
 	Update(ctx context.Context, lease Lease) error
+	// CloseIfOpen writes back lease only when the stored row still reads
+	// open. It reports true when it wrote, or false with no error when the
+	// row already moved on. An unknown id reports an error matching
+	// ErrUnknownLease. Stores must compare while they write, so a loser
+	// that read open earlier still loses.
+	CloseIfOpen(ctx context.Context, lease Lease) (bool, error)
+	// ExpiredOpen lists every row that still reads open with a deadline at
+	// or before now, so a call that names no id still finds abandoned
+	// rows. The order is row order, and the cap bounds the count.
+	ExpiredOpen(ctx context.Context, now time.Time, limit int) ([]Lease, error)
 }
 
 // Config configures a Manager.
@@ -194,7 +209,8 @@ const defaultKind = "session"
 
 // Manager opens, closes and reconciles paid session leases. Create it with
 // New. A Manager is safe for concurrent use, because the quota, the meter
-// and the store each are.
+// and the store each are. Close claims the row before it settles, so two
+// closers of one lease never settle twice in any process.
 type Manager struct {
 	quota *Quota
 	meter Meter
@@ -304,10 +320,14 @@ func (m *Manager) Open(ctx context.Context, owner string, estimate cost.Price, k
 	return lease, nil
 }
 
-// Close ends the open lease id at the holder reported price. It settles
-// the real duration through the seam and frees the quota slot. A past-cap
-// lease expires first and frees its slot on the way out, then Close still
-// reports ErrInvalid, because the session never closed in time.
+// Close ends the open lease id at the holder reported price. It claims the
+// row, then settles the real duration through the seam and frees the quota
+// slot. A past-cap lease expires first and frees its slot on the way out,
+// then Close still reports ErrInvalid, because the session never closed in
+// time. The claim writes closing only when the row still reads open, so the
+// second closer of one lease loses the claim and reports ErrInvalid without
+// settling. The claim covers every process, because the store compares while
+// it writes.
 func (m *Manager) Close(ctx context.Context, id string, price cost.Price) (Lease, error) {
 	if price < 0 {
 		return Lease{}, fmt.Errorf("lease: close price %d: %w", price, ErrNegativePrice)
@@ -324,20 +344,40 @@ func (m *Manager) Close(ctx context.Context, id string, price cost.Price) (Lease
 	if lease.Owner != "" {
 		ref = lease.Owner + "/" + lease.ID
 	}
+	closed := lease
+	closed.State = StateClosing
+	claimed, err := m.store.CloseIfOpen(ctx, closed)
+	if err != nil {
+		return Lease{}, fmt.Errorf("lease: close: %w", err)
+	}
+	if !claimed {
+		return Lease{}, fmt.Errorf("lease: close %s in state closed: %w", id, ErrInvalid)
+	}
 	if _, err := m.meter.Call(ctx, lease.Estimate, lease.Kind, ref, func(context.Context) (cost.Usage, error) {
 		return cost.Usage{Price: price, Measured: true}, nil
 	}); err != nil {
+		m.releaseClaim(ctx, closed)
 		return Lease{}, fmt.Errorf("lease: close: settle price: %w", err)
 	}
-	lease.State = StateClosed
-	lease.ClosedAt = m.now()
-	lease.Settled = price
-	lease.Reported = price
-	if err := m.store.Update(ctx, lease); err != nil {
+	closed.State = StateClosed
+	closed.ClosedAt = m.now()
+	closed.Settled = price
+	closed.Reported = price
+	if err := m.store.Update(ctx, closed); err != nil {
 		return Lease{}, fmt.Errorf("lease: close: %w", err)
 	}
 	m.quota.free(id)
-	return lease, nil
+	return closed, nil
+}
+
+// releaseClaim returns a closing row to open after the settle failed, so the
+// next close may try again. It logs and keeps the claim when the write
+// fails, because the stored row still names the loser as closing.
+func (m *Manager) releaseClaim(ctx context.Context, claimed Lease) {
+	claimed.State = StateOpen
+	if err := m.store.Update(ctx, claimed); err != nil {
+		m.log.ErrorContext(ctx, "lease: release claim", "id", claimed.ID, "error", err)
+	}
 }
 
 // Reconcile applies the provider reported price to the closed lease id.
@@ -385,14 +425,46 @@ func (m *Manager) Inspect(ctx context.Context, id string) (Lease, error) {
 }
 
 // Reclaim frees the quota slot of every open lease whose cap has passed.
-// It reports how many slots it freed. A dead process leaves its lease
-// behind, and the next call reclaims the slot without that process. Each
-// reclaimed row moves to expired in the store, so the fact survives a
-// restart.
+// It reports how many slots it freed. An empty id list sweeps the store for
+// every expired but open row, so a lease whose id nobody kept still frees
+// its row on disk. A named list reclaims exactly those ids and reports
+// ErrUnknownLease for the first id the store never held, so a misspelled id
+// never reads as success. A dead process leaves its lease behind, and the
+// next call reclaims the slot without that process. Each reclaimed row moves
+// to expired in the store, so the fact survives a restart. Reclaim books
+// nothing, because expiry never settles a price.
 func (m *Manager) Reclaim(ctx context.Context, ids []string) (int, error) {
+	if len(ids) == 0 {
+		return m.sweepExpired(ctx)
+	}
 	freed := 0
 	for _, id := range ids {
 		lease, err := m.store.Get(ctx, id)
+		if err != nil {
+			return freed, err
+		}
+		if m.settleExpiry(ctx, &lease) {
+			freed++
+		}
+	}
+	return freed, nil
+}
+
+// sweepCap bounds one sweep of expired but open rows. One pass frees the
+// quota map without growing memory with the table.
+const sweepCap = 256
+
+// sweepExpired expires every open row whose deadline reached now, without
+// settling any price. It reads one bounded pass and frees each row it finds,
+// so the call ends even when the table holds more rows than the cap.
+func (m *Manager) sweepExpired(ctx context.Context) (int, error) {
+	rows, err := m.store.ExpiredOpen(ctx, m.now(), sweepCap)
+	if err != nil {
+		return 0, err
+	}
+	freed := 0
+	for _, row := range rows {
+		lease, err := m.store.Get(ctx, row.ID)
 		if err != nil {
 			if errors.Is(err, ErrUnknownLease) {
 				continue
@@ -414,10 +486,10 @@ func (m *Manager) Active() int {
 // settleExpiry expires lease when its cap has passed. Every touch point
 // runs it first, so a past-cap lease frees its slot on the next call from
 // any direction, without its holder acting. It reports whether this call
-// expired the lease. A closed lease never expires, because its session ran
-// its course.
+// expired the lease. A closed or closing lease never expires, because its
+// session ran its course or is settling now.
 func (m *Manager) settleExpiry(ctx context.Context, lease *Lease) bool {
-	if m.now().Before(lease.ExpiresAt) || lease.State == StateClosed {
+	if m.now().Before(lease.ExpiresAt) || lease.State == StateClosed || lease.State == StateClosing {
 		return false
 	}
 	if lease.State != StateOpen {
