@@ -3,6 +3,7 @@ package cost
 import (
 	"context"
 	"errors"
+	"fmt"
 )
 
 // ErrNilAccount reports a meter built without a budget account.
@@ -10,6 +11,9 @@ var ErrNilAccount = errors.New("cost: nil meter account")
 
 // ErrNilLedger reports a meter built without a ledger.
 var ErrNilLedger = errors.New("cost: nil meter ledger")
+
+// ErrNegativePrice reports a call that measured a price below zero.
+var ErrNegativePrice = errors.New("cost: negative measured price")
 
 // Account is the budget side a meter drives. A Budget is an account on its
 // own, and a KeyedBudget hands out one account per owner through Owner. The
@@ -73,7 +77,9 @@ func NewMeter(account Account, ledger *Ledger) (*Meter, error) {
 // estimate first, and it returns the refusal without running work when the
 // reservation fails or the context is already done. It then runs work and
 // settles the price the usage reports. A usage with Measured false settles
-// at the estimate, and the usage Call returns says so the same way.
+// at the estimate, and the usage Call returns says so the same way. A
+// measured price below zero reports ErrNegativePrice before any booking,
+// because a refund is a separate charge and never a negative booking.
 //
 // A returned error frees the reservation. So does a context that finishes
 // mid-call, which surfaces as the error the work returns. A panic in work
@@ -107,6 +113,9 @@ func (m *Meter) Call(ctx context.Context, estimate Price, kind, ref string, work
 	price := usage.Price
 	if !usage.Measured {
 		price = estimate
+	}
+	if usage.Measured && price < 0 {
+		return Usage{}, fmt.Errorf("cost: measured price %d: %w", price, ErrNegativePrice)
 	}
 	if err := m.account.Settle(estimate, price); err != nil {
 		return Usage{}, err

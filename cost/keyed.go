@@ -150,7 +150,9 @@ func (k *KeyedBudget) Owner(owner string) (Account, error) {
 }
 
 // ownerAccount drives one owner of a keyed budget through the Account shape
-// the meter consumes.
+// the meter consumes. It stays a value because it holds a shared pointer
+// beside a key, so copies share one budget, while Meter stays a pointer
+// because it owns the booked flag its deferred release reads.
 type ownerAccount struct {
 	keyed *KeyedBudget
 	owner string

@@ -244,6 +244,38 @@ func TestMeterRefusesNilAccountAndNilLedger(t *testing.T) {
 	}
 }
 
+// TestMeterRefusesANegativeMeasuredPrice pins that a call reporting a price
+// below zero books nothing and holds nothing. The refusal arrives before
+// any booking, so a later call sees the same headroom it would have seen
+func TestMeterRefusesANegativeMeasuredPrice(t *testing.T) {
+	meter, budget, ledger := mustMeter(t, 100*Cent)
+	usage, err := meter.Call(context.Background(), 30*Cent, "transcribe", "job-9",
+		func(context.Context) (Usage, error) {
+			return Usage{Price: -2 * Cent, Measured: true}, nil
+		})
+	if !errors.Is(err, ErrNegativePrice) {
+		t.Fatalf("Call error = %v, want ErrNegativePrice", err)
+	}
+	if usage != (Usage{}) {
+		t.Errorf("Call usage = %+v, want the zero usage", usage)
+	}
+	if got := budget.Spent(); got != 0 {
+		t.Errorf("Spent() = %d, want 0", got)
+	}
+	if got := budget.Reserved(); got != 0 {
+		t.Errorf("Reserved() = %d, want 0", got)
+	}
+	if got, err := budget.Remaining(); err != nil || got != 100*Cent {
+		t.Errorf("Remaining() = %d, %v, want %d", got, err, 100*Cent)
+	}
+	if charges := ledger.Charges(); len(charges) != 0 {
+		t.Errorf("Charges() = %d rows, want 0", len(charges))
+	}
+	if err := budget.Reserve(100 * Cent); err != nil {
+		t.Errorf("Reserve after the refused call: %v", err)
+	}
+}
+
 // TestMeterDrivesAnOwnerAccount pins that a meter over one owner's account
 // bounds itself by the owner ceiling and by the global one. The owner's
 // headroom comes out exact, and the global ceiling refuses at the exact
