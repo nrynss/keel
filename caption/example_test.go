@@ -8,7 +8,7 @@ import (
 	"github.com/nrynss/keel/caption"
 )
 
-// ExampleGroup_join shows words grouped into cues under a line length and a
+// Example_group shows words grouped into cues under a line length and a
 // duration cap, then rendered to both formats.
 func Example_group() {
 	words := []caption.Word{
@@ -53,7 +53,7 @@ func Example_group() {
 	//
 }
 
-// ExampleWebVTT shows a word carrying markup characters, escaped for WebVTT
+// Example_escape shows a word carrying markup characters, escaped for WebVTT
 // and passed through unchanged by SRT.
 func Example_escape() {
 	cues := caption.Group([]caption.Word{

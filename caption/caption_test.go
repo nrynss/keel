@@ -71,7 +71,7 @@ func TestRenderFixtures(t *testing.T) {
 		{"markup", markupWords, caption.Config{}},
 		{"empty", nil, caption.Config{}},
 		{"longword", longWord, caption.Config{LineLength: 20, MaxDuration: time.Second}},
-		{"normal", normalWords, caption.Config{LineLength: 15}},
+		{"normal", normalWords, caption.Config{LineLength: 15, MaxDuration: time.Second}},
 	}
 
 	for _, tc := range cases {

@@ -13,6 +13,7 @@ import (
 	"io"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // Default line length in characters when Config.LineLength is not set.
@@ -63,8 +64,8 @@ func (c Config) maxDuration() time.Duration {
 }
 
 // Group joins words into cues. A word is never split and never crosses a cue
-// boundary. A word longer than the line length gets a line of its own, and
-// its own cue when adding a neighbour would exceed the limits.
+// boundary. A word longer than the line length gets a line of its own and
+// its own cue, because adding any neighbour would exceed the line length.
 func Group(words []Word, cfg Config) []Cue {
 	limit := cfg.lineLength()
 	maxDur := cfg.maxDuration()
@@ -95,13 +96,23 @@ func Group(words []Word, cfg Config) []Cue {
 		if w.End < w.Start {
 			w.Start, w.End = w.End, w.Start
 		}
+		if utf8.RuneCountInString(w.Text) > limit {
+			// No neighbour can join this line without passing the
+			// limit, so the word takes a cue of its own.
+			closeCue()
+			cur = &Cue{Start: w.Start}
+			line = append(line, w.Text)
+			cur.End = w.End
+			closeCue()
+			continue
+		}
 		if cur != nil && w.End-cur.Start > maxDur {
 			closeCue()
 		}
 		if cur == nil {
 			cur = &Cue{Start: w.Start}
 		}
-		needed := len(w.Text)
+		needed := utf8.RuneCountInString(w.Text)
 		if len(line) > 0 {
 			needed++ // one joining space
 		}

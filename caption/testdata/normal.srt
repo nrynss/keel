@@ -1,6 +1,10 @@
 1
-00:00:00,100 --> 00:00:03,000
+00:00:00,100 --> 00:00:00,800
 the quick brown
-fox jumps over
-the lazy dog
+fox
+
+2
+00:00:02,000 --> 00:00:03,000
+jumps over the
+lazy dog
 
