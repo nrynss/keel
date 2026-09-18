@@ -14,10 +14,17 @@ package waveform
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/nrynss/keel/ffmpeg"
 )
+
+// ErrOddFrameSize reports a Config.Width or Config.Height above zero that is
+// odd. The yuv420p output stores colour in pixel pairs, so an odd value
+// cannot render at the size the caller asked for. A caller that wants to
+// correct its config matches it with errors.Is.
+var ErrOddFrameSize = errors.New("waveform: frame size must be even")
 
 // Default frame width when Config.Width is not set.
 const defaultWidth = 1920
@@ -34,9 +41,13 @@ const defaultPadColor = "black"
 // Config carries the frame size and the two colours of one render. The zero
 // value draws a white waveform over a 1920 by 1080 frame padded with black.
 type Config struct {
-	// Width is the output frame width in pixels. Zero or less means 1920.
+	// Width is the output frame width in pixels. The value must be even,
+	// because the yuv420p output stores colour in pixel pairs. An odd value
+	// reports ErrOddFrameSize. Zero or less means 1920.
 	Width int
-	// Height is the output frame height in pixels. Zero or less means 1080.
+	// Height is the output frame height in pixels. The value must be even,
+	// because the yuv420p output stores colour in pixel pairs. An odd value
+	// reports ErrOddFrameSize. Zero or less means 1080.
 	Height int
 	// WaveColor is the colour the waveform is drawn in. Any colour name
 	// ffmpeg accepts works. Empty means white.
@@ -78,13 +89,23 @@ func (c Config) padColor() string {
 }
 
 // Render draws the audio waveform over the still image and writes one video
-// to out. The frame size and both colours come from cfg.
+// to out. The frame size and both colours come from cfg. An odd cfg.Width
+// or cfg.Height reports ErrOddFrameSize before any process starts.
 //
 // The audio stream is copied, never encoded, so out must name a container
-// that carries the input codec. Matroska carries every common one. A missing
-// binary reports ffmpeg.ErrNotFound and a failed run reports
-// ffmpeg.ErrFailed. The context kills the child when it ends.
+// that carries the input codec. Matroska carries every common one. The
+// output duration equals the input duration for PCM audio. A copied lossy
+// stream adds the priming window of its codec, for example 23 milliseconds
+// for AAC at 44100 Hz. A missing binary reports ffmpeg.ErrNotFound and a
+// failed run reports ffmpeg.ErrFailed. The context kills the child when it
+// ends.
 func Render(ctx context.Context, tools ffmpeg.Tools, cfg Config, still, audio, out string) error {
+	if cfg.Width > 0 && cfg.Width%2 != 0 {
+		return fmt.Errorf("width %d: %w", cfg.Width, ErrOddFrameSize)
+	}
+	if cfg.Height > 0 && cfg.Height%2 != 0 {
+		return fmt.Errorf("height %d: %w", cfg.Height, ErrOddFrameSize)
+	}
 	w, h := cfg.width(), cfg.height()
 	// The still fits the frame along its longer side and the pad filter
 	// fills the rest, so the content keeps its shape. showwavespic draws

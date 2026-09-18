@@ -405,3 +405,29 @@ func TestRenderReportsMissingBinary(t *testing.T) {
 		t.Fatalf("error = %v, want ffmpeg.ErrNotFound", err)
 	}
 }
+
+// TestRenderRejectsOddFrameSize checks that an odd width and an odd height
+// both report ErrOddFrameSize. The Tools value points at a binary that does
+// not exist, so a report of ffmpeg.ErrNotFound would mean the check let a
+// process start. The output file must never appear.
+func TestRenderRejectsOddFrameSize(t *testing.T) {
+	tools := ffmpeg.Tools{FFmpeg: filepath.Join(t.TempDir(), "absent")}
+	out := filepath.Join(t.TempDir(), "out.mkv")
+	t.Run("odd width", func(t *testing.T) {
+		err := Render(context.Background(), tools, Config{Width: 321, Height: 180},
+			"still.png", "tone.wav", out)
+		if !errors.Is(err, ErrOddFrameSize) {
+			t.Fatalf("Render(Width: 321) error = %v, want ErrOddFrameSize", err)
+		}
+	})
+	t.Run("odd height", func(t *testing.T) {
+		err := Render(context.Background(), tools, Config{Width: 320, Height: 181},
+			"still.png", "tone.wav", out)
+		if !errors.Is(err, ErrOddFrameSize) {
+			t.Fatalf("Render(Height: 181) error = %v, want ErrOddFrameSize", err)
+		}
+	})
+	if _, statErr := os.Stat(out); !os.IsNotExist(statErr) {
+		t.Fatalf("rejected config still wrote %s, stat error = %v", out, statErr)
+	}
+}
