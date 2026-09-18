@@ -533,7 +533,9 @@ func (r *Runner) recover(ctx context.Context) error {
 // attempt starts still resumes the chain. The attempt is charged only when it
 // starts, so a queued record that never ran does not consume the limit. A
 // record whose attempts are spent is never rerun, so a spent kind keeps its
-// interrupted terminal.
+// interrupted terminal. The replacement inherits the interrupted record's
+// progress snapshot, so a resume hook can rebuild even a replacement that
+// died before its first report.
 func (r *Runner) resume(ctx context.Context, rec Record) {
 	k := r.kinds[rec.Kind]
 	if !k.Idempotent || k.Resume == nil {
@@ -559,6 +561,7 @@ func (r *Runner) resume(ctx context.Context, rec Record) {
 		Attempt:   rec.Attempt + 1,
 		ParentID:  rec.ID,
 		RootID:    rec.RootID,
+		Progress:  rec.Progress,
 		UpdatedAt: r.now(),
 	}
 	if err := r.store.Create(context.WithoutCancel(ctx), next); err != nil {
