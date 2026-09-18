@@ -1,12 +1,12 @@
 // Package sqlitestore persists runtime flags over SQLite.
 //
-// The package owns one schema, applied through the sqlite package's
-// migration runner under its own namespace, so the migration ledger records
-// what ran and a second open on the same database changes nothing.
+// The package owns one schema. It applies it through the sqlite package's
+// migration runner under its own namespace, so the ledger records what ran
+// and a second open on the same database changes nothing.
 //
 // Reads go through to the database every time. A flag check is one indexed
 // primary-key lookup, so a cache would add an invalidation problem for no
-// measurable gain, and an operator's flip must be visible to the next read
+// measurable gain. An operator's flip must be visible to the next read
 // without a restart.
 //
 // A value row records the kind its writer declared. A read whose
@@ -113,7 +113,7 @@ func (s *Store) Bool(ctx context.Context, f flag.Bool) (bool, time.Time, error) 
 	}
 	var kind, value string
 	var changed int64
-	err := s.db.Writer().QueryRowContext(ctx,
+	err := s.db.Reader().QueryRowContext(ctx,
 		`SELECT kind, value, changed_at FROM flag_value WHERE name = ?`, f.Name,
 	).Scan(&kind, &value, &changed)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -150,7 +150,7 @@ func (s *Store) Text(ctx context.Context, f flag.Text) (string, time.Time, error
 	}
 	var kind, value string
 	var changed int64
-	err := s.db.Writer().QueryRowContext(ctx,
+	err := s.db.Reader().QueryRowContext(ctx,
 		`SELECT kind, value, changed_at FROM flag_value WHERE name = ?`, f.Name,
 	).Scan(&kind, &value, &changed)
 	if errors.Is(err, sql.ErrNoRows) {

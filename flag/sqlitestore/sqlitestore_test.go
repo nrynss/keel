@@ -34,15 +34,12 @@ func openDB(t *testing.T, path string) *sqlite.DB {
 }
 
 // openStore applies the schema at path and returns the store.
-func openStore(t *testing.T, path string, opts ...func(*sqlitestore.Config)) *sqlitestore.Store {
+func openStore(t *testing.T, path string) *sqlitestore.Store {
 	t.Helper()
 	cfg := sqlitestore.Config{
 		DB:     openDB(t, path),
 		Now:    func() time.Time { return base },
 		Logger: slog.New(slog.DiscardHandler),
-	}
-	for _, opt := range opts {
-		opt(&cfg)
 	}
 	store, err := sqlitestore.Open(t.Context(), cfg)
 	if err != nil {
