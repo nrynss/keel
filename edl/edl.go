@@ -42,8 +42,9 @@ var ErrNoDestination = errors.New("edl: no destination")
 // accepts, which is -70 to -5 LUFS.
 var ErrInvalidTarget = errors.New("edl: invalid loudness target")
 
-// ErrNoMeasurement reports that the measure pass left no readable stats.
-// The tool ran but its output held nothing the package could parse.
+// ErrNoMeasurement reports that the measure pass left no usable stats.
+// The tool ran but its output held nothing the apply pass can use.
+// Silence measures as -inf, so that path reports this error too.
 var ErrNoMeasurement = errors.New("edl: loudness measurement missing")
 
 // Segment is one kept time range of the source. Start is inclusive and End

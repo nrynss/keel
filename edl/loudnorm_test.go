@@ -35,9 +35,9 @@ func TestParseLoudnormReadsMeasuredNumbers(t *testing.T) {
 	}
 }
 
-// TestParseLoudnormRejectsUnusableStats checks that unreadable, unparseable
-// or incomplete stats report ErrNoMeasurement, because the apply pass must
-// never run on guessed numbers.
+// TestParseLoudnormRejectsUnusableStats checks that unreadable, unparseable,
+// incomplete or non-finite stats report ErrNoMeasurement, because the apply
+// pass must never run on guessed numbers.
 func TestParseLoudnormRejectsUnusableStats(t *testing.T) {
 	tests := []struct {
 		name string
@@ -47,6 +47,8 @@ func TestParseLoudnormRejectsUnusableStats(t *testing.T) {
 		{"not json", "no stats here"},
 		{"wrong json", `{"input_i": 5}`},
 		{"missing number", `{"input_i" : "-21.75", "input_lra" : "0.00", "input_tp" : "-18.06"}`},
+		{"silence", `{"input_i" : "-inf", "input_tp" : "-inf", "input_lra" : "0.00", "input_thresh" : "-70.00"}`},
+		{"infinite peak", `{"input_i" : "-21.75", "input_tp" : "inf", "input_lra" : "0.00", "input_thresh" : "-31.75"}`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 
 	"github.com/nrynss/keel/ffmpeg"
 )
@@ -46,8 +48,10 @@ func measureLoudness(ctx context.Context, tools ffmpeg.Tools, src, cut string) (
 }
 
 // parseLoudnorm reads the measured numbers out of the stats file the tool
-// wrote. Anything unreadable, unparseable or incomplete reports
-// ErrNoMeasurement, because a guess would defeat the two-pass design.
+// wrote. Anything unreadable, unparseable, incomplete or not a finite
+// number reports ErrNoMeasurement, because a guess would defeat the
+// two-pass design. Silence measures as -inf, which the apply pass cannot
+// hand back, so that path reports ErrNoMeasurement too.
 func parseLoudnorm(raw []byte) (loudnormMeasurement, error) {
 	var m loudnormMeasurement
 	if err := json.Unmarshal(raw, &m); err != nil {
@@ -56,7 +60,16 @@ func parseLoudnorm(raw []byte) (loudnormMeasurement, error) {
 	if m.InputI == "" || m.InputLRA == "" || m.InputTP == "" || m.InputThresh == "" {
 		return loudnormMeasurement{}, fmt.Errorf("%w: a measured number is absent", ErrNoMeasurement)
 	}
+	if !finite(m.InputI) || !finite(m.InputLRA) || !finite(m.InputTP) || !finite(m.InputThresh) {
+		return loudnormMeasurement{}, fmt.Errorf("%w: a measured number is not finite", ErrNoMeasurement)
+	}
 	return m, nil
+}
+
+// finite reports whether s parses as a finite number.
+func finite(s string) bool {
+	v, err := strconv.ParseFloat(s, 64)
+	return err == nil && !math.IsInf(v, 0) && !math.IsNaN(v)
 }
 
 // applyLoudness runs the cut a second time with the measured numbers and

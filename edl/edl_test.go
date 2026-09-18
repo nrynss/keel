@@ -163,9 +163,9 @@ func measureFile(t *testing.T, path string) map[string]string {
 
 // TestRenderLoudnessMatchesTarget renders a cut at a -16 LUFS target and
 // measures the rendered file with an independent loudnorm run. The measured
-// values carry two decimals and the tool reports its own residual target
-// offset of 0.05 LU on these fixtures, so the pin allows 0.5 LU, ten times
-// that residual. A normalisation that misses by more fails.
+// values carry two decimals. The tool reports its own residual target offset
+// of 0.05 LU on these fixtures, so the pin allows 0.5 LU, ten times that
+// residual. A normalisation that misses by more fails.
 func TestRenderLoudnessMatchesTarget(t *testing.T) {
 	requireFFmpeg(t)
 	out := filepath.Join(t.TempDir(), "cut.wav")

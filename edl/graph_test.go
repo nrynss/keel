@@ -93,7 +93,7 @@ func TestJoinFadesBoundedByShorterNeighbour(t *testing.T) {
 	}
 }
 
-// TestCutGraphShapes pins the built filter graphs: a lone range trims
+// TestCutGraphShapes pins the built filter graphs. A lone range trims
 // straight, a faded join chains through acrossfade, and a join without a
 // fade is a concat cut, so the graph never receives a zero length range.
 func TestCutGraphShapes(t *testing.T) {
