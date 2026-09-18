@@ -781,3 +781,283 @@ func TestStrandedClosingLeaseExpiresPastItsCap(t *testing.T) {
 		t.Fatalf("first manager spent = %d, want 100, the open estimate only", got)
 	}
 }
+
+// latchMeter holds an armed close inside the paid call seam until the test
+// releases it, so a sweep can run past the cap mid close.
+type latchMeter struct {
+	inner   *cost.Meter
+	entered chan struct{}
+	release chan struct{}
+	armed   bool
+	mu      sync.Mutex
+}
+
+// Call runs the paid call, parking armed closes inside the seam.
+func (l *latchMeter) Call(ctx context.Context, estimate cost.Price, kind, ref string, work cost.Work) (cost.Usage, error) {
+	l.mu.Lock()
+	armed := l.armed
+	l.mu.Unlock()
+	if !armed {
+		return l.inner.Call(ctx, estimate, kind, ref, work)
+	}
+	l.entered <- struct{}{}
+	<-l.release
+	return l.inner.Call(ctx, estimate, kind, ref, work)
+}
+
+// blockExpire parks the sweep inside its expire write until the test opens
+// the gate, so the late close lands its final write first.
+type blockExpire struct {
+	lease.Store
+	gate    chan struct{}
+	entered chan struct{}
+	once    sync.Once
+}
+
+// ExpireIfOpenOrClosing parks the first expiry write on the gate.
+func (b *blockExpire) ExpireIfOpenOrClosing(ctx context.Context, l lease.Lease) (bool, error) {
+	b.once.Do(func() { close(b.entered) })
+	<-b.gate
+	return b.Store.ExpireIfOpenOrClosing(ctx, l)
+}
+
+// TestSweepLosesToAFinishedClose pins the close-first order. The close holds
+// the seam past the cap, the sweep parks inside its expire write, the close
+// finishes first, and the released sweep leaves the closed row alone. The
+// store agrees with the success the close reported, spend stays exactly
+// once, and the closed lease still reconciles.
+func TestSweepLosesToAFinishedClose(t *testing.T) {
+	path := t.TempDir() + "/lease.db"
+	clock := &testClock{at: base}
+	ctx := t.Context()
+	db := openDB(t, path)
+	store, err := leasesql.Open(ctx, leasesql.Config{
+		DB:     db,
+		Logger: slog.New(slog.DiscardHandler),
+	})
+	if err != nil {
+		t.Fatalf("open lease store: %v", err)
+	}
+	meter := newFakeMeter(t, 100000)
+	latched := &latchMeter{inner: meter.meter, entered: make(chan struct{}, 1), release: make(chan struct{})}
+	quota, err := lease.NewQuota(1)
+	if err != nil {
+		t.Fatalf("new quota: %v", err)
+	}
+	closer, err := lease.New(lease.Config{
+		Quota: quota,
+		Meter: latched,
+		Store: store,
+		Cap:   time.Hour,
+		Kind:  "session",
+		Now:   clock.now,
+		Log:   slog.New(slog.DiscardHandler),
+	})
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	got := openLease(t, closer, 100)
+	latched.mu.Lock()
+	latched.armed = true
+	latched.mu.Unlock()
+	closeDone := make(chan error, 1)
+	go func() {
+		_, err := closer.Close(context.Background(), got.ID, 110)
+		closeDone <- err
+	}()
+	select {
+	case <-latched.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("close did not reach the seam")
+	}
+	clock.advance(61 * time.Minute)
+	wrap := &blockExpire{Store: store, gate: make(chan struct{}), entered: make(chan struct{})}
+	sweepQuota, err := lease.NewQuota(1)
+	if err != nil {
+		t.Fatalf("new sweep quota: %v", err)
+	}
+	sweepMeter := newFakeMeter(t, 100000)
+	sweeper, err := lease.New(lease.Config{
+		Quota: sweepQuota,
+		Meter: sweepMeter,
+		Store: wrap,
+		Cap:   time.Hour,
+		Kind:  "session",
+		Now:   clock.now,
+		Log:   slog.New(slog.DiscardHandler),
+	})
+	if err != nil {
+		t.Fatalf("new sweep manager: %v", err)
+	}
+	sweepDone := make(chan error, 1)
+	go func() {
+		_, err := sweeper.Reclaim(context.Background(), nil)
+		sweepDone <- err
+	}()
+	select {
+	case <-wrap.entered:
+	case <-time.After(10 * time.Second):
+		close(latched.release)
+		close(wrap.gate)
+		t.Fatalf("sweep did not reach its expire write")
+	}
+	close(latched.release)
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			close(wrap.gate)
+			t.Fatalf("close: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		close(wrap.gate)
+		t.Fatalf("close did not finish")
+	}
+	close(wrap.gate)
+	select {
+	case err := <-sweepDone:
+		if err != nil {
+			t.Fatalf("sweep: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatalf("sweep did not finish")
+	}
+	stored, err := store.Get(ctx, got.ID)
+	if err != nil {
+		t.Fatalf("read stored lease: %v", err)
+	}
+	if stored.State != lease.StateClosed {
+		t.Fatalf("stored state = %q, want closed", stored.State)
+	}
+	if stored.Settled != 110 || stored.Reported != 110 {
+		t.Fatalf("stored settled = %d at %d, want 110 at 110", stored.Settled, stored.Reported)
+	}
+	if got := meter.meterSpent(); got != 210 {
+		t.Fatalf("spent = %d, want 210", got)
+	}
+	if got := sweepMeter.meterSpent(); got != 0 {
+		t.Fatalf("sweep spent = %d, want 0", got)
+	}
+	after, err := closer.Reconcile(ctx, got.ID, 150)
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if after.Settled != 150 || after.Reported != 110 {
+		t.Fatalf("reconciled settled = %d at %d, want 150 at 110", after.Settled, after.Reported)
+	}
+}
+
+// TestCloseLosesToAFinishedSweep pins the sweep-first order. The sweep
+// expires the closing row first, the late close then reports ErrInvalid
+// without touching the row, and the store agrees with the expiry the sweep
+// reported. Spend stays exactly once, and the slot frees exactly once.
+func TestCloseLosesToAFinishedSweep(t *testing.T) {
+	path := t.TempDir() + "/lease.db"
+	clock := &testClock{at: base}
+	ctx := t.Context()
+	db := openDB(t, path)
+	store, err := leasesql.Open(ctx, leasesql.Config{
+		DB:     db,
+		Logger: slog.New(slog.DiscardHandler),
+	})
+	if err != nil {
+		t.Fatalf("open lease store: %v", err)
+	}
+	meter := newFakeMeter(t, 100000)
+	latched := &latchMeter{inner: meter.meter, entered: make(chan struct{}, 1), release: make(chan struct{})}
+	quota, err := lease.NewQuota(1)
+	if err != nil {
+		t.Fatalf("new quota: %v", err)
+	}
+	closer, err := lease.New(lease.Config{
+		Quota: quota,
+		Meter: latched,
+		Store: store,
+		Cap:   time.Hour,
+		Kind:  "session",
+		Now:   clock.now,
+		Log:   slog.New(slog.DiscardHandler),
+	})
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	got := openLease(t, closer, 100)
+	latched.mu.Lock()
+	latched.armed = true
+	latched.mu.Unlock()
+	closeDone := make(chan error, 1)
+	go func() {
+		_, err := closer.Close(context.Background(), got.ID, 110)
+		closeDone <- err
+	}()
+	select {
+	case <-latched.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("close did not reach the seam")
+	}
+	clock.advance(61 * time.Minute)
+	sweepQuota, err := lease.NewQuota(1)
+	if err != nil {
+		t.Fatalf("new sweep quota: %v", err)
+	}
+	sweepMeter := newFakeMeter(t, 100000)
+	sweeper, err := lease.New(lease.Config{
+		Quota: sweepQuota,
+		Meter: sweepMeter,
+		Store: store,
+		Cap:   time.Hour,
+		Kind:  "session",
+		Now:   clock.now,
+		Log:   slog.New(slog.DiscardHandler),
+	})
+	if err != nil {
+		t.Fatalf("new sweep manager: %v", err)
+	}
+	freed, err := sweeper.Reclaim(context.Background(), nil)
+	if err != nil {
+		close(latched.release)
+		t.Fatalf("sweep: %v", err)
+	}
+	if freed != 1 {
+		close(latched.release)
+		t.Fatalf("sweep freed = %d, want 1", freed)
+	}
+	mid, err := store.Get(ctx, got.ID)
+	if err != nil {
+		close(latched.release)
+		t.Fatalf("read swept row: %v", err)
+	}
+	if mid.State != lease.StateExpired {
+		close(latched.release)
+		t.Fatalf("swept state = %q, want expired", mid.State)
+	}
+	close(latched.release)
+	var closeErr error
+	select {
+	case closeErr = <-closeDone:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("close did not finish")
+	}
+	if !errors.Is(closeErr, lease.ErrInvalid) {
+		t.Fatalf("late close error = %v, want ErrInvalid", closeErr)
+	}
+	final, err := store.Get(ctx, got.ID)
+	if err != nil {
+		t.Fatalf("read final row: %v", err)
+	}
+	if final.State != lease.StateExpired {
+		t.Fatalf("final state = %q, want expired", final.State)
+	}
+	if got := meter.meterSpent(); got != 210 {
+		t.Fatalf("spent = %d, want 210", got)
+	}
+	if got := sweepMeter.meterSpent(); got != 0 {
+		t.Fatalf("sweep spent = %d, want 0", got)
+	}
+	read, err := sweeper.Inspect(ctx, got.ID)
+	if err != nil {
+		t.Fatalf("inspect: %v", err)
+	}
+	if read.State != lease.StateExpired {
+		t.Fatalf("inspect state = %q, want expired", read.State)
+	}
+}

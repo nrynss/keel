@@ -287,3 +287,99 @@ func TestExpiredOpenListsPastCapClosingRows(t *testing.T) {
 		t.Fatalf("expired open = %v, want [stranded]", got)
 	}
 }
+
+// TestCloseIfClosingFinishesOnlyAClosingRow pins that the late close finish
+// writes a closing row and refuses a row the sweep already moved. The loser
+// leaves the winner untouched and reports false with no error.
+func TestCloseIfClosingFinishesOnlyAClosingRow(t *testing.T) {
+	store := openStore(t, filepath.Join(t.TempDir(), "lease.db"))
+	ctx := t.Context()
+	row := sampleLease("row-1")
+	row.State = lease.StateClosing
+	if err := store.Create(ctx, row); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	want := row
+	want.State = lease.StateClosed
+	want.ClosedAt = base.Add(10 * time.Minute)
+	want.Settled = 110
+	want.Reported = 110
+	ok, err := store.CloseIfClosing(ctx, want)
+	if err != nil {
+		t.Fatalf("close closing row: %v", err)
+	}
+	if !ok {
+		t.Fatalf("close closing row = false, want true")
+	}
+	swept := want
+	swept.State = lease.StateExpired
+	ok, err = store.ExpireIfOpenOrClosing(ctx, swept)
+	if err != nil {
+		t.Fatalf("expire closed row: %v", err)
+	}
+	if ok {
+		t.Fatalf("expire closed row = true, want false")
+	}
+	got, err := store.Get(ctx, "row-1")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got != want {
+		t.Fatalf("lease = %+v, want %+v", got, want)
+	}
+	late := got
+	late.Settled = 120
+	late.Reported = 120
+	ok, err = store.CloseIfClosing(ctx, late)
+	if err != nil {
+		t.Fatalf("close closed row: %v", err)
+	}
+	if ok {
+		t.Fatalf("close closed row = true, want false")
+	}
+	if _, err := store.CloseIfClosing(ctx, sampleLease("missing")); !errors.Is(err, lease.ErrUnknownLease) {
+		t.Fatalf("close missing error = %v, want ErrUnknownLease", err)
+	}
+}
+
+// TestExpireIfOpenOrClosingKeepsAClosedRow pins that the sweep write expires
+// an open or closing row and refuses a row a close already finished. The
+// loser leaves the winner untouched and reports false with no error.
+func TestExpireIfOpenOrClosingKeepsAClosedRow(t *testing.T) {
+	store := openStore(t, filepath.Join(t.TempDir(), "lease.db"))
+	ctx := t.Context()
+	row := sampleLease("row-1")
+	if err := store.Create(ctx, row); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	want := row
+	want.State = lease.StateExpired
+	ok, err := store.ExpireIfOpenOrClosing(ctx, want)
+	if err != nil {
+		t.Fatalf("expire open row: %v", err)
+	}
+	if !ok {
+		t.Fatalf("expire open row = false, want true")
+	}
+	late := want
+	late.State = lease.StateClosed
+	late.Settled = 110
+	late.Reported = 110
+	ok, err = store.CloseIfClosing(ctx, late)
+	if err != nil {
+		t.Fatalf("close expired row: %v", err)
+	}
+	if ok {
+		t.Fatalf("close expired row = true, want false")
+	}
+	got, err := store.Get(ctx, "row-1")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got != want {
+		t.Fatalf("lease = %+v, want %+v", got, want)
+	}
+	if _, err := store.ExpireIfOpenOrClosing(ctx, sampleLease("missing")); !errors.Is(err, lease.ErrUnknownLease) {
+		t.Fatalf("expire missing error = %v, want ErrUnknownLease", err)
+	}
+}

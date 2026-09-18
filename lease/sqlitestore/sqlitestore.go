@@ -189,6 +189,76 @@ func (s *Store) CloseIfOpen(ctx context.Context, l lease.Lease) (bool, error) {
 	return true, nil
 }
 
+// CloseIfClosing writes back lease only when the stored row still reads
+// closing. It reports true when it wrote. It reports false with no error
+// when the row already moved to closed or expired, and the stored row stays
+// as the winner left it. An unknown id reports an error matching
+// lease.ErrUnknownLease. The compare and the write share one statement, so
+// a late finish never overwrites a sweep that already expired the row.
+func (s *Store) CloseIfClosing(ctx context.Context, l lease.Lease) (bool, error) {
+	if l.ID == "" {
+		return false, fmt.Errorf("sqlitestore: close: %w: id must not be empty", lease.ErrInvalid)
+	}
+	result, err := s.db.Writer().ExecContext(ctx,
+		`UPDATE lease_entry SET state = ?, opened_at = ?, expires_at = ?,
+			closed_at = ?, estimate_nd = ?, settled_nd = ?,
+			reported_nd = ?, reconciled = ?, kind = ?, owner = ?
+		WHERE id = ? AND state = ?`,
+		string(l.State), l.OpenedAt.UnixNano(), l.ExpiresAt.UnixNano(),
+		unixOrZero(l.ClosedAt), int64(l.Estimate), int64(l.Settled),
+		int64(l.Reported), boolToInt(l.Reconciled), l.Kind, l.Owner, l.ID, string(lease.StateClosing))
+	if err != nil {
+		return false, fmt.Errorf("sqlitestore: close lease %s: %w", l.ID, err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("sqlitestore: close lease %s: %w", l.ID, err)
+	}
+	if affected == 0 {
+		_, err := s.Get(ctx, l.ID)
+		if err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+	return true, nil
+}
+
+// ExpireIfOpenOrClosing writes back lease only when the stored row still
+// reads open or closing. It reports true when it wrote. It reports false
+// with no error when the row already moved to closed or expired, and the
+// stored row stays as the winner left it. An unknown id reports an error
+// matching lease.ErrUnknownLease. The compare and the write share one
+// statement, so a late sweep never overwrites a close that already finished.
+func (s *Store) ExpireIfOpenOrClosing(ctx context.Context, l lease.Lease) (bool, error) {
+	if l.ID == "" {
+		return false, fmt.Errorf("sqlitestore: expire: %w: id must not be empty", lease.ErrInvalid)
+	}
+	result, err := s.db.Writer().ExecContext(ctx,
+		`UPDATE lease_entry SET state = ?, opened_at = ?, expires_at = ?,
+			closed_at = ?, estimate_nd = ?, settled_nd = ?,
+			reported_nd = ?, reconciled = ?, kind = ?, owner = ?
+		WHERE id = ? AND state IN (?, ?)`,
+		string(l.State), l.OpenedAt.UnixNano(), l.ExpiresAt.UnixNano(),
+		unixOrZero(l.ClosedAt), int64(l.Estimate), int64(l.Settled),
+		int64(l.Reported), boolToInt(l.Reconciled), l.Kind, l.Owner, l.ID, string(lease.StateOpen), string(lease.StateClosing))
+	if err != nil {
+		return false, fmt.Errorf("sqlitestore: expire lease %s: %w", l.ID, err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("sqlitestore: expire lease %s: %w", l.ID, err)
+	}
+	if affected == 0 {
+		_, err := s.Get(ctx, l.ID)
+		if err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+	return true, nil
+}
+
 // ExpiredOpen lists every row that still reads open or closing with a
 // deadline at or before now, oldest deadline first. Closing rows land here
 // because a closer may die between the claim write and the final write, and

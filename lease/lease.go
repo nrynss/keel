@@ -168,6 +168,19 @@ type Store interface {
 	// ErrUnknownLease. Stores must compare while they write, so a loser
 	// that read open earlier still loses.
 	CloseIfOpen(ctx context.Context, lease Lease) (bool, error)
+	// CloseIfClosing writes back lease only when the stored row still
+	// reads closing. It reports true when it wrote, or false with no error
+	// when the row already moved to closed or expired. An unknown id
+	// reports an error matching ErrUnknownLease. Stores must compare while
+	// they write, so a late finish never overwrites a row the sweep moved.
+	CloseIfClosing(ctx context.Context, lease Lease) (bool, error)
+	// ExpireIfOpenOrClosing writes back lease only when the stored row
+	// still reads open or closing. It reports true when it wrote, or false
+	// with no error when the row already moved to closed or expired. An
+	// unknown id reports an error matching ErrUnknownLease. Stores must
+	// compare while they write, so a late sweep never overwrites a close
+	// that already finished.
+	ExpireIfOpenOrClosing(ctx context.Context, lease Lease) (bool, error)
 	// ExpiredOpen lists every row that still reads open or closing with a
 	// deadline at or before now, so a call that names no id still finds
 	// abandoned rows and rows a dead closer stranded. The order is row
@@ -330,8 +343,10 @@ func (m *Manager) Open(ctx context.Context, owner string, estimate cost.Price, k
 // already have run. One session books its close price at most once. The
 // claim writes closing only when the row still reads open, so the second
 // closer of one lease loses the claim and reports ErrInvalid without
-// settling. The claim covers every process, because the store compares
-// while it writes.
+// settling. The final write lands only while the row still reads closing,
+// so a sweep that expired the row first makes the late close report
+// ErrInvalid without touching the stored row. The claim covers every
+// process, because the store compares while it writes.
 func (m *Manager) Close(ctx context.Context, id string, price cost.Price) (Lease, error) {
 	if price < 0 {
 		return Lease{}, fmt.Errorf("lease: close price %d: %w", price, ErrNegativePrice)
@@ -367,8 +382,19 @@ func (m *Manager) Close(ctx context.Context, id string, price cost.Price) (Lease
 	closed.ClosedAt = m.now()
 	closed.Settled = price
 	closed.Reported = price
-	if err := m.store.Update(ctx, closed); err != nil {
+	finished, err := m.store.CloseIfClosing(ctx, closed)
+	if err != nil {
 		return Lease{}, fmt.Errorf("lease: close: %w", err)
+	}
+	if !finished {
+		stored, getErr := m.store.Get(ctx, id)
+		if getErr != nil {
+			return Lease{}, fmt.Errorf("lease: close: %w", getErr)
+		}
+		if stored.State == StateExpired {
+			m.quota.free(id)
+		}
+		return Lease{}, fmt.Errorf("lease: close %s in state %s: %w", id, stored.State, ErrInvalid)
 	}
 	m.quota.free(id)
 	return closed, nil
@@ -497,7 +523,9 @@ func (m *Manager) Active() int {
 // its course. A closing row stranded by a dead closer expires past its cap
 // like an open one, because the settle may never have run. The stranded
 // spend stays exactly what the seam settled, and a retry never settles
-// again, so one session books its close price at most once.
+// again, so one session books its close price at most once. The write only
+// lands while the stored row still reads open or closing, so a sweep that
+// loses to a finished close leaves the closed row alone.
 func (m *Manager) settleExpiry(ctx context.Context, lease *Lease) bool {
 	if m.now().Before(lease.ExpiresAt) {
 		return false
@@ -506,17 +534,34 @@ func (m *Manager) settleExpiry(ctx context.Context, lease *Lease) bool {
 		return false
 	}
 	m.expire(ctx, lease)
-	return true
+	return lease.State == StateExpired
 }
 
-// expire moves lease to expired in the store and frees its quota slot. A
-// failed write still frees the slot, because the stored deadline judges
-// expiry again on the next touch.
+// expire moves lease to expired in the store and frees its quota slot. The
+// write only lands while the stored row still reads open or closing, so a
+// sweep that loses to a finished close keeps the closed row and reports no
+// expiry. A failed write still frees the slot, because the stored deadline
+// judges expiry again on the next touch.
 func (m *Manager) expire(ctx context.Context, lease *Lease) {
-	lease.State = StateExpired
-	if err := m.store.Update(ctx, *lease); err != nil {
+	want := *lease
+	want.State = StateExpired
+	moved, err := m.store.ExpireIfOpenOrClosing(ctx, want)
+	if err != nil {
 		m.log.ErrorContext(ctx, "lease: expire", "id", lease.ID, "error", err)
 	}
+	if !moved {
+		stored, getErr := m.store.Get(ctx, lease.ID)
+		if getErr == nil {
+			*lease = stored
+		}
+		if getErr != nil || stored.State != StateExpired {
+			return
+		}
+		m.quota.free(lease.ID)
+		m.log.InfoContext(ctx, "lease: expired", "id", lease.ID)
+		return
+	}
+	*lease = want
 	m.quota.free(lease.ID)
 	m.log.InfoContext(ctx, "lease: expired", "id", lease.ID)
 }
