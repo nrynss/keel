@@ -15,7 +15,7 @@ nothing logs on its own, and nothing panics.
 ## Install
 
 ```bash
-go get github.com/nrynss/keel@v0.3.0
+go get github.com/nrynss/keel@v0.3.1
 ```
 
 Go 1.27 or newer. The `ffmpeg` package runs the `ffmpeg` and `ffprobe` binaries, so install those
@@ -465,10 +465,11 @@ go test -run Example -v ./...
 
 ## Versioning
 
-Keel is on v0. The exported API is frozen in `api/v0.3.0.txt` with its `api/v0.3.0.export`
+Keel is on v0. The exported API is frozen in `api/v0.3.1.txt` with its `api/v0.3.1.export`
 baseline, and a check in CI fails on any change to them. The records are frozen for
 `linux/amd64`. They cover the surface the release shipped, including `flag`, `caption`,
-`erase`, `edl`, `waveform`, `lease`, and the `cost` keyed budgets with the paid call seam.
+`erase`, `edl`, `waveform`, and `lease`. The `cost` keyed budgets ship with the paid
+call seam and the budget windows that restart a ceiling.
 Once v1 lands, a breaking change will need a major version.
 
 ## Development

@@ -48,8 +48,8 @@ apidiff_version="v0.0.0-20260908205506-85c1c2202aba"
 # transcript and a human reads no export data, so the formats stay separate on
 # purpose. A compatible addition updates the transcript. An incompatible
 # change fails against the release export.
-api_doc="api/v0.3.0.txt"
-api_export="api/v0.3.0.export"
+api_doc="api/v0.3.1.txt"
+api_export="api/v0.3.1.export"
 
 # Both records are taken from one frozen build context, linux/amd64, which is
 # also the context CI runs on. The transcript is generated under it, so the same
@@ -270,25 +270,30 @@ header "11/11 api"
 # index, so the guard reads the change rows from both views, merges them,
 # and judges every row once, naming the record it refuses.
 #
-# One move is sanctioned, the release move. A release births a new pair, the
-# new transcript and its export record, so it adds both records of the pair
-# and repoints the variables in this script. A commit carries
-# the index, but a plain diff judges the working tree. The guard therefore
-# reads the change rows from both views, drops duplicate rows, and judges
-# every merged row once. A row passes only against the pair variables or the
-# transcript path that HEAD gated, which it reads from HEAD, so no record
-# name is hardcoded. The regeneration runs before the rows, so the deletion
-# sanction compares the staged successor against fresh bytes. The release
-# move stages the successor of the old transcript path. The guard compares
-# that staged copy, the bytes the commit carries, against the regeneration
-# and accepts the deletion only on a byte-identical match, so a stale or
-# dishonest successor fails. After the rows the guard asks the
-# index for the old path and refuses it by name. A cached row on the
-# transcript or the export also arms an index-side content judge over the
-# staged bytes. The worktree view arms nothing, because the commit carries
-# index bytes alone. That judge regenerates the transcript or runs apidiff
-# on the index copy and refuses a mismatch by name. The guard names the
-# first record it refuses and exits there, fail-fast by design.
+# Two moves are sanctioned, the rename and the pair-add. A rename births a
+# new pair, the new transcript and its export record, so it adds both
+# records of the pair, deletes the old transcript path, and repoints the
+# variables in this script. A pair-add does the same without the deletion,
+# so a patch release keeps its predecessor as a frozen record. A commit
+# carries the index, but a plain diff judges the working tree. The guard
+# therefore reads the change rows from both views, drops duplicate rows,
+# and judges every merged row once. A row passes only against the pair
+# variables or the transcript path that HEAD gated, which it reads from
+# HEAD, so no record name is hardcoded. The regeneration runs before the
+# rows, so the deletion sanction compares the staged successor against
+# fresh bytes. The rename move stages the successor of the old transcript
+# path. The guard compares that staged copy, the bytes the commit carries,
+# against the regeneration and accepts the deletion only on a byte-identical
+# match, so a stale or dishonest successor fails. After the rows the guard
+# asks the index for the old path and refuses it by name, unless the old
+# path carries no change in either view, which is the pair-add keeping its
+# predecessor frozen. Every changed byte still passes through the row
+# judging above, so an untouched predecessor smuggles nothing in. A cached
+# row on the transcript or the export also arms an index-side content judge
+# over the staged bytes. The worktree view arms nothing, because the commit
+# carries index bytes alone. That judge regenerates the transcript or runs
+# apidiff on the index copy and refuses a mismatch by name. The guard names
+# the first record it refuses and exits there, fail-fast by design.
 doc_at_head=$(git show HEAD:tools/check.sh | sed -n 's/^api_doc="\(.*\)"$/\1/p')
 doc_row=
 export_row=
@@ -307,27 +312,37 @@ stale_index() {
     [ -n "$doc_at_head" ] && [ "$doc_at_head" != "$api_doc" ] \
         && [ -n "$(git ls-files -- "$doc_at_head")" ]
 }
+# stale_untouched reports that the previous transcript path carries no change
+# in either view. A pair-add release keeps that path as a frozen record, so
+# an untouched predecessor is not a leftover. Every changed byte still went
+# through the row judging, so the exemption smuggles nothing in.
+stale_untouched() {
+    [ -z "$(git diff --name-status --no-renames HEAD -- "${doc_at_head}")" ] \
+        && [ -z "$(git diff --cached --name-status --no-renames HEAD -- "${doc_at_head}")" ]
+}
 if [ -n "$rows" ] || stale_index; then
-    while IFS=$'\t' read -r status path; do
-        if [ "$status" = "M" ]; then
-            [ "$path" = "$api_doc" ] && continue
-            fail "11/11 api" "a released record under api/ changed: ${path}, only ${api_doc} may move"
-        elif [ "$status" = "A" ]; then
-            [ "$path" = "$api_doc" ] || [ "$path" = "$api_export" ] || \
-                fail "11/11 api" "a new record under api/ was added: ${path}, only the release pair ${api_doc} and ${api_export} may appear"
-        elif [ "$status" = "D" ]; then
-            if [ "$path" = "$doc_at_head" ] && [ -n "$doc_at_head" ] \
-                    && [ "$doc_at_head" != "$api_doc" ] \
-                    && git show ":${api_doc}" > "$api_tmp/successor.txt" 2>/dev/null \
-                    && cmp -s "$api_tmp/successor.txt" "$api_tmp/regen.txt"; then
-                continue
+    if [ -n "$rows" ]; then
+        while IFS=$'\t' read -r status path; do
+            if [ "$status" = "M" ]; then
+                [ "$path" = "$api_doc" ] && continue
+                fail "11/11 api" "a released record under api/ changed: ${path}, only ${api_doc} may move"
+            elif [ "$status" = "A" ]; then
+                [ "$path" = "$api_doc" ] || [ "$path" = "$api_export" ] || \
+                    fail "11/11 api" "a new record under api/ was added: ${path}, only the release pair ${api_doc} and ${api_export} may appear"
+            elif [ "$status" = "D" ]; then
+                if [ "$path" = "$doc_at_head" ] && [ -n "$doc_at_head" ] \
+                        && [ "$doc_at_head" != "$api_doc" ] \
+                        && git show ":${api_doc}" > "$api_tmp/successor.txt" 2>/dev/null \
+                        && cmp -s "$api_tmp/successor.txt" "$api_tmp/regen.txt"; then
+                    continue
+                fi
+                fail "11/11 api" "a released record under api/ was deleted: ${path}, only the move to ${api_doc} is sanctioned"
+            else
+                fail "11/11 api" "a record under api/ changed: ${path}, status ${status} is not sanctioned"
             fi
-            fail "11/11 api" "a released record under api/ was deleted: ${path}, only the move to ${api_doc} is sanctioned"
-        else
-            fail "11/11 api" "a record under api/ changed: ${path}, status ${status} is not sanctioned"
-        fi
-    done <<<"$rows"
-    if stale_index; then
+        done <<<"$rows"
+    fi
+    if stale_index && ! stale_untouched; then
         fail "11/11 api" "the stale record ${doc_at_head} is still staged, a release leaves no record at the old transcript path"
     fi
 fi
