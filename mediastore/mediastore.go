@@ -469,6 +469,14 @@ func (s *Store) find(ctx context.Context, blobID string) (Blob, error) {
 	return b, nil
 }
 
+// serveNotFound answers 404 with the private cache header, so a refusal
+// and an unknown id stay identical down to the headers and no cache
+// keeps either answer.
+func serveNotFound(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "private, no-store")
+	http.NotFound(w, r)
+}
+
 // ServeHTTP serves one stored blob at GET or HEAD /media/{id}.
 // http.ServeContent does the protocol work, so a Range request returns
 // 206, a matching ETag returns 304, and HEAD sends no body.
@@ -476,8 +484,9 @@ func (s *Store) find(ctx context.Context, blobID string) (Blob, error) {
 // An unknown, malformed or file-less id is 404. A blob that exists but
 // cannot be opened is 500 and one log line. A private blob is served
 // only when Config.Authorize allows the request, and a refusal answers
-// the same 404 as an unknown id, so the response never confirms that a
-// private blob exists.
+// the same 404 as an unknown id, with the same private cache header,
+// so the response never confirms that a private blob exists and no
+// cache keeps the refusal.
 func (s *Store) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		w.Header().Set("Allow", "GET, HEAD")
@@ -487,7 +496,7 @@ func (s *Store) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	blobID := r.PathValue("id")
 	b, err := s.find(r.Context(), blobID)
 	if errors.Is(err, ErrNotFound) {
-		http.NotFound(w, r)
+		serveNotFound(w, r)
 		return
 	}
 	if err != nil {
@@ -498,7 +507,7 @@ func (s *Store) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if b.Visibility != Public && (s.authorize == nil || !s.authorize(r, b)) {
 		// A refusal is deliberately identical to an unknown id. The
 		// answer must not tell a caller whether the blob exists.
-		http.NotFound(w, r)
+		serveNotFound(w, r)
 		return
 	}
 	f, err := s.root.Open(blobID)
@@ -509,7 +518,7 @@ func (s *Store) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// 404 as an unknown id and the operator sees the classified
 			// error.
 			s.log.Error("mediastore: row without file", "id", blobID, "err", notFound(blobID, err).Error())
-			http.NotFound(w, r)
+			serveNotFound(w, r)
 			return
 		}
 		s.log.Error("mediastore: blob open failed", "id", blobID, "err", err.Error())

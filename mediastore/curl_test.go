@@ -163,4 +163,7 @@ func TestCurlPrivateBlobWithoutAuthorizerIsNotFound(t *testing.T) {
 	if !strings.Contains(headOutput, "404") {
 		t.Fatalf("private HEAD = %q, want a 404", headOutput)
 	}
+	if !strings.Contains(headOutput, privateCacheControl) {
+		t.Fatalf("private HEAD = %q, want %q", headOutput, privateCacheControl)
+	}
 }

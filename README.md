@@ -154,7 +154,8 @@ budget.Settle(cost.USD(4.50), actual)
 
 `cost.Price` counts nanodollars in an `int64`, so no rounding creeps in. `cost/sqlitestore` keeps
 the ledger and the reservations across a restart, and a reservation that expires releases itself.
-A `cost.KeyedBudget` divides one pool by owner under a global ceiling, so one owner cannot spend
+A store opened with `Period: cost.DailyUTC` restarts its ceiling every UTC day, and `MonthlyUTC`
+every month, so a limit bounds one window rather than all spend ever booked. A `cost.KeyedBudget` divides one pool by owner under a global ceiling, so one owner cannot spend
 another owner's headroom. Each owner reserves and settles through its own account from `Owner`.
 A `cost.Meter` runs one paid call against an account: it reserves the estimate, runs the work,
 settles the measured price, and frees the reservation on every failure path. A call that reports

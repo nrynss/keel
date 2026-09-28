@@ -31,6 +31,13 @@
 // names the unkeyed budget the store itself keeps, so the keyed budget
 // refuses it.
 //
+// A store opened with a period restarts its ceiling on a calendar window,
+// so a limit bounds one day or one month rather than all spend ever booked.
+// The spend a window reads comes from the settle history, which every
+// Settle extends, so a rollover needs no scheduler and no caller code.
+// Totals and charges keep all history either way. Spend booked before this
+// version stays in the lifetime total and outside every window.
+//
 // This package is one of the few allowed to import the SQLite driver. The
 // ledger arithmetic itself stays in the cost package, and every total is
 // summed through a cost.Ledger so the overflow rule never drifts.
@@ -83,6 +90,15 @@ type Config struct {
 	// ceiling and the stored spend stays.
 	Limit cost.Price
 
+	// Period restarts the ceiling on a calendar window. None keeps one
+	// lifetime ceiling, which is the zero value and the behaviour every
+	// store has today. DailyUTC bounds each UTC day and MonthlyUTC each
+	// UTC month. The same window applies to the global ceiling and to
+	// every owner ceiling. Reserve, Remaining and Spent read the spend
+	// booked since the current window began, while Total and Charges
+	// keep all history.
+	Period cost.Period
+
 	// ReservationTTL is how long a reservation holds budget before the
 	// store treats it as expired. Zero means ten minutes.
 	ReservationTTL time.Duration
@@ -103,6 +119,7 @@ type Store struct {
 	now            func() time.Time
 	log            *slog.Logger
 	reservationTTL time.Duration
+	period         cost.Period
 }
 
 // Reservation is one outstanding budget hold. Reserve returns it and the caller
@@ -132,6 +149,11 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 	if cfg.Limit < 0 {
 		return nil, fmt.Errorf("sqlitestore: open: limit %d: %w", cfg.Limit, cost.ErrNegativeLimit)
 	}
+	switch cfg.Period {
+	case cost.None, cost.DailyUTC, cost.MonthlyUTC:
+	default:
+		return nil, fmt.Errorf("sqlitestore: open: period %d: %w", cfg.Period, ErrInvalid)
+	}
 	namespace := cfg.Namespace
 	if namespace == "" {
 		namespace = schemaNamespace
@@ -155,7 +177,7 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 	if ttl <= 0 {
 		ttl = defaultReservationTTL
 	}
-	store := &Store{db: cfg.DB, now: now, log: logger, reservationTTL: ttl}
+	store := &Store{db: cfg.DB, now: now, log: logger, reservationTTL: ttl, period: cfg.Period}
 	if err := store.setLimit(ctx, cfg.Limit); err != nil {
 		return nil, fmt.Errorf("sqlitestore: open: %w", err)
 	}
@@ -274,29 +296,42 @@ func (s *Store) queryCharges(ctx context.Context, query string, args ...any) ([]
 	return out, nil
 }
 
-// Limit returns the ceiling the store was opened with.
+// Limit returns the ceiling the store was opened with. A store with a
+// period applies the same ceiling to each window in turn.
 func (s *Store) Limit(ctx context.Context) (cost.Price, error) {
-	state, err := loadState(ctx, s.db.Reader(), s.now())
+	state, err := s.loadGlobal(ctx, s.db.Reader(), s.now())
 	if err != nil {
 		return 0, err
 	}
 	return state.limit, nil
 }
 
-// Spent returns the sum of the prices Settle has booked.
+// Spent returns the sum of the prices Settle has booked. A store with no
+// period returns the lifetime booked spend. A store with a period returns
+// the spend booked since the current window began.
 func (s *Store) Spent(ctx context.Context) (cost.Price, error) {
-	state, err := loadState(ctx, s.db.Reader(), s.now())
+	state, err := s.loadGlobal(ctx, s.db.Reader(), s.now())
 	if err != nil {
 		return 0, err
 	}
 	return state.spent, nil
 }
 
+// SpentSince returns the spend booked on or after t, across every owner.
+// It reads the settle history, so it serves any instant the history
+// covers. A store with a period answers its current window through
+// Spent, and any other window through here.
+func (s *Store) SpentSince(ctx context.Context, t time.Time) (cost.Price, error) {
+	return sumSettles(ctx, s.db.Reader(), "", t.UnixMilli())
+}
+
 // Reserved returns the sum of the reservations that are still holding budget.
 // An expired reservation never counts, so a dead process stops holding budget
-// when its hold expires.
+// when its hold expires. A store with a period counts only holds taken
+// since the current window began, so a hold counts against the window its
+// caller took it in.
 func (s *Store) Reserved(ctx context.Context) (cost.Price, error) {
-	state, err := loadState(ctx, s.db.Reader(), s.now())
+	state, err := s.loadGlobal(ctx, s.db.Reader(), s.now())
 	if err != nil {
 		return 0, err
 	}
@@ -304,10 +339,12 @@ func (s *Store) Reserved(ctx context.Context) (cost.Price, error) {
 }
 
 // Remaining returns the headroom left for new reservations. It is the ceiling
-// minus booked spend minus unexpired holds. It reports an error matching
-// cost.ErrOverflow when that difference leaves the int64 range.
+// minus booked spend minus unexpired holds. A store with a period reads the
+// spend and the holds of the current window, so each window starts with a
+// full ceiling. It reports an error matching cost.ErrOverflow when that
+// difference leaves the int64 range.
 func (s *Store) Remaining(ctx context.Context) (cost.Price, error) {
-	state, err := loadState(ctx, s.db.Reader(), s.now())
+	state, err := s.loadGlobal(ctx, s.db.Reader(), s.now())
 	if err != nil {
 		return 0, err
 	}
@@ -317,7 +354,8 @@ func (s *Store) Remaining(ctx context.Context) (cost.Price, error) {
 // Reserve commits estimate against the durable budget and returns the hold. It
 // fails with an error matching cost.ErrOverBudget when the ceiling, the booked
 // spend and the unexpired holds leave less than estimate, and it commits
-// nothing then. The check and the insert share one transaction, so concurrent
+// nothing then. A store with a period checks the ceiling against the current
+// window alone. The check and the insert share one transaction, so concurrent
 // callers never overspend. The hold expires after the configured TTL, so a
 // caller that dies still returns its budget. A cancelled context stops the
 // reserve, so no hold is taken.
@@ -335,7 +373,7 @@ func (s *Store) Reserve(ctx context.Context, estimate cost.Price) (Reservation, 
 		`DELETE FROM cost_reservation WHERE expires_at <= ?`, now.UnixMilli()); err != nil {
 		return Reservation{}, fmt.Errorf("sqlitestore: reserve: purge expired: %w", err)
 	}
-	state, err := loadState(ctx, tx, now)
+	state, err := s.loadGlobal(ctx, tx, now)
 	if err != nil {
 		return Reservation{}, fmt.Errorf("sqlitestore: reserve: %w", err)
 	}
@@ -365,10 +403,13 @@ func (s *Store) Reserve(ctx context.Context, estimate cost.Price) (Reservation, 
 
 // Settle books the price a paid call actually cost and releases the hold. It
 // books actual even when the hold already expired, because the call happened
-// and the charge is a fact. It reports an error matching cost.ErrOverflow and
-// commits nothing when actual would push the booked spend past the int64 range.
-// A cancelled context stops the settle, so nothing is booked.
+// and the charge is a fact. The booking extends the settle history, so a
+// store with a period counts it in the current window. It reports an error
+// matching cost.ErrOverflow and commits nothing when actual would push the
+// booked spend past the int64 range. A cancelled context stops the settle,
+// so nothing is booked.
 func (s *Store) Settle(ctx context.Context, r Reservation, actual cost.Price) error {
+	now := s.now()
 	tx, err := s.db.Writer().BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("sqlitestore: settle: %w", err)
@@ -385,6 +426,11 @@ func (s *Store) Settle(ctx context.Context, r Reservation, actual cost.Price) er
 	}
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE cost_budget SET spent_nd = ? WHERE id = 1`, int64(next)); err != nil {
+		return fmt.Errorf("sqlitestore: settle: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO cost_settle (owner, amount_nd, created_at) VALUES (?, ?, ?)`,
+		"", int64(actual), now.UnixMilli()); err != nil {
 		return fmt.Errorf("sqlitestore: settle: %w", err)
 	}
 	if r.ID != "" {
@@ -414,9 +460,11 @@ func (s *Store) Release(ctx context.Context, r Reservation) error {
 }
 
 // querier is the statement subset shared by the write pool and a transaction,
-// so one budget read serves a plain read and a reserve alike.
+// so one budget read serves a plain read and a reserve alike. Both the pool
+// handle and a transaction satisfy it.
 type querier interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 }
 
 // budgetState is the three numbers the budget arithmetic needs, read in one
@@ -427,26 +475,83 @@ type budgetState struct {
 	reserved cost.Price
 }
 
-// loadState reads the ceiling, the booked spend and the unexpired holds. It
-// counts only reservations whose expiry is still in the future, so an expired
-// hold never keeps budget.
-func loadState(ctx context.Context, q querier, now time.Time) (budgetState, error) {
+// windowSince returns the created_at lower bound in millis for windowed
+// budget reads. It returns zero when the store keeps a lifetime budget,
+// so the bound matches every row.
+func (s *Store) windowSince(now time.Time) int64 {
+	if s.period == cost.None {
+		return 0
+	}
+	return s.period.Start(now).UnixMilli()
+}
+
+// loadGlobal reads the global ceiling, the booked spend and the open holds.
+// A store with no period reads the lifetime booked spend. A store with a
+// period sums the settles booked since the current window began, so one
+// ceiling bounds each window in turn. Open holds count against the window
+// they were taken in, because the read bounds them by creation time.
+func (s *Store) loadGlobal(ctx context.Context, q querier, now time.Time) (budgetState, error) {
 	var state budgetState
-	var limit, spent int64
+	var limit, lifetime int64
 	if err := q.QueryRowContext(ctx,
-		`SELECT limit_nd, spent_nd FROM cost_budget WHERE id = 1`).Scan(&limit, &spent); err != nil {
+		`SELECT limit_nd, spent_nd FROM cost_budget WHERE id = 1`).Scan(&limit, &lifetime); err != nil {
 		return budgetState{}, fmt.Errorf("sqlitestore: read budget: %w", err)
 	}
 	state.limit = cost.Price(limit)
-	state.spent = cost.Price(spent)
+	since := s.windowSince(now)
+	if since == 0 {
+		state.spent = cost.Price(lifetime)
+	} else {
+		spent, err := sumSettles(ctx, q, "", since)
+		if err != nil {
+			return budgetState{}, err
+		}
+		state.spent = spent
+	}
 	var reserved int64
 	if err := q.QueryRowContext(ctx,
-		`SELECT COALESCE(SUM(amount_nd), 0) FROM cost_reservation WHERE expires_at > ?`,
-		now.UnixMilli()).Scan(&reserved); err != nil {
+		`SELECT COALESCE(SUM(amount_nd), 0) FROM cost_reservation WHERE expires_at > ? AND created_at >= ?`,
+		now.UnixMilli(), since).Scan(&reserved); err != nil {
 		return budgetState{}, fmt.Errorf("sqlitestore: read reservations: %w", err)
 	}
 	state.reserved = cost.Price(reserved)
 	return state, nil
+}
+
+// sumSettles returns the spend booked on or after sinceMillis. An empty
+// owner sums every owner, so the global ceiling reads the whole store.
+// It reports an error matching cost.ErrOverflow when the exact sum leaves
+// the int64 range.
+func sumSettles(ctx context.Context, q querier, owner string, sinceMillis int64) (cost.Price, error) {
+	var query string
+	var args []any
+	if owner == "" {
+		query = `SELECT amount_nd FROM cost_settle WHERE created_at >= ?`
+		args = []any{sinceMillis}
+	} else {
+		query = `SELECT amount_nd FROM cost_settle WHERE owner = ? AND created_at >= ?`
+		args = []any{owner, sinceMillis}
+	}
+	rows, err := q.QueryContext(ctx, query, args...)
+	if err != nil {
+		return 0, fmt.Errorf("sqlitestore: read settle history: %w", err)
+	}
+	defer rows.Close() // the cursor is drained before the caller returns
+	var total cost.Price
+	for rows.Next() {
+		var amount int64
+		if err := rows.Scan(&amount); err != nil {
+			return 0, fmt.Errorf("sqlitestore: scan settle history: %w", err)
+		}
+		total, err = addPrice(total, cost.Price(amount))
+		if err != nil {
+			return 0, err
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("sqlitestore: read settle history: %w", err)
+	}
+	return total, nil
 }
 
 // remainingOf computes the headroom. It subtracts the holds first, because the

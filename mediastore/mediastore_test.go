@@ -251,7 +251,8 @@ func TestPrivateIsTheZeroValueAndTheDefault(t *testing.T) {
 
 // TestPrivateBlobWithoutAuthorizerIsNotFound: a store that cannot admit
 // anyone refuses a private blob, and the refusal is indistinguishable
-// from an unknown id down to the body.
+// from an unknown id down to the body. The refusal carries the private
+// cache header, so no cache keeps it.
 func TestPrivateBlobWithoutAuthorizerIsNotFound(t *testing.T) {
 	s := openTestStore(t)
 	blobID, err := s.Persist(t.Context(), bytes.NewReader(blob(64)), Put{ContentType: "image/png"})
@@ -267,8 +268,8 @@ func TestPrivateBlobWithoutAuthorizerIsNotFound(t *testing.T) {
 	if body := rr.Body.String(); strings.Contains(body, blobID) || strings.Contains(body, "private") {
 		t.Fatalf("body confirms existence or reason: %q", body)
 	}
-	if got := rr.Header().Get("Cache-Control"); got != "" {
-		t.Fatalf("cache-control = %q, want none on a refusal", got)
+	if got := rr.Header().Get("Cache-Control"); got != privateCacheControl {
+		t.Fatalf("cache-control = %q, want %q", got, privateCacheControl)
 	}
 }
 
@@ -527,7 +528,8 @@ func TestServeHTTPIfNoneMatchPins304(t *testing.T) {
 
 // TestServeHTTPUnknownAndMalformedIDs: both a well formed id with no row
 // and a malformed id are 404. The malformed check is also what keeps a
-// crafted path value away from the file layer.
+// crafted path value away from the file layer. Every 404 carries the
+// private cache header, so a refusal stays identical to an unknown id.
 func TestServeHTTPUnknownAndMalformedIDs(t *testing.T) {
 	s := openTestStore(t)
 	cases := []string{
@@ -542,6 +544,9 @@ func TestServeHTTPUnknownAndMalformedIDs(t *testing.T) {
 			rr := serve(t, s, http.MethodGet, blobID, nil)
 			if got, want := rr.Code, http.StatusNotFound; got != want {
 				t.Fatalf("status = %d, want %d", got, want)
+			}
+			if got := rr.Header().Get("Cache-Control"); got != privateCacheControl {
+				t.Fatalf("cache-control = %q, want %q", got, privateCacheControl)
 			}
 		})
 	}
@@ -564,7 +569,9 @@ func TestServeHTTPRejectsNonGETMethods(t *testing.T) {
 
 // TestServeHTTPRowWithoutFileIs404: a row whose file vanished, which is
 // what a crash between the row delete and the file remove leaves,
-// answers 404. There is nothing else an honest server can say.
+// answers 404. There is nothing else an honest server can say. The 404
+// carries the private cache header like every other 404 the handler
+// answers.
 func TestServeHTTPRowWithoutFileIs404(t *testing.T) {
 	s := openTestStore(t)
 	const blobID = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
@@ -575,6 +582,9 @@ func TestServeHTTPRowWithoutFileIs404(t *testing.T) {
 	rr := serve(t, s, http.MethodGet, blobID, nil)
 	if got, want := rr.Code, http.StatusNotFound; got != want {
 		t.Fatalf("status = %d, want %d", got, want)
+	}
+	if got := rr.Header().Get("Cache-Control"); got != privateCacheControl {
+		t.Fatalf("cache-control = %q, want %q", got, privateCacheControl)
 	}
 }
 
