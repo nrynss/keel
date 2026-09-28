@@ -53,6 +53,30 @@ func mustHeadroom(t *testing.T, store *sqlitestore.Store) cost.Price {
 	return remaining
 }
 
+// TestSettleHistoryLandsBesideTheBooking reads the settle rows back over a
+// fresh connection a test helper owns, so the window math below stands on a
+// record the package API never touches. One settle writes exactly one row
+// with the booked amount and the clock the store stamps.
+func TestSettleHistoryLandsBesideTheBooking(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cost.db")
+	clock := &testClock{at: base}
+	store := openStore(t, path, withLimit(1000), withClock(clock.now))
+	mustBook(t, store, mustHold(t, store, 400), 300)
+
+	var owner string
+	var amount, created int64
+	row := openFresh(t, path).QueryRow(`SELECT owner, amount_nd, created_at FROM cost_settle`)
+	if err := row.Scan(&owner, &amount, &created); err != nil {
+		t.Fatalf("scan settle history: %v", err)
+	}
+	if owner != "" || amount != 300 || created != base.UnixMilli() {
+		t.Fatalf("settle row = (%q, %d, %d), want (\"\", 300, %d)", owner, amount, created, base.UnixMilli())
+	}
+	if n := freshCount(t, path, "cost_settle"); n != 1 {
+		t.Fatalf("settle rows = %d, want 1", n)
+	}
+}
+
 // TestDailyPeriodRestartsTheCeiling is the reported defect: a budget spent
 // to its limit refuses again after midnight, because Spent, Remaining and
 // Reserve read the window rather than the lifetime.

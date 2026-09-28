@@ -924,7 +924,8 @@ type Config struct {
 	// UTC month. The same window applies to the global ceiling and to
 	// every owner ceiling. Reserve, Remaining and Spent read the spend
 	// booked since the current window began, while Total and Charges
-	// keep all history.
+	// keep all history. The period is configuration, so reopening with
+	// another period re-windows the same history.
 	Period cost.Period
 
 	// ReservationTTL is how long a reservation holds budget before the
