@@ -83,11 +83,23 @@ for path in "${tracked_files[@]}"; do
     fi
 done
 
-# Check 1: every tracked Go file stays gofmt clean. A commit carries the index,
-# not the working tree, so the check judges the Go files the commit carries and
-# never the gitignored probe files the worktree happens to hold.
+# Check 1: every Go file the commit carries stays gofmt clean at the index
+# bytes. A commit carries the index, not the working tree, so the check
+# materializes exactly the tracked Go files, at their index bytes, into a
+# temporary directory and runs gofmt over those copies. It judges nothing
+# else: not the worktree copies, and not the gitignored probe files the
+# worktree happens to hold.
 header "1/11 gofmt"
-unformatted=$(git ls-files -z -- '*.go' | xargs -0 -r gofmt -l)
+gofmt_tmp=$(mktemp -d)
+api_tmp=
+trap 'rm -rf "$gofmt_tmp" "$api_tmp"' EXIT
+git ls-files -z -- '*.go' | git checkout-index -z --prefix="$gofmt_tmp/" --stdin
+if ! unformatted=$(
+    cd "$gofmt_tmp"
+    find . -type f -print0 | xargs -0 -r gofmt -l | sed 's|^\./||'
+); then
+    fail "1/11 gofmt" "gofmt could not read the indexed copies"
+fi
 if [ -n "$unformatted" ]; then
     printf '%s\n' "$unformatted"
     fail "1/11 gofmt" "files above need gofmt -w"
@@ -304,7 +316,6 @@ case "${cached_doc_rows}" in *[MA]*) doc_row=1 ;; esac
 cached_export_rows=$(git diff --cached --name-status --no-renames HEAD -- "${api_export}" | cut -f1 | sort -u | tr -d '\n')
 case "${cached_export_rows}" in *A*) export_row=1 ;; esac
 api_tmp=$(mktemp -d)
-trap 'rm -rf "$api_tmp"' EXIT
 regenerate_api_doc "$api_tmp/regen.txt"
 rows=$({
     git diff --name-status --no-renames HEAD -- api/
