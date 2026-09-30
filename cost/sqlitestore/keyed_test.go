@@ -315,3 +315,128 @@ func TestKeyedCancelledContextStopsTheWrite(t *testing.T) {
 		t.Errorf("reserve after the cancelled calls: %v", err)
 	}
 }
+
+// TestForgetOwnerRemovesTheOwnerRows: after a limit, a reserve and a
+// settle, the erase leaves zero rows naming the owner, read from a fresh
+// connection. The other owner's ceiling and the ledger stay.
+func TestForgetOwnerRemovesTheOwnerRows(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cost.db")
+	keyed, store := openKeyed(t, path, withLimit(1000))
+	ctx := t.Context()
+	mustOwnerCeiling(t, keyed, "alice", 400)
+	mustOwnerCeiling(t, keyed, "bob", 400)
+	hold := mustKeyedHold(t, keyed, "alice", 100)
+	if err := keyed.Settle(ctx, "alice", hold, 60); err != nil {
+		t.Fatalf("settle: %v", err)
+	}
+	bobHold := mustKeyedHold(t, keyed, "bob", 100)
+	if err := keyed.Settle(ctx, "bob", bobHold, 40); err != nil {
+		t.Fatalf("settle: %v", err)
+	}
+	if err := store.Add(ctx, cost.Charge{Kind: "gen", Units: 3, UnitPrice: 10, Ref: "call-1"}); err != nil {
+		t.Fatalf("add charge: %v", err)
+	}
+
+	if err := keyed.ForgetOwner(ctx, "alice"); err != nil {
+		t.Fatalf("ForgetOwner: %v", err)
+	}
+	fresh := openFresh(t, path)
+	for _, table := range []string{"cost_owner_budget", "cost_reservation", "cost_settle"} {
+		var n int
+		if err := fresh.QueryRow(`SELECT COUNT(*) FROM `+table+` WHERE owner = ?`, "alice").Scan(&n); err != nil {
+			t.Fatalf("count %s: %v", table, err)
+		}
+		if n != 0 {
+			t.Fatalf("%s holds %d rows for alice after ForgetOwner, want 0", table, n)
+		}
+	}
+	var bobRows int
+	if err := fresh.QueryRow(`SELECT COUNT(*) FROM cost_owner_budget WHERE owner = ?`, "bob").Scan(&bobRows); err != nil {
+		t.Fatalf("count bob rows: %v", err)
+	}
+	if bobRows != 1 {
+		t.Fatalf("bob ceiling rows = %d after ForgetOwner, want 1", bobRows)
+	}
+	total, err := store.Total(ctx)
+	if err != nil {
+		t.Fatalf("total: %v", err)
+	}
+	if total != 30 {
+		t.Fatalf("ledger total = %d after ForgetOwner, want 30, the charge stayed", total)
+	}
+}
+
+// TestForgetOwnerRefusesAnUnexpiredReservation: a hold still in flight is
+// money, so the erase is refused with ErrReservationLive and the owner's
+// rows survive.
+func TestForgetOwnerRefusesAnUnexpiredReservation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cost.db")
+	keyed, _ := openKeyed(t, path, withLimit(1000))
+	mustOwnerCeiling(t, keyed, "alice", 400)
+	mustKeyedHold(t, keyed, "alice", 100)
+
+	if err := keyed.ForgetOwner(t.Context(), "alice"); !errors.Is(err, sqlitestore.ErrReservationLive) {
+		t.Fatalf("ForgetOwner over an unexpired hold = %v, want ErrReservationLive", err)
+	}
+	var n int
+	fresh := openFresh(t, path)
+	if err := fresh.QueryRow(`SELECT COUNT(*) FROM cost_owner_budget WHERE owner = ?`, "alice").Scan(&n); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("alice ceiling rows = %d after the refusal, want 1", n)
+	}
+}
+
+// TestForgetOwnerTakesAnExpiredHold: a hold past its TTL holds no budget,
+// so the erase removes the owner and the expired row with it.
+func TestForgetOwnerTakesAnExpiredHold(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cost.db")
+	clock := &testClock{at: base}
+	keyed, _ := openKeyed(t, path, withLimit(1000), withTTL(time.Minute), withClock(clock.now))
+	mustOwnerCeiling(t, keyed, "alice", 400)
+	mustKeyedHold(t, keyed, "alice", 100)
+	clock.advance(2 * time.Minute)
+
+	if err := keyed.ForgetOwner(t.Context(), "alice"); err != nil {
+		t.Fatalf("ForgetOwner over an expired hold: %v", err)
+	}
+	var n int
+	fresh := openFresh(t, path)
+	if err := fresh.QueryRow(`SELECT COUNT(*) FROM cost_reservation WHERE owner = ?`, "alice").Scan(&n); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("reservation rows for alice = %d after ForgetOwner, want 0", n)
+	}
+}
+
+// TestForgetOwnerUnknownOwnerIsRepeatable: an owner no ceiling was set for
+// answers cost.ErrUnknownOwner, and an erased owner answers it again, so
+// an erase.Target maps both to erase.ErrGone.
+func TestForgetOwnerUnknownOwnerIsRepeatable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cost.db")
+	keyed, _ := openKeyed(t, path, withLimit(1000))
+	mustOwnerCeiling(t, keyed, "alice", 400)
+
+	if err := keyed.ForgetOwner(t.Context(), "nobody"); !errors.Is(err, cost.ErrUnknownOwner) {
+		t.Fatalf("ForgetOwner of an unknown owner = %v, want cost.ErrUnknownOwner", err)
+	}
+	if err := keyed.ForgetOwner(t.Context(), "alice"); err != nil {
+		t.Fatalf("ForgetOwner: %v", err)
+	}
+	for i := 0; i < 2; i++ {
+		if err := keyed.ForgetOwner(t.Context(), "alice"); !errors.Is(err, cost.ErrUnknownOwner) {
+			t.Fatalf("repeat ForgetOwner %d = %v, want cost.ErrUnknownOwner", i+1, err)
+		}
+	}
+}
+
+// TestForgetOwnerRefusesAnEmptyOwner pins the refusal the other keyed
+// methods share, because the empty key names the unkeyed budget.
+func TestForgetOwnerRefusesAnEmptyOwner(t *testing.T) {
+	keyed, _ := openKeyed(t, filepath.Join(t.TempDir(), "cost.db"), withLimit(1000))
+	if err := keyed.ForgetOwner(t.Context(), ""); !errors.Is(err, sqlitestore.ErrInvalid) {
+		t.Fatalf("ForgetOwner with no owner = %v, want ErrInvalid", err)
+	}
+}

@@ -257,6 +257,70 @@ func (k *KeyedBudget) SpentSince(ctx context.Context, owner string, t time.Time)
 	return sumSettles(ctx, k.store.db.Reader(), owner, t.UnixMilli())
 }
 
+// ForgetOwner removes every row keyed to owner: the ceiling row in
+// cost_owner_budget, the owner's reservation rows and the owner's settle
+// history. It refuses with ErrReservationLive while the owner holds an
+// unexpired reservation, because that is money in flight. Settle or
+// release the hold first, or let it expire. An owner no ceiling was ever
+// set for reports an error matching cost.ErrUnknownOwner, the answer the
+// keyed reads already use, so an erase.Target maps it to erase.ErrGone
+// without importing this package. Repeating an erase therefore answers
+// the same way again. The ledger is not the owner's: cost_charge rows key
+// by ref, not owner, so scoping them is the consumer's decision, and
+// ForgetOwner leaves every charge in place. It reports ErrInvalid when
+// owner is empty, as the other keyed methods do. A cancelled context
+// removes nothing.
+func (k *KeyedBudget) ForgetOwner(ctx context.Context, owner string) error {
+	if owner == "" {
+		return emptyOwner("forget owner")
+	}
+	now := k.store.now()
+	tx, err := k.store.db.Writer().BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("sqlitestore: forget owner: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }() // a committed transaction rolls back to a no-op
+	// The owner's expired holds go first, which also takes the write lock
+	// before the checks read. A reserve that races this erase either
+	// commits first and is refused below, or waits and then finds no
+	// ceiling row, so no hold outlives the owner it was taken for.
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM cost_reservation WHERE owner = ? AND expires_at <= ?`,
+		owner, now.UnixMilli()); err != nil {
+		return fmt.Errorf("sqlitestore: forget owner: purge expired: %w", err)
+	}
+	var live int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT EXISTS (SELECT 1 FROM cost_reservation WHERE owner = ? AND expires_at > ?)`,
+		owner, now.UnixMilli()).Scan(&live); err != nil {
+		return fmt.Errorf("sqlitestore: forget owner: %w", err)
+	}
+	if live != 0 {
+		return fmt.Errorf("sqlitestore: forget owner: owner %q: %w", owner, ErrReservationLive)
+	}
+	var known int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT EXISTS (SELECT 1 FROM cost_owner_budget WHERE owner = ?)`,
+		owner).Scan(&known); err != nil {
+		return fmt.Errorf("sqlitestore: forget owner: %w", err)
+	}
+	if known == 0 {
+		return fmt.Errorf("sqlitestore: forget owner: owner %q: %w", owner, cost.ErrUnknownOwner)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM cost_settle WHERE owner = ?`, owner); err != nil {
+		return fmt.Errorf("sqlitestore: forget owner: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM cost_owner_budget WHERE owner = ?`, owner); err != nil {
+		return fmt.Errorf("sqlitestore: forget owner: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("sqlitestore: forget owner: %w", err)
+	}
+	return nil
+}
+
 // loadOwner reads one owner's ceiling, booked spend and unexpired holds. A
 // zero since reads the lifetime booked spend. A positive since sums the
 // owner's settles booked on or after it and counts only holds taken on or

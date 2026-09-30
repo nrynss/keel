@@ -37,6 +37,11 @@ var migrations embed.FS
 // as a nil database.
 var ErrInvalid = errors.New("sqlitestore: invalid config")
 
+// ErrLeaseLive is returned by ForgetOwner when the owner still holds an
+// open or closing lease entry. Those name live sessions, so the erase
+// waits until they are closed or their caps pass.
+var ErrLeaseLive = errors.New("sqlitestore: owner still holds a live lease")
+
 // Config configures Open.
 type Config struct {
 	// DB is the open database. It must not be nil, and this package never
@@ -291,6 +296,56 @@ func (s *Store) ExpiredOpen(ctx context.Context, now time.Time, limit int) ([]le
 		return nil, fmt.Errorf("sqlitestore: expired open: %w", err)
 	}
 	return out, nil
+}
+
+// ForgetOwner removes every closed and expired lease row of owner. It
+// refuses with ErrLeaseLive while any open or closing row of owner
+// remains, because those name live sessions. The holder closes them, or
+// their caps pass, first. An owner the store holds no row for reports an
+// error matching lease.ErrUnknownLease, the answer Get already uses, so
+// an erase.Target maps it to erase.ErrGone without importing this
+// package. Forgetting an already forgotten owner answers the same way
+// again. An empty owner names the rows the store keys with the empty
+// owner, the leases opened with no owner. The delete names the terminal
+// states alone, so it cannot take a live row whatever it races. The
+// delete and the live check share one transaction, so a close that
+// claims a row mid-erase either commits before the check reads and is
+// refused, or finishes after the erase. A cancelled context removes
+// nothing.
+func (s *Store) ForgetOwner(ctx context.Context, owner string) error {
+	tx, err := s.db.Writer().BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("sqlitestore: forget owner: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }() // a committed transaction rolls back to a no-op
+	// The terminal delete is the transaction's first write, so the write
+	// lock is held before the live check reads.
+	result, err := tx.ExecContext(ctx,
+		`DELETE FROM lease_entry WHERE owner = ? AND state IN (?, ?)`,
+		owner, string(lease.StateClosed), string(lease.StateExpired))
+	if err != nil {
+		return fmt.Errorf("sqlitestore: forget owner: %w", err)
+	}
+	var live int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT EXISTS (SELECT 1 FROM lease_entry WHERE owner = ? AND state IN (?, ?))`,
+		owner, string(lease.StateOpen), string(lease.StateClosing)).Scan(&live); err != nil {
+		return fmt.Errorf("sqlitestore: forget owner: %w", err)
+	}
+	if live != 0 {
+		return fmt.Errorf("sqlitestore: forget owner: owner %q: %w", owner, ErrLeaseLive)
+	}
+	removed, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("sqlitestore: forget owner: %w", err)
+	}
+	if removed == 0 {
+		return fmt.Errorf("sqlitestore: forget owner: owner %q: %w", owner, lease.ErrUnknownLease)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("sqlitestore: forget owner: %w", err)
+	}
+	return nil
 }
 
 // scanner is the row shape Get decodes, so a row and its scan stay in one

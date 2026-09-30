@@ -75,6 +75,11 @@ const defaultReservationTTL = 10 * time.Minute
 // nil database.
 var ErrInvalid = errors.New("sqlitestore: invalid config")
 
+// ErrReservationLive is returned by KeyedBudget.ForgetOwner when the owner
+// still holds an unexpired reservation. That is money in flight, so the
+// erase waits until the hold is settled, released or expired.
+var ErrReservationLive = errors.New("sqlitestore: owner still holds an unexpired reservation")
+
 // Config configures Open.
 type Config struct {
 	// DB is the open database. It must not be nil, and this package never

@@ -901,6 +901,11 @@ var ErrInvalid = errors.New("sqlitestore: invalid config")
     ErrInvalid is returned for an argument this package cannot honour, such as a
     nil database.
 
+var ErrReservationLive = errors.New("sqlitestore: owner still holds an unexpired reservation")
+    ErrReservationLive is returned by KeyedBudget.ForgetOwner when the owner
+    still holds an unexpired reservation. That is money in flight, so the erase
+    waits until the hold is settled, released or expired.
+
 
 TYPES
 
@@ -955,6 +960,20 @@ type KeyedBudget struct {
 func NewKeyedBudget(store *Store) *KeyedBudget
     NewKeyedBudget returns a keyed budget over store. The store must come from
     Open, because the keyed budget reads and writes the schema Open applies.
+
+func (k *KeyedBudget) ForgetOwner(ctx context.Context, owner string) error
+    ForgetOwner removes every row keyed to owner: the ceiling row in
+    cost_owner_budget, the owner's reservation rows and the owner's settle
+    history. It refuses with ErrReservationLive while the owner holds an
+    unexpired reservation, because that is money in flight. Settle or release
+    the hold first, or let it expire. An owner no ceiling was ever set for
+    reports an error matching cost.ErrUnknownOwner, the answer the keyed reads
+    already use, so an erase.Target maps it to erase.ErrGone without importing
+    this package. Repeating an erase therefore answers the same way again.
+    The ledger is not the owner's: cost_charge rows key by ref, not owner,
+    so scoping them is the consumer's decision, and ForgetOwner leaves every
+    charge in place. It reports ErrInvalid when owner is empty, as the other
+    keyed methods do. A cancelled context removes nothing.
 
 func (k *KeyedBudget) Release(ctx context.Context, owner string, r Reservation) error
     Release frees a hold owner never spent. It reports ErrInvalid when owner is
@@ -2430,6 +2449,11 @@ var ErrInvalid = errors.New("sqlitestore: invalid config")
     ErrInvalid is returned for an argument this package cannot honour, such as a
     nil database.
 
+var ErrLeaseLive = errors.New("sqlitestore: owner still holds a live lease")
+    ErrLeaseLive is returned by ForgetOwner when the owner still holds an open
+    or closing lease entry. Those name live sessions, so the erase waits until
+    they are closed or their caps pass.
+
 
 TYPES
 
@@ -2496,6 +2520,21 @@ func (s *Store) ExpiredOpen(ctx context.Context, now time.Time, limit int) ([]le
     row must expire with the ordinary open ones. The limit bounds the pass,
     so one call never loads the whole table. A cancelled context stops the read
     and returns no rows rather than the rows it had already decoded.
+
+func (s *Store) ForgetOwner(ctx context.Context, owner string) error
+    ForgetOwner removes every closed and expired lease row of owner.
+    It refuses with ErrLeaseLive while any open or closing row of owner remains,
+    because those name live sessions. The holder closes them, or their caps
+    pass, first. An owner the store holds no row for reports an error matching
+    lease.ErrUnknownLease, the answer Get already uses, so an erase.Target maps
+    it to erase.ErrGone without importing this package. Forgetting an already
+    forgotten owner answers the same way again. An empty owner names the rows
+    the store keys with the empty owner, the leases opened with no owner.
+    The delete names the terminal states alone, so it cannot take a live row
+    whatever it races. The delete and the live check share one transaction,
+    so a close that claims a row mid-erase either commits before the check reads
+    and is refused, or finishes after the erase. A cancelled context removes
+    nothing.
 
 func (s *Store) Get(ctx context.Context, id string) (lease.Lease, error)
     Get reads the lease stored under id. It returns the stored row unchanged.

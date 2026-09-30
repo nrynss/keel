@@ -383,3 +383,151 @@ func TestExpireIfOpenOrClosingKeepsAClosedRow(t *testing.T) {
 		t.Fatalf("expire missing error = %v, want ErrUnknownLease", err)
 	}
 }
+
+// TestForgetOwnerRemovesTerminalRows: the closed and expired rows of the
+// owner go, another owner's row stays, and a fresh connection reads the
+// table after the erase.
+func TestForgetOwnerRemovesTerminalRows(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "lease.db")
+	store := openStore(t, path)
+	ctx := t.Context()
+	closed := sampleLease("gone-closed")
+	closed.State = lease.StateClosed
+	expired := sampleLease("gone-expired")
+	expired.State = lease.StateExpired
+	other := sampleLease("kept")
+	other.Owner = "team-b"
+	other.State = lease.StateClosed
+	for _, row := range []lease.Lease{closed, expired, other} {
+		if err := store.Create(ctx, row); err != nil {
+			t.Fatalf("Create %s: %v", row.ID, err)
+		}
+	}
+
+	if err := store.ForgetOwner(ctx, "team-a"); err != nil {
+		t.Fatalf("ForgetOwner: %v", err)
+	}
+	fresh := openFresh(t, path)
+	var gone int
+	if err := fresh.QueryRow(`SELECT COUNT(*) FROM lease_entry WHERE owner = ?`, "team-a").Scan(&gone); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if gone != 0 {
+		t.Fatalf("lease_entry holds %d rows for team-a after ForgetOwner, want 0", gone)
+	}
+	if _, err := store.Get(ctx, "kept"); err != nil {
+		t.Fatalf("Get of the other owner's row after ForgetOwner = %v, want nil", err)
+	}
+}
+
+// TestForgetOwnerRefusesLiveRows: an open or closing row is a live
+// session, so the erase is refused with ErrLeaseLive and even the
+// terminal rows of the owner survive it.
+func TestForgetOwnerRefusesLiveRows(t *testing.T) {
+	for _, live := range []lease.State{lease.StateOpen, lease.StateClosing} {
+		t.Run(string(live), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "lease.db")
+			store := openStore(t, path)
+			ctx := t.Context()
+			liveRow := sampleLease("live")
+			liveRow.State = live
+			closed := sampleLease("closed")
+			closed.State = lease.StateClosed
+			for _, row := range []lease.Lease{liveRow, closed} {
+				if err := store.Create(ctx, row); err != nil {
+					t.Fatalf("Create %s: %v", row.ID, err)
+				}
+			}
+
+			if err := store.ForgetOwner(ctx, "team-a"); !errors.Is(err, leasesql.ErrLeaseLive) {
+				t.Fatalf("ForgetOwner over a %s row = %v, want ErrLeaseLive", live, err)
+			}
+			fresh := openFresh(t, path)
+			var rows int
+			if err := fresh.QueryRow(`SELECT COUNT(*) FROM lease_entry WHERE owner = ?`, "team-a").Scan(&rows); err != nil {
+				t.Fatalf("count: %v", err)
+			}
+			if rows != 2 {
+				t.Fatalf("lease_entry rows for team-a = %d after the refusal, want 2", rows)
+			}
+		})
+	}
+}
+
+// TestForgetOwnerUnknownOwnerIsRepeatable: an owner the store holds no row
+// for answers lease.ErrUnknownLease, and an erased owner answers it again,
+// so an erase.Target maps both to erase.ErrGone.
+func TestForgetOwnerUnknownOwnerIsRepeatable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "lease.db")
+	store := openStore(t, path)
+	ctx := t.Context()
+	closed := sampleLease("row-1")
+	closed.State = lease.StateClosed
+	if err := store.Create(ctx, closed); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	if err := store.ForgetOwner(ctx, "nobody"); !errors.Is(err, lease.ErrUnknownLease) {
+		t.Fatalf("ForgetOwner of an unknown owner = %v, want lease.ErrUnknownLease", err)
+	}
+	if err := store.ForgetOwner(ctx, "team-a"); err != nil {
+		t.Fatalf("ForgetOwner: %v", err)
+	}
+	for i := 0; i < 2; i++ {
+		if err := store.ForgetOwner(ctx, "team-a"); !errors.Is(err, lease.ErrUnknownLease) {
+			t.Fatalf("repeat ForgetOwner %d = %v, want lease.ErrUnknownLease", i+1, err)
+		}
+	}
+}
+
+// TestForgetOwnerAfterOpenAndClose: a session opened and closed through
+// the manager leaves one closed row, the erase removes it, and a fresh
+// connection reads none. An open session refuses the erase instead.
+func TestForgetOwnerAfterOpenAndClose(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "lease.db")
+	store := openStore(t, path)
+	budget, err := cost.NewBudget(1000)
+	if err != nil {
+		t.Fatalf("new budget: %v", err)
+	}
+	ledger := cost.NewLedger()
+	meter, err := cost.NewMeter(budget, ledger)
+	if err != nil {
+		t.Fatalf("new meter: %v", err)
+	}
+	quota, err := lease.NewQuota(2)
+	if err != nil {
+		t.Fatalf("new quota: %v", err)
+	}
+	manager, err := lease.New(lease.Config{
+		Quota: quota,
+		Meter: meter,
+		Store: store,
+		Log:   slog.New(slog.DiscardHandler),
+	})
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	ctx := t.Context()
+	opened, err := manager.Open(ctx, "team-a", 100, "")
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := store.ForgetOwner(ctx, "team-a"); !errors.Is(err, leasesql.ErrLeaseLive) {
+		t.Fatalf("ForgetOwner over an open session = %v, want ErrLeaseLive", err)
+	}
+	if _, err := manager.Close(ctx, opened.ID, 80); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := store.ForgetOwner(ctx, "team-a"); err != nil {
+		t.Fatalf("ForgetOwner after Close: %v", err)
+	}
+	fresh := openFresh(t, path)
+	var rows int
+	if err := fresh.QueryRow(`SELECT COUNT(*) FROM lease_entry WHERE owner = ?`, "team-a").Scan(&rows); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if rows != 0 {
+		t.Fatalf("lease_entry rows for team-a = %d after the erase, want 0", rows)
+	}
+}
