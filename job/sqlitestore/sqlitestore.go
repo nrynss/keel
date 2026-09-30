@@ -37,9 +37,11 @@ const selectColumns = `SELECT id, kind, status, attempt, parent_id, root_id, pro
 // database.
 var ErrInvalid = errors.New("sqlitestore: invalid config")
 
-// ErrChainActive is returned by Delete and PruneFinished when an attempt
-// chain still holds a running or queued row. Erasure never destroys live
-// work, so the caller finishes or cancels the job first.
+// ErrChainActive is returned by Delete when an attempt chain still holds a
+// running or queued row. Erasure never destroys live work, so the caller
+// finishes or cancels the job first. PruneFinished does not return this
+// sentinel: it skips such chains silently and leaves them for a later
+// cutoff, once their newest row is terminal and old enough.
 var ErrChainActive = errors.New("sqlitestore: job chain is still active")
 
 // Config configures Open.
@@ -198,16 +200,20 @@ func (s *Store) Delete(ctx context.Context, id string) error {
 	if _, err := tx.ExecContext(ctx, `DELETE FROM jobs WHERE root_id = ?`, root); err != nil {
 		return fmt.Errorf("sqlitestore: delete %s: %w", id, err)
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("sqlitestore: delete %s: %w", id, err)
+	}
+	return nil
 }
 
 // PruneFinished removes every attempt chain in which no row is running or
 // queued and the newest updated_at is before before, and returns the number
 // of chains removed. The schema keeps no finish timestamp, and Finish writes
 // updated_at last, so the newest updated_at in a terminal chain is the
-// moment it finished. The work is one bounded listing and one delete, never
-// a scan in Go loops, so a periodic prune costs the same as any other
-// indexed pass.
+// moment it finished. A chain still holding a running or queued row is
+// skipped silently and left for a later cutoff. The work is one bounded
+// listing and one delete, never a scan in Go loops, so a periodic prune
+// costs the same as any other indexed pass.
 func (s *Store) PruneFinished(ctx context.Context, before time.Time) (int, error) {
 	tx, err := s.db.Writer().BeginTx(ctx, nil)
 	if err != nil {
@@ -226,13 +232,19 @@ func (s *Store) PruneFinished(ctx context.Context, before time.Time) (int, error
 		return 0, fmt.Errorf("sqlitestore: prune finished: %w", err)
 	}
 	if chains == 0 {
-		return 0, tx.Commit()
+		if err := tx.Commit(); err != nil {
+			return 0, fmt.Errorf("sqlitestore: prune finished: %w", err)
+		}
+		return 0, nil
 	}
 	if _, err := tx.ExecContext(ctx,
 		`DELETE FROM jobs WHERE root_id IN (`+aged+`)`, before.UnixNano()); err != nil {
 		return 0, fmt.Errorf("sqlitestore: prune finished: %w", err)
 	}
-	return chains, tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("sqlitestore: prune finished: %w", err)
+	}
+	return chains, nil
 }
 
 // update runs one write and classifies its row count. The rows affected
