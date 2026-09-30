@@ -37,6 +37,11 @@ const selectColumns = `SELECT id, kind, status, attempt, parent_id, root_id, pro
 // database.
 var ErrInvalid = errors.New("sqlitestore: invalid config")
 
+// ErrChainActive is returned by Delete and PruneFinished when an attempt
+// chain still holds a running or queued row. Erasure never destroys live
+// work, so the caller finishes or cancels the job first.
+var ErrChainActive = errors.New("sqlitestore: job chain is still active")
+
 // Config configures Open.
 type Config struct {
 	// DB is the open database the store writes through. It must not be
@@ -159,6 +164,75 @@ func (s *Store) Attempts(ctx context.Context, id string) ([]job.Record, error) {
 		return nil, fmt.Errorf("sqlitestore: attempts %s: %w", id, err)
 	}
 	return scanRecords(rows, "attempts "+id)
+}
+
+// Delete removes one finished record and every row of its attempt chain:
+// all rows sharing the named row's root_id, including the named row. It
+// refuses with ErrChainActive while any row of the chain is running or
+// queued, and reports ErrUnknownJob for an id the store does not hold, so
+// deleting an already deleted chain answers ErrUnknownJob again. An
+// erase.Target maps that unknown-id answer to erase.ErrGone without
+// importing this package.
+func (s *Store) Delete(ctx context.Context, id string) error {
+	tx, err := s.db.Writer().BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("sqlitestore: delete %s: %w", id, err)
+	}
+	defer func() { _ = tx.Rollback() }() // a committed transaction rolls back to a no-op
+	var root string
+	if err := tx.QueryRowContext(ctx, `SELECT root_id FROM jobs WHERE id = ?`, id).Scan(&root); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("sqlitestore: delete %s: %w", id, job.ErrUnknownJob)
+		}
+		return fmt.Errorf("sqlitestore: delete %s: %w", id, err)
+	}
+	var active int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT EXISTS (SELECT 1 FROM jobs WHERE root_id = ? AND status IN (?, ?))`,
+		root, string(job.StatusRunning), string(job.StatusQueued)).Scan(&active); err != nil {
+		return fmt.Errorf("sqlitestore: delete %s: %w", id, err)
+	}
+	if active != 0 {
+		return fmt.Errorf("sqlitestore: delete %s: %w", id, ErrChainActive)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM jobs WHERE root_id = ?`, root); err != nil {
+		return fmt.Errorf("sqlitestore: delete %s: %w", id, err)
+	}
+	return tx.Commit()
+}
+
+// PruneFinished removes every attempt chain in which no row is running or
+// queued and the newest updated_at is before before, and returns the number
+// of chains removed. The schema keeps no finish timestamp, and Finish writes
+// updated_at last, so the newest updated_at in a terminal chain is the
+// moment it finished. The work is one bounded listing and one delete, never
+// a scan in Go loops, so a periodic prune costs the same as any other
+// indexed pass.
+func (s *Store) PruneFinished(ctx context.Context, before time.Time) (int, error) {
+	tx, err := s.db.Writer().BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("sqlitestore: prune finished: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }() // a committed transaction rolls back to a no-op
+	// aged holds every chain whose newest row is terminal and older than
+	// the cutoff. The newest updated_at of a terminal chain is the finish
+	// moment, because Finish writes it last.
+	const aged = `SELECT root_id FROM jobs GROUP BY root_id
+		HAVING MAX(CASE WHEN status IN ('running', 'queued') THEN 1 ELSE 0 END) = 0
+		     AND MAX(updated_at) < ?`
+	var chains int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM (`+aged+`)`, before.UnixNano()).Scan(&chains); err != nil {
+		return 0, fmt.Errorf("sqlitestore: prune finished: %w", err)
+	}
+	if chains == 0 {
+		return 0, tx.Commit()
+	}
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM jobs WHERE root_id IN (`+aged+`)`, before.UnixNano()); err != nil {
+		return 0, fmt.Errorf("sqlitestore: prune finished: %w", err)
+	}
+	return chains, tx.Commit()
 }
 
 // update runs one write and classifies its row count. The rows affected

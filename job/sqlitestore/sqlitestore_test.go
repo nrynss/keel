@@ -348,3 +348,158 @@ func TestStateSurvivesReopen(t *testing.T) {
 
 // int64p returns a pointer to v, for the optional numeric progress members.
 func int64p(v int64) *int64 { return &v }
+
+// chain builds a two-attempt chain under the store: attempt one finished at
+// firstAt, attempt two finished at secondAt.
+func chain(t *testing.T, store *sqlitestore.Store, kind string, firstAt, secondAt time.Time) {
+	t.Helper()
+	first := running("chain-a1", kind)
+	first.UpdatedAt = firstAt
+	if err := store.Create(t.Context(), first); err != nil {
+		t.Fatalf("Create %s: %v", first.ID, err)
+	}
+	second := running("chain-a2", kind)
+	second.Attempt = 2
+	second.ParentID = "chain-a1"
+	second.RootID = "chain-a1"
+	second.UpdatedAt = secondAt
+	if err := store.Create(t.Context(), second); err != nil {
+		t.Fatalf("Create %s: %v", second.ID, err)
+	}
+	for _, rec := range []job.Record{
+		{ID: first.ID, Status: job.StatusDone, UpdatedAt: firstAt},
+		{ID: second.ID, Status: job.StatusDone, UpdatedAt: secondAt},
+	} {
+		if err := store.Finish(t.Context(), rec); err != nil {
+			t.Fatalf("Finish %s: %v", rec.ID, err)
+		}
+	}
+}
+
+// gone reports that a fresh connection to the same file finds no row for id
+// and no attempt of the chain id rooted, which is what erasure depends on.
+func gone(t *testing.T, path string, root string, ids ...string) {
+	t.Helper()
+	reader, err := sqlitestore.Open(t.Context(), sqlitestore.Config{DB: openDB(t, path)})
+	if err != nil {
+		t.Fatalf("Open reader: %v", err)
+	}
+	for _, id := range ids {
+		if _, err := reader.Get(t.Context(), id); !errors.Is(err, job.ErrUnknownJob) {
+			t.Errorf("Get %s through a fresh connection = %v, want ErrUnknownJob", id, err)
+		}
+	}
+	if _, err := reader.Attempts(t.Context(), root); !errors.Is(err, job.ErrUnknownJob) {
+		t.Errorf("Attempts %s through a fresh connection = %v, want ErrUnknownJob", root, err)
+	}
+}
+
+// TestDeleteRemovesAttemptChain: deleting one finished record removes every
+// row of its attempt chain, and a fresh connection finds none of them.
+func TestDeleteRemovesAttemptChain(t *testing.T) {
+	store, path := openStore(t)
+	chain(t, store, "index", time.Unix(1700000000, 0), time.Unix(1700000100, 0))
+	other := running("job-other", "index")
+	other.UpdatedAt = time.Unix(1700000050, 0)
+	if err := store.Create(t.Context(), other); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	if err := store.Delete(t.Context(), "chain-a2"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	gone(t, path, "chain-a1", "chain-a1", "chain-a2")
+	if _, err := store.Get(t.Context(), "job-other"); err != nil {
+		t.Errorf("Get of an untouched job after Delete = %v, want nil", err)
+	}
+}
+
+// TestDeleteRefusesActiveChain: a chain that still holds a running row is
+// refused with ErrChainActive, and every row of it survives.
+func TestDeleteRefusesActiveChain(t *testing.T) {
+	store, _ := openStore(t)
+	first := running("chain-a1", "index")
+	first.UpdatedAt = time.Unix(1700000000, 0)
+	second := running("chain-a2", "index")
+	second.Attempt = 2
+	second.ParentID = "chain-a1"
+	second.RootID = "chain-a1"
+	second.UpdatedAt = time.Unix(1700000100, 0)
+	if err := store.Create(t.Context(), first); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := store.Create(t.Context(), second); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	if err := store.Delete(t.Context(), "chain-a1"); !errors.Is(err, sqlitestore.ErrChainActive) {
+		t.Fatalf("Delete over a running chain = %v, want ErrChainActive", err)
+	}
+	for _, id := range []string{"chain-a1", "chain-a2"} {
+		if _, err := store.Get(t.Context(), id); err != nil {
+			t.Errorf("Get %s after the refusal = %v, want the row kept", id, err)
+		}
+	}
+}
+
+// TestDeleteUnknownJobIsRepeatable: an absent id answers ErrUnknownJob, and
+// deleting an already deleted chain answers it again.
+func TestDeleteUnknownJobIsRepeatable(t *testing.T) {
+	store, path := openStore(t)
+	chain(t, store, "index", time.Unix(1700000000, 0), time.Unix(1700000100, 0))
+	if err := store.Delete(t.Context(), "no-such-job"); !errors.Is(err, job.ErrUnknownJob) {
+		t.Fatalf("Delete of an unknown id = %v, want ErrUnknownJob", err)
+	}
+	if err := store.Delete(t.Context(), "chain-a1"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	for i := 0; i < 2; i++ {
+		if err := store.Delete(t.Context(), "chain-a2"); !errors.Is(err, job.ErrUnknownJob) {
+			t.Fatalf("repeat Delete %d = %v, want ErrUnknownJob", i+1, err)
+		}
+	}
+	gone(t, path, "chain-a1", "chain-a1", "chain-a2")
+}
+
+// TestPruneFinishedRemovesAgedTerminalChains: exactly the terminal chains
+// whose newest update is before the cutoff go, and a fresh terminal chain and
+// a running chain stay.
+func TestPruneFinishedRemovesAgedTerminalChains(t *testing.T) {
+	store, path := openStore(t)
+	aged := time.Unix(1700000000, 0)
+	fresh := time.Unix(1700009000, 0)
+	cutoff := time.Unix(1700005000, 0)
+	chain(t, store, "index", aged.Add(-time.Minute), aged)
+
+	freshFirst := running("fresh-a1", "index")
+	freshFirst.UpdatedAt = fresh
+	if err := store.Create(t.Context(), freshFirst); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := store.Finish(t.Context(), job.Record{ID: "fresh-a1", Status: job.StatusDone, UpdatedAt: fresh}); err != nil {
+		t.Fatalf("Finish: %v", err)
+	}
+	active := running("job-active", "index")
+	active.UpdatedAt = aged
+	if err := store.Create(t.Context(), active); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	n, err := store.PruneFinished(t.Context(), cutoff)
+	if err != nil {
+		t.Fatalf("PruneFinished: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("PruneFinished = %d, want 1 chain removed", n)
+	}
+	gone(t, path, "chain-a1", "chain-a1", "chain-a2")
+	for _, id := range []string{"fresh-a1", "job-active"} {
+		if _, err := store.Get(t.Context(), id); err != nil {
+			t.Errorf("Get %s after prune = %v, want the row kept", id, err)
+		}
+	}
+
+	if n, err := store.PruneFinished(t.Context(), cutoff); err != nil || n != 0 {
+		t.Errorf("second PruneFinished = %d, %v, want 0, nil", n, err)
+	}
+}
