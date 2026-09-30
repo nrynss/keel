@@ -83,9 +83,11 @@ for path in "${tracked_files[@]}"; do
     fi
 done
 
-# Check 1: every Go file stays gofmt clean.
+# Check 1: every tracked Go file stays gofmt clean. A commit carries the index,
+# not the working tree, so the check judges the Go files the commit carries and
+# never the gitignored probe files the worktree happens to hold.
 header "1/11 gofmt"
-unformatted=$(gofmt -l .)
+unformatted=$(git ls-files -z -- '*.go' | xargs -0 -r gofmt -l)
 if [ -n "$unformatted" ]; then
     printf '%s\n' "$unformatted"
     fail "1/11 gofmt" "files above need gofmt -w"
