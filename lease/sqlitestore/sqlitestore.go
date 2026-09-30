@@ -39,7 +39,7 @@ var ErrInvalid = errors.New("sqlitestore: invalid config")
 
 // ErrLeaseLive is returned by ForgetOwner when the owner still holds an
 // open or closing lease entry. Those name live sessions, so the erase
-// waits until they are closed or their caps pass.
+// waits until they are closed or a sweep expires them past their caps.
 var ErrLeaseLive = errors.New("sqlitestore: owner still holds a live lease")
 
 // Config configures Open.
@@ -301,8 +301,9 @@ func (s *Store) ExpiredOpen(ctx context.Context, now time.Time, limit int) ([]le
 // ForgetOwner removes every closed and expired lease row of owner. It
 // refuses with ErrLeaseLive while any open or closing row of owner
 // remains, because those name live sessions. The holder closes them, or
-// their caps pass, first. An owner the store holds no row for reports an
-// error matching lease.ErrUnknownLease, the answer Get already uses, so
+// a sweep expires them once their caps pass, first. An owner the store
+// holds no row for reports an error matching lease.ErrUnknownLease, the
+// answer Get already uses, so
 // an erase.Target maps it to erase.ErrGone without importing this
 // package. Forgetting an already forgotten owner answers the same way
 // again. An empty owner names the rows the store keys with the empty
