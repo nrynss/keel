@@ -48,8 +48,8 @@ apidiff_version="v0.0.0-20260908205506-85c1c2202aba"
 # transcript and a human reads no export data, so the formats stay separate on
 # purpose. A compatible addition updates the transcript. An incompatible
 # change fails against the release export.
-api_doc="api/next.txt"
-api_export="api/v0.3.1.export"
+api_doc="api/v0.4.0.txt"
+api_export="api/v0.4.0.export"
 
 # Both records are taken from one frozen build context, linux/amd64, which is
 # also the context CI runs on. The transcript is generated under it, so the same

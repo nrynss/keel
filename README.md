@@ -15,7 +15,7 @@ nothing logs on its own, and nothing panics.
 ## Install
 
 ```bash
-go get github.com/nrynss/keel@v0.3.1
+go get github.com/nrynss/keel@v0.4.0
 ```
 
 Go 1.27 or newer. The `ffmpeg` package runs the `ffmpeg` and `ffprobe` binaries, so install those
@@ -159,7 +159,8 @@ every month, so a limit bounds one window rather than all spend ever booked. A `
 another owner's headroom. Each owner reserves and settles through its own account from `Owner`.
 A `cost.Meter` runs one paid call against an account: it reserves the estimate, runs the work,
 settles the measured price, and frees the reservation on every failure path. A call that reports
-no usage settles at its estimate and says so in the returned `Usage`.
+no usage settles at its estimate and says so in the returned `Usage`. `KeyedBudget.ForgetOwner`
+removes an owner's budget, reservations and settle history after its live reservations finish.
 
 ### Flip a switch without a restart
 
@@ -249,7 +250,8 @@ refuses new leases at once, which pairs with `flag` without importing it. `Close
 reported price through the same seam. `Reconcile` applies the provider reported price as the
 truth and keeps both numbers on the record. A dead process leaves its lease behind, and a later
 call reclaims the slot once the cap has passed. `lease/sqlitestore` owns its namespaced
-migration, like every other store here.
+migration, like every other store here. `lease/sqlitestore.Store.ForgetOwner` removes an
+owner's closed and expired leases after its live leases finish.
 
 ### Configure with a file that holds no secret value
 
@@ -381,6 +383,8 @@ An `error` terminal embeds the same envelope body a failed response carries, so 
 both. The broker retains the terminal event for the bound in `stream.Config.Retain`, one minute at defaults, so a subscriber that joins within retention still receives it. A subscriber that joins after expiry gets live events only. The client
 subscribes first, then calls `Runner.Result` for the stored state, then drops a duplicate on the
 job id. A `Result` read for an unknown id fails with `job: unknown id` rather than a frame.
+`Store.Delete` removes a finished job and its whole attempt chain. `Store.PruneFinished` removes
+terminal chains older than a supplied time and leaves active chains alone.
 
 ### Private and public media with mediastore
 
@@ -465,11 +469,12 @@ go test -run Example -v ./...
 
 ## Versioning
 
-Keel is on v0. The exported API is frozen in `api/v0.3.1.txt` with its `api/v0.3.1.export`
+Keel is on v0. The exported API is frozen in `api/v0.4.0.txt` with its `api/v0.4.0.export`
 baseline, and a check in CI fails on any change to them. The records are frozen for
 `linux/amd64`. They cover the surface the release shipped, including `flag`, `caption`,
-`erase`, `edl`, `waveform`, and `lease`. The `cost` keyed budgets ship with the paid
-call seam and the budget windows that restart a ceiling.
+`erase`, `edl`, `waveform`, and `lease`. Version 0.4.0 adds deletion for finished job chains,
+owner budget state and completed leases. The `cost` keyed budgets ship with the paid call seam
+and the budget windows that restart a ceiling.
 Once v1 lands, a breaking change will need a major version.
 
 ## Development
