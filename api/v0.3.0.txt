@@ -781,31 +781,6 @@ func (m *Meter) Call(ctx context.Context, estimate Price, kind, ref string, work
     the reservation and reports the error, so a call that books nothing leaves
     nothing held.
 
-type Period int
-    Period bounds a durable budget ceiling to a repeating window. None keeps one
-    lifetime ceiling, which is the zero value and the behaviour every budget has
-    today. DailyUTC restarts the ceiling at each UTC midnight and MonthlyUTC
-    at each UTC month start. A durable store reads this value from its own
-    configuration. The in-memory Budget and KeyedBudget keep lifetime ceilings,
-    because neither owns a clock.
-
-const (
-	// None keeps one lifetime ceiling over all spend ever booked. It is
-	// the zero value, so a configuration that never sets a period keeps
-	// the behaviour every budget has today.
-	None Period = iota
-	// DailyUTC restarts the ceiling at each UTC midnight, so a limit
-	// bounds one calendar day.
-	DailyUTC
-	// MonthlyUTC restarts the ceiling at each UTC month start, so a
-	// limit bounds one calendar month.
-	MonthlyUTC
-)
-func (p Period) Start(t time.Time) time.Time
-    Start returns the instant the window holding t began. A daily window begins
-    at its UTC midnight and a monthly one at its first UTC midnight. None has no
-    window, so it returns the zero time.
-
 type Price int64
     Price represents a cost in nanodollars (billionths of a dollar).
 
@@ -884,13 +859,6 @@ counts against the global one. An owner that exhausts its share therefore never
 touches another owner's headroom. The empty owner key names the unkeyed budget
 the store itself keeps, so the keyed budget refuses it.
 
-A store opened with a period restarts its ceiling on a calendar window,
-so a limit bounds one day or one month rather than all spend ever booked. The
-spend a window reads comes from the settle history, which every Settle extends,
-so a rollover needs no scheduler and no caller code. Totals and charges keep all
-history either way. Spend booked before this version stays in the lifetime total
-and outside every window.
-
 This package is one of the few allowed to import the SQLite driver. The ledger
 arithmetic itself stays in the cost package, and every total is summed through a
 cost.Ledger so the overflow rule never drifts.
@@ -917,16 +885,6 @@ type Config struct {
 	// writes it on every open, so a redeploy can raise or lower the
 	// ceiling and the stored spend stays.
 	Limit cost.Price
-
-	// Period restarts the ceiling on a calendar window. None keeps one
-	// lifetime ceiling, which is the zero value and the behaviour every
-	// store has today. DailyUTC bounds each UTC day and MonthlyUTC each
-	// UTC month. The same window applies to the global ceiling and to
-	// every owner ceiling. Reserve, Remaining and Spent read the spend
-	// booked since the current window began, while Total and Charges
-	// keep all history. The period is configuration, so reopening with
-	// another period re-windows the same history.
-	Period cost.Period
 
 	// ReservationTTL is how long a reservation holds budget before the
 	// store treats it as expired. Zero means ten minutes.
@@ -968,8 +926,7 @@ func (k *KeyedBudget) Release(ctx context.Context, owner string, r Reservation) 
 func (k *KeyedBudget) Remaining(ctx context.Context, owner string) (cost.Price, error)
     Remaining returns the headroom owner still has under its own ceiling.
     It is the owner's ceiling minus what its settles booked minus its unexpired
-    holds. A store with a period reads the spend and the holds of the current
-    window. It reports ErrInvalid when owner is empty, an error matching
+    holds. It reports ErrInvalid when owner is empty, an error matching
     cost.ErrUnknownOwner when no ceiling was set for owner, and an error
     matching cost.ErrOverflow when that difference leaves the int64 range.
     A reserve can still fail with an error matching cost.ErrOverBudget when the
@@ -981,11 +938,10 @@ func (k *KeyedBudget) Reserve(ctx context.Context, owner string, estimate cost.P
     empty and an error matching cost.ErrUnknownOwner when no ceiling was set
     for owner. It reports an error matching cost.ErrOverBudget when either bound
     would be passed, and commits nothing then. It reports an error matching
-    cost.ErrNegativeEstimate for a negative estimate. A store with a period
-    checks both ceilings against the current window alone. The checks and the
-    insert share one transaction, so concurrent callers never overspend either
-    bound. The hold expires after the configured TTL, as every hold on the store
-    does. A cancelled context stops the reserve, so no hold is taken.
+    cost.ErrNegativeEstimate for a negative estimate. The checks and the insert
+    share one transaction, so concurrent callers never overspend either bound.
+    The hold expires after the configured TTL, as every hold on the store does.
+    A cancelled context stops the reserve, so no hold is taken.
 
 func (k *KeyedBudget) SetLimit(ctx context.Context, owner string, limit cost.Price) error
     SetLimit gives owner a ceiling of its own, or replaces the ceiling it has.
@@ -1001,17 +957,10 @@ func (k *KeyedBudget) Settle(ctx context.Context, owner string, r Reservation, a
     cost.ErrUnknownOwner when no ceiling was set for owner. It reports an error
     matching cost.ErrOverflow when actual would push either booked spend past
     the int64 range, and commits nothing then. The booking lands on the global
-    pool and on the owner's own account, because both ceilings read the fact,
-    and it extends the settle history under the owner's name, so a store with
-    a period counts it in the current window. A hold that already expired
-    or belongs to another owner frees nothing, and that is not an error.
-    A cancelled context stops the settle, so nothing is booked.
-
-func (k *KeyedBudget) SpentSince(ctx context.Context, owner string, t time.Time) (cost.Price, error)
-    SpentSince returns the spend owner booked on or after t. It reads the settle
-    history, so it serves any instant the history covers. It reports ErrInvalid
-    when owner is empty and an error matching cost.ErrUnknownOwner when no
-    ceiling was set for owner.
+    pool and on the owner's own account, because both ceilings read the fact.
+    A hold that already expired or belongs to another owner frees nothing,
+    and that is not an error. A cancelled context stops the settle, so nothing
+    is booked.
 
 type Reservation struct {
 	// ID identifies the reservation.
@@ -1051,8 +1000,7 @@ func (s *Store) Charges(ctx context.Context) ([]cost.Charge, error)
     Charges returns every recorded charge in insertion order.
 
 func (s *Store) Limit(ctx context.Context) (cost.Price, error)
-    Limit returns the ceiling the store was opened with. A store with a period
-    applies the same ceiling to each window in turn.
+    Limit returns the ceiling the store was opened with.
 
 func (s *Store) Release(ctx context.Context, r Reservation) error
     Release frees a hold the caller never spent. A hold that already expired
@@ -1061,17 +1009,14 @@ func (s *Store) Release(ctx context.Context, r Reservation) error
 
 func (s *Store) Remaining(ctx context.Context) (cost.Price, error)
     Remaining returns the headroom left for new reservations. It is the ceiling
-    minus booked spend minus unexpired holds. A store with a period reads the
-    spend and the holds of the current window, so each window starts with a full
-    ceiling. It reports an error matching cost.ErrOverflow when that difference
-    leaves the int64 range.
+    minus booked spend minus unexpired holds. It reports an error matching
+    cost.ErrOverflow when that difference leaves the int64 range.
 
 func (s *Store) Reserve(ctx context.Context, estimate cost.Price) (Reservation, error)
     Reserve commits estimate against the durable budget and returns the hold.
     It fails with an error matching cost.ErrOverBudget when the ceiling,
-    the booked spend and the unexpired holds leave less than estimate, and it
-    commits nothing then. A store with a period checks the ceiling against
-    the current window alone. The check and the insert share one transaction,
+    the booked spend and the unexpired holds leave less than estimate,
+    and it commits nothing then. The check and the insert share one transaction,
     so concurrent callers never overspend. The hold expires after the configured
     TTL, so a caller that dies still returns its budget. A cancelled context
     stops the reserve, so no hold is taken.
@@ -1079,29 +1024,17 @@ func (s *Store) Reserve(ctx context.Context, estimate cost.Price) (Reservation, 
 func (s *Store) Reserved(ctx context.Context) (cost.Price, error)
     Reserved returns the sum of the reservations that are still holding budget.
     An expired reservation never counts, so a dead process stops holding budget
-    when its hold expires. A store with a period counts only holds taken since
-    the current window began, so a hold counts against the window its caller
-    took it in.
+    when its hold expires.
 
 func (s *Store) Settle(ctx context.Context, r Reservation, actual cost.Price) error
-    Settle books the price a paid call actually cost and releases the hold.
-    It books actual even when the hold already expired, because the call
-    happened and the charge is a fact. The booking extends the settle history,
-    so a store with a period counts it in the current window. It reports an
-    error matching cost.ErrOverflow and commits nothing when actual would push
-    the booked spend past the int64 range. A cancelled context stops the settle,
-    so nothing is booked.
+    Settle books the price a paid call actually cost and releases the hold. It
+    books actual even when the hold already expired, because the call happened
+    and the charge is a fact. It reports an error matching cost.ErrOverflow
+    and commits nothing when actual would push the booked spend past the int64
+    range. A cancelled context stops the settle, so nothing is booked.
 
 func (s *Store) Spent(ctx context.Context) (cost.Price, error)
-    Spent returns the sum of the prices Settle has booked. A store with no
-    period returns the lifetime booked spend. A store with a period returns the
-    spend booked since the current window began.
-
-func (s *Store) SpentSince(ctx context.Context, t time.Time) (cost.Price, error)
-    SpentSince returns the spend booked on or after t, across every owner.
-    It reads the settle history, so it serves any instant the history covers.
-    A store with a period answers its current window through Spent, and any
-    other window through here.
+    Spent returns the sum of the prices Settle has booked.
 
 func (s *Store) Total(ctx context.Context) (cost.Price, error)
     Total returns the sum of every charge in the ledger. It reports an error
@@ -2735,8 +2668,7 @@ func (s *Store) ServeHTTP(w http.ResponseWriter, r *http.Request)
     An unknown, malformed or file-less id is 404. A blob that exists but cannot
     be opened is 500 and one log line. A private blob is served only when
     Config.Authorize allows the request, and a refusal answers the same 404 as
-    an unknown id, with the same private cache header, so the response never
-    confirms that a private blob exists and no cache keeps the refusal.
+    an unknown id, so the response never confirms that a private blob exists.
 
 type SweepResult struct {
 	// UnplacedDeleted and UnplacedBytes count sweep A: aged-out rows

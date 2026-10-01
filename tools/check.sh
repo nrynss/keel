@@ -276,13 +276,12 @@ regenerate_api_doc() {
 # incompatible change against it, whether or not a recorded package carries it.
 # The transcript record describes the surface under construction. It fails on
 # any visible change inside a recorded package until it is updated. Every other
-# record under api/ is frozen at its release, and the guard below refuses to
-# move it.
+# record under api/ stays frozen, except for an exact restoration from its
+# version tag with matching worktree and index bytes.
 header "11/11 api"
-# The released records are frozen at their release. Only the transcript of
-# the surface under construction moves with the work. A commit carries the
-# index, so the guard reads the change rows from both views, merges them,
-# and judges every row once, naming the record it refuses.
+# Released records stay frozen, except when both the worktree and index restore
+# the exact transcript from its existing version tag. The guard reads both
+# views because the commit carries the index, not the worktree.
 #
 # Two moves are sanctioned, the rename and the pair-add. A rename births a
 # new pair, the new transcript and its export record, so it adds both
@@ -333,11 +332,22 @@ stale_untouched() {
     [ -z "$(git diff --name-status --no-renames HEAD -- "${doc_at_head}")" ] \
         && [ -z "$(git diff --cached --name-status --no-renames HEAD -- "${doc_at_head}")" ]
 }
+tagged_record_restored() {
+    local path=$1 tag
+    [[ "$path" =~ ^api/(v[0-9]+\.[0-9]+\.[0-9]+)\.txt$ ]] || return 1
+    tag=${BASH_REMATCH[1]}
+    git show-ref --verify --quiet "refs/tags/${tag}" || return 1
+    git show "${tag}:${path}" > "$api_tmp/tagged-record.txt" 2>/dev/null || return 1
+    cmp -s "$api_tmp/tagged-record.txt" "$path" || return 1
+    git show ":${path}" > "$api_tmp/index-record.txt" 2>/dev/null || return 1
+    cmp -s "$api_tmp/tagged-record.txt" "$api_tmp/index-record.txt"
+}
 if [ -n "$rows" ] || stale_index; then
     if [ -n "$rows" ]; then
         while IFS=$'\t' read -r status path; do
             if [ "$status" = "M" ]; then
                 [ "$path" = "$api_doc" ] && continue
+                tagged_record_restored "$path" && continue
                 fail "11/11 api" "a released record under api/ changed: ${path}, only ${api_doc} may move"
             elif [ "$status" = "A" ]; then
                 [ "$path" = "$api_doc" ] || [ "$path" = "$api_export" ] || \
