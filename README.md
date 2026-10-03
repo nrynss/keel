@@ -42,6 +42,7 @@ else is pure Go, and `CGO_ENABLED=0` builds the whole module.
 | `caption` | Word timings to SRT and WebVTT subtitle files as a pure function, with cues grouped by line length and duration |
 | `erase` | A delete that finishes, fanned out over consumer targets with per-target progress, restart-safe resume, and a stuck report that names what is owed |
 | `edl` | A cut list rendered into one audio file, with merged ranges, crossfades or cuts at the joins, and two-pass loudness normalisation |
+| `bed` | A looping music bed mixed under a finished video, with gain and an end fade anchored to a known duration |
 | `waveform` | A still plus audio rendered to one video, with the waveform drawn over the scaled and padded still |
 | `lease` | Paid sessions with a time cap, a quota, a caller supplied kill switch, settle at close, provider reconciliation, and reclaim of abandoned rows |
 | `config` | TOML settings, and secret references that resolve from the environment, a file, a directory or a command, never holding a value in the file |
@@ -221,6 +222,22 @@ Loudness normalises in two passes: the first measures through the loudnorm filte
 applies the numbers the tool itself wrote. Pin ffmpeg 9.0.1 for this package, as the Install
 section says: the duration and loudness pins assert exactly on that version. Every invocation
 carries the caller's context, so a cancelled render stops the child.
+
+### Mix a music bed under a finished video
+
+```go
+err := bed.Mix(ctx, tools, bed.Config{}, bed.Input{
+    Film: "film.mp4", Bed: "bed.mp3", Duration: filmLength, Output: "mixed.mp4",
+})
+```
+
+`bed` loops or trims a music file under a finished video. The fade starts
+`Duration` minus the fade, two seconds by default, and reaches silence at the
+known end. The video stream is copied. The bed is gained on its own chain,
+and the mix does not normalise, so the film's audio stays at its own level.
+`Duration` is the length the caller already computed. The mix does not probe
+the file.
+
 
 ### Render a still plus audio to video
 
