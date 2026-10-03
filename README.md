@@ -38,6 +38,7 @@ else is pure Go, and `CGO_ENABLED=0` builds the whole module.
 | `sqlite` | One SQLite file with WAL, a writer handle, a read-only reader pool, namespaced migrations and online backup |
 | `ffmpeg` | ffmpeg and ffprobe bound to a context, with a bounded wait on shutdown |
 | `cost` | Money as integer nanodollars, a ledger of charges, budgets that refuse before a call, keyed budgets that divide one pool by owner, and a meter that runs one paid call |
+| `throttle` | Retry of a paid call that failed for a reason a wait can clear, with full-jitter backoff and an optional cap on how many calls run at once |
 | `flag` | Runtime flags an operator flips without a restart, read through to the store with a declared default for a missing row |
 | `caption` | Word timings to SRT and WebVTT subtitle files as a pure function, with cues grouped by line length and duration |
 | `erase` | A delete that finishes, fanned out over consumer targets with per-target progress, restart-safe resume, and a stuck report that names what is owed |
@@ -161,6 +162,25 @@ A `cost.Meter` runs one paid call against an account: it reserves the estimate, 
 settles the measured price, and frees the reservation on every failure path. A call that reports
 no usage settles at its estimate and says so in the returned `Usage`. `KeyedBudget.ForgetOwner`
 removes an owner's budget, reservations and settle history after its live reservations finish.
+
+### Retry a paid call that a wait can clear
+
+```go
+err := throttle.Retry(ctx, throttle.Config{}, func(err error) bool {
+    return errors.Is(err, errRateLimited)
+}, func() error {
+    return provider.Speak(ctx, page)
+})
+```
+
+`throttle` retries only the errors the caller classifies as worth a wait. The
+wait is full jitter across the upper half of each backoff, starting at 20
+seconds and doubling up to 90, so a fan-out refused together does not retry in
+lockstep. The call's own error comes back untouched. A cancelled context ends
+the wait and still returns that error. `throttle.New` caps how many calls run
+at once. The cap is held only while a call runs, and the backoff waits outside
+it. `cost.Meter` still reserves and settles. This package only paces the call.
+
 
 ### Flip a switch without a restart
 
