@@ -469,13 +469,16 @@ go test -run Example -v ./...
 
 ## Versioning
 
-Keel is on v0. The exported API is frozen in `api/v0.4.0.txt` with its `api/v0.4.0.export`
-baseline, and a check in CI fails on any change to them. The records are frozen for
-`linux/amd64`. They cover the surface the release shipped, including `flag`, `caption`,
-`erase`, `edl`, `waveform`, and `lease`. Version 0.4.0 adds deletion for finished job chains,
-owner budget state and completed leases. The `cost` keyed budgets ship with the paid call seam
-and the budget windows that restart a ceiling.
-Once v1 lands, a breaking change will need a major version.
+Keel is on v0. Each release freezes the exported API in a pair of records under `api/`.
+`api/vX.Y.Z.txt` is a readable `go doc -all` transcript, and `api/vX.Y.Z.export` is the binary
+baseline apidiff compares against. Both are taken on `linux/amd64`. Between releases the records
+do not move, and a check fails on any change to them. Ordinary work never touches `api/`, so
+new packages and new exports join a record at the next release.
+
+A release is the only writer. It adds exactly one pair for its version, and that version must
+be strictly newer than every record already there. `tools/freeze.sh vX.Y.Z` writes the pair,
+stages it, and runs the gate. A patch release may only add to the surface. While the module is
+on v0, a minor release may break it. Once v1 lands, a breaking change needs a major version.
 
 ## Development
 

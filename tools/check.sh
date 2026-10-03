@@ -40,16 +40,12 @@ staticcheck_version="v0.8.1"
 # the module's requirement set is frozen.
 apidiff_version="v0.0.0-20260908205506-85c1c2202aba"
 
-# Two records freeze the exported API, and both live under api/.
-# api_doc is the readable go doc -all transcript of the surface under
-# construction, which a diff can show and a reviewer can read. It moves with
-# the work. api_export is the binary export data of the latest release, which
-# the apidiff tool compares against. It never moves. apidiff reads no
-# transcript and a human reads no export data, so the formats stay separate on
-# purpose. A compatible addition updates the transcript. An incompatible
-# change fails against the release export.
-api_doc="api/v0.4.0.txt"
-api_export="api/v0.4.0.export"
+# The exported API is frozen as one pair of records per release, both under
+# api/: vX.Y.Z.txt is the readable go doc -all transcript, and vX.Y.Z.export
+# is the binary export data the apidiff tool compares against. The guard
+# below hardcodes no record name, so it judges whichever pair a release
+# stages. apidiff reads no transcript and a human reads no export data, so
+# the formats stay separate on purpose.
 
 # Both records are taken from one frozen build context, linux/amd64, which is
 # also the context CI runs on. The transcript is generated under it, so the same
@@ -241,18 +237,17 @@ header "10/11 conventions"
 go run ./tools/conventions || fail "10/11 conventions" "the convention breaches above must be fixed"
 passed
 
-# recorded_packages names the packages the transcript record covers, in the
-# order the record writes them. The guard covers the surface a release shipped,
-# so a package no release has carried yet is not compared against the record.
-# The transcript regenerates only listed packages, so a dropped package needs its header removed from the record.
-# Reviewers must diff the header list on release.
+# recorded_packages names the packages a transcript record covers, in the
+# order the record writes them: every package of the module except the tools
+# package, which serves this repository and no consumer. go list orders the
+# packages deterministically, so the same tree regenerates the same bytes.
 recorded_packages() {
-    sed -n 's/^########## //p' "$api_doc"
+    go list ./... | grep -v '/tools' || true
 }
 
 # regenerate_api_doc writes a go doc -all transcript of every recorded package
 # to the path in $1. Each package contributes a header line, so a regeneration
-# on an unchanged tree is byte for byte the same. Both calls run under the
+# on an unchanged tree is byte for byte the same. The call runs under the
 # frozen build context named above, so the transcript is host independent.
 regenerate_api_doc() {
     local dest=$1
@@ -261,152 +256,173 @@ regenerate_api_doc() {
     while IFS= read -r pkg; do
         printf '########## %s\n' "$pkg" >> "$dest"
         GOOS="$frozen_goos" GOARCH="$frozen_goarch" go doc -all "$pkg" >> "$dest" \
-            || fail "11/11 api" "${pkg} is named by ${api_doc} and no longer resolves"
+            || fail "11/11 api" "${pkg} could not be documented under the frozen context"
         printf '\n' >> "$dest"
     done < <(recorded_packages)
 }
 
-# Check 11: the exported API matches both records, taken from the one frozen
-# build context named above, linux/amd64, which CI also runs on. The transcript
-# half regenerates under that context, so the same bytes come out on any host.
-# The conventions check keeps every file inside that context, so a file from
-# another context cannot grow the surface the records never see.
+# api_version_lt reports whether version $1 sorts before version $2, both vX.Y.Z.
+api_version_lt() {
+    local -a a b
+    IFS=. read -r -a a <<< "${1#v}"
+    IFS=. read -r -a b <<< "${2#v}"
+    if [ "${a[0]}" -ne "${b[0]}" ]; then
+        [ "${a[0]}" -lt "${b[0]}" ]
+    elif [ "${a[1]}" -ne "${b[1]}" ]; then
+        [ "${a[1]}" -lt "${b[1]}" ]
+    else
+        [ "${a[2]}" -lt "${b[2]}" ]
+    fi
+}
+
+# Check 11: the records under api/ freeze what a release shipped. A release is
+# their only writer. Between releases the gate asks one question: did any
+# released byte move? A modification or a deletion refuses outright, read from
+# both views, because a commit carries the index and not the working tree. The
+# surface a release shipped stays intact even while the tree moves on. A new
+# package or a new export joins a record at the next release, so an ordinary
+# task never touches api/ at all and this check costs nothing there.
 #
-# The export record stays at the last release. apidiff refuses every
-# incompatible change against it, whether or not a recorded package carries it.
-# The transcript record describes the surface under construction. It fails on
-# any visible change inside a recorded package until it is updated. Every other
-# record under api/ stays frozen, except for an exact restoration from its
-# version tag with matching worktree and index bytes.
+# The release pair is the one sanctioned addition, and it is judged hard, on
+# the index bytes the commit carries. The pair is exactly one transcript and
+# one export record of one version, and that version is strictly newer than
+# every record already on disk. The transcript must equal a fresh regeneration
+# over the recorded packages under the frozen context, and apidiff must find
+# the export identical to the build, so the pair is honest about the tree it
+# freezes. Incompatible changes then face the bump policy, judged by running
+# apidiff of the previous export against the build: while the module is on v0
+# a minor bump may break and a patch may not, and from v1 only a major bump
+# may. tools/freeze.sh writes the pair and runs this gate, so a release PR
+# arrives already judged.
 header "11/11 api"
-# Released records stay frozen, except when both the worktree and index restore
-# the exact transcript from its existing version tag. The guard reads both
-# views because the commit carries the index, not the worktree.
-#
-# Two moves are sanctioned, the rename and the pair-add. A rename births a
-# new pair, the new transcript and its export record, so it adds both
-# records of the pair, deletes the old transcript path, and repoints the
-# variables in this script. A pair-add does the same without the deletion,
-# so a patch release keeps its predecessor as a frozen record. A commit
-# carries the index, but a plain diff judges the working tree. The guard
-# therefore reads the change rows from both views, drops duplicate rows,
-# and judges every merged row once. A row passes only against the pair
-# variables or the transcript path that HEAD gated, which it reads from
-# HEAD, so no record name is hardcoded. The regeneration runs before the
-# rows, so the deletion sanction compares the staged successor against
-# fresh bytes. The rename move stages the successor of the old transcript
-# path. The guard compares that staged copy, the bytes the commit carries,
-# against the regeneration and accepts the deletion only on a byte-identical
-# match, so a stale or dishonest successor fails. After the rows the guard
-# asks the index for the old path and refuses it by name, unless the old
-# path carries no change in either view, which is the pair-add keeping its
-# predecessor frozen. Every changed byte still passes through the row
-# judging above, so an untouched predecessor smuggles nothing in. A cached
-# row on the transcript or the export also arms an index-side content judge
-# over the staged bytes. The worktree view arms nothing, because the commit
-# carries index bytes alone. That judge regenerates the transcript or runs
-# apidiff on the index copy and refuses a mismatch by name. The guard names
-# the first record it refuses and exits there, fail-fast by design.
-doc_at_head=$(git show HEAD:tools/check.sh | sed -n 's/^api_doc="\(.*\)"$/\1/p')
-doc_row=
-export_row=
-cached_doc_rows=$(git diff --cached --name-status --no-renames HEAD -- "${api_doc}" | cut -f1 | sort -u | tr -d '\n')
-case "${cached_doc_rows}" in *[MA]*) doc_row=1 ;; esac
-cached_export_rows=$(git diff --cached --name-status --no-renames HEAD -- "${api_export}" | cut -f1 | sort -u | tr -d '\n')
-case "${cached_export_rows}" in *A*) export_row=1 ;; esac
 api_tmp=$(mktemp -d)
-regenerate_api_doc "$api_tmp/regen.txt"
-rows=$({
+
+api_rows=$({
     git diff --name-status --no-renames HEAD -- api/
     git diff --cached --name-status --no-renames HEAD -- api/
 } | sort -u)
-stale_index() {
-    [ -n "$doc_at_head" ] && [ "$doc_at_head" != "$api_doc" ] \
-        && [ -n "$(git ls-files -- "$doc_at_head")" ]
-}
-# stale_untouched reports that the previous transcript path carries no change
-# in either view. A pair-add release keeps that path as a frozen record, so
-# an untouched predecessor is not a leftover. Every changed byte still went
-# through the row judging, so the exemption smuggles nothing in.
-stale_untouched() {
-    [ -z "$(git diff --name-status --no-renames HEAD -- "${doc_at_head}")" ] \
-        && [ -z "$(git diff --cached --name-status --no-renames HEAD -- "${doc_at_head}")" ]
-}
-tagged_record_restored() {
-    local path=$1 tag
-    [[ "$path" =~ ^api/(v[0-9]+\.[0-9]+\.[0-9]+)\.txt$ ]] || return 1
-    tag=${BASH_REMATCH[1]}
-    git show-ref --verify --quiet "refs/tags/${tag}" || return 1
-    git show "${tag}:${path}" > "$api_tmp/tagged-record.txt" 2>/dev/null || return 1
-    cmp -s "$api_tmp/tagged-record.txt" "$path" || return 1
-    git show ":${path}" > "$api_tmp/index-record.txt" 2>/dev/null || return 1
-    cmp -s "$api_tmp/tagged-record.txt" "$api_tmp/index-record.txt"
-}
-if [ -n "$rows" ] || stale_index; then
-    if [ -n "$rows" ]; then
-        while IFS=$'\t' read -r status path; do
-            if [ "$status" = "M" ]; then
-                [ "$path" = "$api_doc" ] && continue
-                tagged_record_restored "$path" && continue
-                fail "11/11 api" "a released record under api/ changed: ${path}, only ${api_doc} may move"
-            elif [ "$status" = "A" ]; then
-                [ "$path" = "$api_doc" ] || [ "$path" = "$api_export" ] || \
-                    fail "11/11 api" "a new record under api/ was added: ${path}, only the release pair ${api_doc} and ${api_export} may appear"
-            elif [ "$status" = "D" ]; then
-                if [ "$path" = "$doc_at_head" ] && [ -n "$doc_at_head" ] \
-                        && [ "$doc_at_head" != "$api_doc" ] \
-                        && git show ":${api_doc}" > "$api_tmp/successor.txt" 2>/dev/null \
-                        && cmp -s "$api_tmp/successor.txt" "$api_tmp/regen.txt"; then
-                    continue
+# An untracked file under api/ refuses too: a generated pair that was never
+# staged is a record no reviewer and no CI run will ever see.
+api_strays=$(git status --porcelain -- api/ | sed -n 's/^?? //p')
+if [ -n "$api_strays" ]; then
+    printf '%s\n' "$api_strays"
+    fail "11/11 api" "untracked files above sit under api/, stage the release pair or remove the strays"
+fi
+
+# Any row that is not an addition moved a released record. History does not
+# move, so no exemption exists. A genuinely broken record is fixed the only
+# way records are written, by a release.
+api_moved=$(printf '%s\n' "$api_rows" | grep -v '^A' | cut -f2- || true)
+if [ -n "$api_moved" ]; then
+    fail "11/11 api" "a released record changed: ${api_moved}, releases add records and never move them"
+fi
+
+api_added=$(printf '%s\n' "$api_rows" | grep '^A' | cut -f2 || true)
+if [ -z "$api_added" ]; then
+    # Nothing under api/ moved, the ordinary path between releases. The tree
+    # may grow, shrink or change freely. The next release picks the surface up.
+    passed
+else
+    api_pair_fail() {
+        printf '%s\n' "$api_added"
+        fail "11/11 api" "$1"
+    }
+    if [ "$(printf '%s\n' "$api_added" | grep -c '\.txt$')" -ne 1 ] \
+            || [ "$(printf '%s\n' "$api_added" | grep -c '\.export$')" -ne 1 ] \
+            || [ "$(printf '%s\n' "$api_added" | wc -l)" -ne 2 ]; then
+        api_pair_fail "a release adds exactly one pair, api/vX.Y.Z.txt and api/vX.Y.Z.export, nothing else"
+    fi
+    api_doc_added=$(printf '%s\n' "$api_added" | grep '\.txt$')
+    api_export_added=$(printf '%s\n' "$api_added" | grep '\.export$')
+    api_new=${api_doc_added#api/}
+    api_new=${api_new%.txt}
+    [[ "$api_new" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+        || api_pair_fail "the transcript record ${api_doc_added} does not name a vX.Y.Z version"
+    api_new_export=${api_export_added#api/}
+    api_new_export=${api_new_export%.export}
+    [ "$api_new_export" = "$api_new" ] \
+        || api_pair_fail "the transcript and the export record name different versions, ${api_new} and ${api_new_export}"
+
+    # The version moves forward. Records at HEAD are the released history.
+    api_prev=""
+    while IFS= read -r path; do
+        case "$path" in
+            api/v*.txt)
+                v=${path#api/}
+                v=${v%.txt}
+                if [ -z "$api_prev" ] || api_version_lt "$api_prev" "$v"; then
+                    api_prev=$v
                 fi
-                fail "11/11 api" "a released record under api/ was deleted: ${path}, only the move to ${api_doc} is sanctioned"
+                ;;
+        esac
+    done < <(git ls-tree HEAD --name-only -- api/)
+    if [ -n "$api_prev" ] && ! api_version_lt "$api_prev" "$api_new"; then
+        api_pair_fail "the new record ${api_new} is not strictly newer than ${api_prev}, a release moves forward"
+    fi
+
+    regenerate_api_doc "$api_tmp/regen.txt"
+    git show ":${api_doc_added}" > "$api_tmp/staged.txt" \
+        || fail "11/11 api" "the staged ${api_doc_added} could not be read from the index"
+    diff -u "$api_tmp/staged.txt" "$api_tmp/regen.txt" \
+        || fail "11/11 api" "the staged transcript ${api_doc_added} does not match the regenerated record, see the diff above"
+
+    # The pinned apidiff refuses to build when GOOS is set for its own build, so
+    # build it once for the host and run that binary under the frozen context.
+    # GOBIN keeps the tool out of go.mod.
+    mkdir -p "$api_tmp/bin"
+    GOBIN="$api_tmp/bin" go install "golang.org/x/exp/cmd/apidiff@${apidiff_version}" \
+        || fail "11/11 api" "apidiff could not be installed at ${apidiff_version}"
+    git show ":${api_export_added}" > "$api_tmp/staged.export" \
+        || fail "11/11 api" "the staged ${api_export_added} could not be read from the index"
+    api_report=$(GOOS="$frozen_goos" GOARCH="$frozen_goarch" "$api_tmp/bin/apidiff" -incompatible -m "$api_tmp/staged.export" "$(go list -m)") \
+        || fail "11/11 api" "apidiff could not compare the staged ${api_export_added} against the build"
+    if [ -n "$api_report" ]; then
+        printf '%s\n' "$api_report"
+        fail "11/11 api" "the staged ${api_export_added} does not match the build, regenerate it with tools/freeze.sh"
+    fi
+
+    # The bump policy. apidiff of the previous export against the build names
+    # every incompatible change the release carries, except one: a package the
+    # build drops simply leaves no trace in the new export, and apidiff ignores
+    # what the previous record names and the build does not carry. The
+    # transcript header lists carry that truth, so a package present in the
+    # previous record and absent from the new one joins the breaks report and
+    # faces the same policy as any other incompatible change.
+    if [ -n "$api_prev" ]; then
+        git show "HEAD:api/${api_prev}.txt" | sed -n 's/^########## //p' | sort -u > "$api_tmp/prev-headers.txt"
+        sed -n 's/^########## //p' "$api_tmp/regen.txt" | sort -u > "$api_tmp/new-headers.txt"
+        api_removed=$(comm -23 "$api_tmp/prev-headers.txt" "$api_tmp/new-headers.txt")
+        git show "HEAD:api/${api_prev}.export" > "$api_tmp/previous.export" \
+            || fail "11/11 api" "the previous record api/${api_prev}.export is missing from HEAD"
+        api_breaks=$(GOOS="$frozen_goos" GOARCH="$frozen_goarch" "$api_tmp/bin/apidiff" -incompatible -m "$api_tmp/previous.export" "$(go list -m)") \
+            || fail "11/11 api" "apidiff could not compare ${api_prev} against the build"
+        if [ -n "$api_removed" ]; then
+            printf '%s\n' "$api_removed"
+            api_breaks="${api_breaks}
+removed packages above are incompatible and were never reported by apidiff"
+        fi
+        if [ -n "$api_breaks" ]; then
+            IFS=. read -r prev_major prev_minor _ <<< "${api_prev#v}"
+            IFS=. read -r new_major new_minor _ <<< "${api_new#v}"
+            allowed=0
+            if [ "$prev_major" -eq 0 ]; then
+                # On v0 a minor bump may break the surface, a patch may not.
+                if [ "$new_major" -gt 0 ] || [ "$new_minor" -gt "$prev_minor" ]; then
+                    allowed=1
+                fi
+                api_want="a minor bump"
             else
-                fail "11/11 api" "a record under api/ changed: ${path}, status ${status} is not sanctioned"
+                # From v1 only a major bump may break the surface.
+                [ "$new_major" -gt "$prev_major" ] && allowed=1
+                api_want="a major bump"
             fi
-        done <<<"$rows"
+            if [ "$allowed" -ne 1 ]; then
+                printf '%s\n' "$api_breaks"
+                fail "11/11 api" "${api_new} breaks the surface ${api_prev} shipped, an incompatible change needs ${api_want}"
+            fi
+        fi
     fi
-    if stale_index && ! stale_untouched; then
-        fail "11/11 api" "the stale record ${doc_at_head} is still staged, a release leaves no record at the old transcript path"
-    fi
+    passed
 fi
-if ! diff -u "$api_doc" "$api_tmp/regen.txt"; then
-    fail "11/11 api" "the exported API differs from ${api_doc}, see the diff above"
-fi
-# A cached transcript row only cleared the path rules. The cached view
-# alone arms this judge, so it runs exactly when the commit carries
-# changed transcript bytes.
-if [ -n "$doc_row" ]; then
-    git show ":${api_doc}" > "$api_tmp/index-doc.txt" \
-        || fail "11/11 api" "the staged ${api_doc} could not be read from the index"
-    regenerate_api_doc "$api_tmp/index-regen.txt"
-    if ! diff -u "$api_tmp/index-doc.txt" "$api_tmp/index-regen.txt"; then
-        fail "11/11 api" "the committed transcript ${api_doc} differs from the regenerated API, refusing it"
-    fi
-fi
-# The pinned apidiff refuses to run when GOOS is set for its own build, so build
-# it once for the host and run that binary under the frozen context. GOBIN keeps
-# the tool out of go.mod.
-mkdir -p "$api_tmp/bin"
-GOBIN="$api_tmp/bin" go install "golang.org/x/exp/cmd/apidiff@${apidiff_version}" \
-    || fail "11/11 api" "apidiff could not be installed at ${apidiff_version}"
-api_report=$(GOOS="$frozen_goos" GOARCH="$frozen_goarch" "$api_tmp/bin/apidiff" -incompatible -m "$api_export" "$(go list -m)") \
-    || fail "11/11 api" "apidiff could not compare against ${api_export}"
-if [ -n "$api_report" ]; then
-    printf '%s\n' "$api_report"
-    fail "11/11 api" "apidiff reports an incompatible change against ${api_export}, see the report above"
-fi
-# A cached export row arms the same index-side judge. apidiff runs
-# against the staged export bytes, the copy the commit carries.
-if [ -n "$export_row" ]; then
-    git show ":${api_export}" > "$api_tmp/index-export" \
-        || fail "11/11 api" "the staged ${api_export} could not be read from the index"
-    index_report=$(GOOS="$frozen_goos" GOARCH="$frozen_goarch" "$api_tmp/bin/apidiff" -incompatible -m "$api_tmp/index-export" "$(go list -m)") \
-        || fail "11/11 api" "apidiff could not compare against the staged ${api_export}"
-    if [ -n "$index_report" ]; then
-        printf '%s\n' "$index_report"
-        fail "11/11 api" "apidiff reports an incompatible change in the staged ${api_export}, refusing it"
-    fi
-fi
-passed
 
 echo "all checks passed"
