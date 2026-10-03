@@ -40,6 +40,7 @@ else is pure Go, and `CGO_ENABLED=0` builds the whole module.
 | `cost` | Money as integer nanodollars, a ledger of charges, budgets that refuse before a call, keyed budgets that divide one pool by owner, and a meter that runs one paid call |
 | `flag` | Runtime flags an operator flips without a restart, read through to the store with a declared default for a missing row |
 | `caption` | Word timings to SRT and WebVTT subtitle files as a pure function, with cues grouped by line length and duration |
+| `film` | A title card, captioned stills, and an end card joined by a stream copy, with the length computed in Go |
 | `erase` | A delete that finishes, fanned out over consumer targets with per-target progress, restart-safe resume, and a stuck report that names what is owed |
 | `edl` | A cut list rendered into one audio file, with merged ranges, crossfades or cuts at the joins, and two-pass loudness normalisation |
 | `waveform` | A still plus audio rendered to one video, with the waveform drawn over the scaled and padded still |
@@ -233,6 +234,33 @@ still. The default frame is 1920 by 1080. The still scales to fit and pads out t
 frame, so another aspect ratio keeps its shape rather than stretching. The audio stream copies
 into the output and never passes an encoder. Pin ffmpeg 9.0.1 for this package, as the Install
 section says. Every render carries the caller context, so a cancelled render stops the child.
+
+### Assemble a captioned still film
+
+```go
+length, err := film.Render(ctx, tools, film.Config{
+    FontFile: "Face.ttf",
+    EndTitle: "The end",
+}, film.Input{
+    Title: "A story",
+    Output: "film.mp4",
+    Pages: []film.Page{{
+        ImagePath: "page.png",
+        Text:      "The gate opens.",
+        AudioPath: "page.mp3",
+        Duration:  clip,
+    }},
+})
+```
+
+`film` builds a title card, one segment per page, and an end card, then joins
+them with a stream copy. Every segment is 1080 by 1620. The page caption is
+wrapped in Go and burned in from a text file, which is separate from the
+word-timed cues in `caption`. A narrated page is held for the duration the
+caller measured. A silent page is held for `film.SilentHold`. `Render` returns
+that sum and does not probe the file. `film.Total` is the same sum without
+rendering, which is what a later mix anchors a fade to.
+
 
 ### Bound a paid session with a lease
 
