@@ -37,6 +37,7 @@ else is pure Go, and `CGO_ENABLED=0` builds the whole module.
 | `upload` | Resumable chunked uploads that land in `mediastore`, resumable by id after a dropped connection |
 | `sqlite` | One SQLite file with WAL, a writer handle, a read-only reader pool, namespaced migrations and online backup |
 | `ffmpeg` | ffmpeg and ffprobe bound to a context, with a bounded wait on shutdown |
+| `duration` | WAV and MP3 length read from the bytes themselves, for a runtime that ships ffmpeg without ffprobe |
 | `cost` | Money as integer nanodollars, a ledger of charges, budgets that refuse before a call, keyed budgets that divide one pool by owner, and a meter that runs one paid call |
 | `flag` | Runtime flags an operator flips without a restart, read through to the store with a declared default for a missing row |
 | `caption` | Word timings to SRT and WebVTT subtitle files as a pure function, with cues grouped by line length and duration |
@@ -233,6 +234,18 @@ still. The default frame is 1920 by 1080. The still scales to fit and pads out t
 frame, so another aspect ratio keeps its shape rather than stretching. The audio stream copies
 into the output and never passes an encoder. Pin ffmpeg 9.0.1 for this package, as the Install
 section says. Every render carries the caller context, so a cancelled render stops the child.
+
+### Read a clip's length without ffprobe
+
+```go
+d, err := duration.Read(clip)
+```
+
+`duration` reads a WAV from its fmt and data chunks, and an MP3 from its
+frame headers. A Xing or Info count is trimmed by the encoder delay and tail
+padding when a LAME, Lavf, or Lavc tag carries them, which is the playable
+length. `ffmpeg.Duration` stays the measurement when ffprobe is installed.
+
 
 ### Bound a paid session with a lease
 
