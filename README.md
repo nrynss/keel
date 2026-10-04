@@ -43,6 +43,7 @@ else is pure Go, and `CGO_ENABLED=0` builds the whole module.
 | `flag` | Runtime flags an operator flips without a restart, read through to the store with a declared default for a missing row |
 | `caption` | Word timings to SRT and WebVTT subtitle files as a pure function, with cues grouped by line length and duration |
 | `film` | A title card, captioned stills, and an end card joined by a stream copy, with the length computed in Go |
+| `book` | An illustrated PDF of image pages and captions, with the font, margins and page size injected |
 | `erase` | A delete that finishes, fanned out over consumer targets with per-target progress, restart-safe resume, and a stuck report that names what is owed |
 | `edl` | A cut list rendered into one audio file, with merged ranges, crossfades or cuts at the joins, and two-pass loudness normalisation |
 | `bed` | A looping music bed mixed under a finished video, with gain and an end fade anchored to a known duration |
@@ -55,7 +56,7 @@ The stores that need SQLite live one directory down, in `job/sqlitestore`,
 `mediastore/sqlitestore`, `cost/sqlitestore`, `flag/sqlitestore` and
 `lease/sqlitestore`. Only those packages import a SQLite driver, so an
 app that uses `gate` alone never compiles one. The TOML parser stays the same way behind `config`
-and `config/source`, so an app that uses `gate` alone never compiles it either.
+and `config/source`, so an app that uses `gate` alone never compiles it either. The PDF library stays behind `book` the same way.
 
 ## Using it
 
@@ -330,6 +331,28 @@ sync have succeeded, so a failed or cancelled publish leaves the previous
 file in place. Renders that name the same output are not queued. The last
 successful rename is the file a reader sees.
 
+### Assemble an illustrated PDF
+
+```go
+var pdf bytes.Buffer
+err := book.Write(ctx, &pdf, book.Config{
+    FontDir:  "fonts",
+    FontFile: "Face.ttf",
+}, []book.Page{{
+    Image:     png,
+    ImageType: "png",
+    Caption:   "The gate opens.",
+}})
+```
+
+`book` draws one sheet per page: the image fitted inside the margins, and the
+caption under it. The face is a file name inside `FontDir`, so a caption cannot
+point the loader at an arbitrary path. Image-only pages need no font. A caption
+taller than the page, or one that leaves no room for the image, is refused, and
+so is a page with neither an image nor a caption. Caption height is measured in
+runes, so a non-ASCII caption is not accepted when it would run past the margin.
+The PDF library does not shape complex scripts. `Write` returns an error,
+including when the PDF library panics, and a cancelled context writes nothing.
 
 ### Bound a paid session with a lease
 
@@ -583,9 +606,9 @@ on v0, a minor release may break it. Once v1 lands, a breaking change needs a ma
 ./tools/check.sh
 ```
 
-That runs the same eleven checks CI runs: formatting, vet, staticcheck, a `CGO_ENABLED=0` build,
-the race-enabled tests, two content scans, two dependency-boundary checks that keep SQLite and the
-TOML parser inside their packages, a convention checker, and the frozen-API diff. It needs
+That runs the same twelve checks CI runs: formatting, vet, staticcheck, a `CGO_ENABLED=0` build,
+the race-enabled tests, two content scans, three dependency-boundary checks that keep SQLite, the
+TOML parser and the PDF library inside their packages, a convention checker, and the frozen-API diff. It needs
 `ffmpeg` and `ffprobe` on `PATH` for the media tests.
 
 ## License

@@ -85,7 +85,7 @@ done
 # temporary directory and runs gofmt over those copies. It judges nothing
 # else: not the worktree copies, and not the gitignored probe files the
 # worktree happens to hold.
-header "1/11 gofmt"
+header "1/12 gofmt"
 gofmt_tmp=$(mktemp -d)
 api_tmp=
 trap 'rm -rf "$gofmt_tmp" "$api_tmp"' EXIT
@@ -94,11 +94,11 @@ if ! unformatted=$(
     cd "$gofmt_tmp"
     find . -type f -print0 | xargs -0 -r gofmt -l | sed 's|^\./||'
 ); then
-    fail "1/11 gofmt" "gofmt could not read the indexed copies"
+    fail "1/12 gofmt" "gofmt could not read the indexed copies"
 fi
 if [ -n "$unformatted" ]; then
     printf '%s\n' "$unformatted"
-    fail "1/11 gofmt" "files above need gofmt -w"
+    fail "1/12 gofmt" "files above need gofmt -w"
 fi
 passed
 
@@ -108,33 +108,33 @@ packages=$(go list ./... 2>/dev/null || true)
 
 if [ -n "$packages" ]; then
     # Check 2: the Go vet suite passes.
-    header "2/11 go vet"
-    go vet ./... || fail "2/11 go vet" "go vet found problems"
+    header "2/12 go vet"
+    go vet ./... || fail "2/12 go vet" "go vet found problems"
     passed
 
     # Check 3: staticcheck passes at the pinned version.
-    header "3/11 staticcheck"
+    header "3/12 staticcheck"
     go run "honnef.co/go/tools/cmd/staticcheck@${staticcheck_version}" ./... \
-        || fail "3/11 staticcheck" "staticcheck found problems"
+        || fail "3/12 staticcheck" "staticcheck found problems"
     passed
 
     # Check 4: every package builds without cgo.
-    header "4/11 build"
+    header "4/12 build"
     # A cgo-only directory vanishes from ./... under CGO_ENABLED=0.
     # go build then warns and exits 0, so compare the package lists as well.
     packages_cgo=$(CGO_ENABLED=1 go list ./... 2>/dev/null || true)
     packages_nocgo=$(CGO_ENABLED=0 go list ./... 2>/dev/null || true)
     missing_packages=$(comm -23 <(sort <<<"$packages_cgo") <(sort <<<"$packages_nocgo"))
-    CGO_ENABLED=0 go build ./... || fail "4/11 build" "build failed with CGO disabled"
+    CGO_ENABLED=0 go build ./... || fail "4/12 build" "build failed with CGO disabled"
     if [ -n "$missing_packages" ]; then
         printf '%s\n' "$missing_packages"
-        fail "4/11 build" "packages above disappear when cgo is disabled"
+        fail "4/12 build" "packages above disappear when cgo is disabled"
     fi
     passed
 
     # Check 5: the test suite passes under the race detector.
-    header "5/11 test"
-    go test -race ./... || fail "5/11 test" "tests failed under the race detector"
+    header "5/12 test"
+    go test -race ./... || fail "5/12 test" "tests failed under the race detector"
     passed
 else
     echo "== checks 2 to 5 (go vet, staticcheck, build, test) =="
@@ -146,23 +146,23 @@ fi
 # The binary fixtures carry every short byte sequence by chance, and chance is not a citation.
 # A text file named *.bin holds real words, and grep still scans it.
 # Check 6: no consumer name in a tracked file.
-header "6/11 consumer names"
+header "6/12 consumer names"
 if [ "${#scanned_files[@]}" -gt 0 ]; then
     hits=$(grep -l -i -E -I -e "$consumer_re" -- "${scanned_files[@]}" || true)
     if [ -n "$hits" ]; then
         printf '%s\n' "$hits"
-        fail "6/11 consumer names" "tracked files above name a consumer"
+        fail "6/12 consumer names" "tracked files above name a consumer"
     fi
 fi
 passed
 
 # Check 7: no planning reference in a tracked file.
-header "7/11 plan references"
+header "7/12 plan references"
 if [ "${#scanned_files[@]}" -gt 0 ]; then
     hits=$(grep -l -i -E -I -e "$plan_re" -- "${scanned_files[@]}" || true)
     if [ -n "$hits" ]; then
         printf '%s\n' "$hits"
-        fail "7/11 plan references" "tracked files above cite planning"
+        fail "7/12 plan references" "tracked files above cite planning"
     fi
 fi
 passed
@@ -171,11 +171,14 @@ passed
 # Each row is a module path and the import-path globs allowed to depend on it.
 # modernc.org/sqlite -> */sqlite, */sqlite/*, */sqlitestore, */sqlitestore/*
 # github.com/pelletier/go-toml/v2 -> */config, */config/source, */config/source/*
-# Check 8 walks the sqlite row. Check 9 walks the parser row.
+# github.com/go-pdf/fpdf -> */book, */book/*
+# Check 8 walks the sqlite row. Check 9 walks the parser row. Check 10 walks the pdf row.
 edge_sqlite_module="modernc.org/sqlite"
 edge_sqlite_prefixes=("*/sqlite" "*/sqlite/*" "*/sqlitestore" "*/sqlitestore/*")
 edge_parser_module="github.com/pelletier/go-toml/v2"
 edge_parser_prefixes=("*/config" "*/config/source" "*/config/source/*")
+edge_pdf_module="github.com/go-pdf/fpdf"
+edge_pdf_prefixes=("*/book" "*/book/*")
 
 # check_edge walks every package against one table row.
 # $1 is the check label. $2 is the module. The rest are allowed globs.
@@ -215,26 +218,35 @@ check_edge() {
 }
 
 # Check 8: only packages built to wrap sqlite may depend on its driver.
-header "8/11 sqlite edge"
+header "8/12 sqlite edge"
 if [ -z "$packages" ]; then
     echo "no packages yet, skipping"
 else
-    check_edge "8/11 sqlite edge" "$edge_sqlite_module" "${edge_sqlite_prefixes[@]}"
+    check_edge "8/12 sqlite edge" "$edge_sqlite_module" "${edge_sqlite_prefixes[@]}"
     passed
 fi
 
 # Check 9: only packages built to parse settings may depend on the parser.
-header "9/11 toml edge"
+header "9/12 toml edge"
 if [ -z "$packages" ]; then
     echo "no packages yet, skipping"
 else
-    check_edge "9/11 toml edge" "$edge_parser_module" "${edge_parser_prefixes[@]}"
+    check_edge "9/12 toml edge" "$edge_parser_module" "${edge_parser_prefixes[@]}"
     passed
 fi
 
-# Check 10: the four Go conventions that gofmt, vet and staticcheck cannot see.
-header "10/11 conventions"
-go run ./tools/conventions || fail "10/11 conventions" "the convention breaches above must be fixed"
+# Check 10: only the book package may depend on the PDF library.
+header "10/12 pdf edge"
+if [ -z "$packages" ]; then
+    echo "no packages yet, skipping"
+else
+    check_edge "10/12 pdf edge" "$edge_pdf_module" "${edge_pdf_prefixes[@]}"
+    passed
+fi
+
+# Check 11: the four Go conventions that gofmt, vet and staticcheck cannot see.
+header "11/12 conventions"
+go run ./tools/conventions || fail "11/12 conventions" "the convention breaches above must be fixed"
 passed
 
 # recorded_packages names the packages a transcript record covers, in the
@@ -256,7 +268,7 @@ regenerate_api_doc() {
     while IFS= read -r pkg; do
         printf '########## %s\n' "$pkg" >> "$dest"
         GOOS="$frozen_goos" GOARCH="$frozen_goarch" go doc -all "$pkg" >> "$dest" \
-            || fail "11/11 api" "${pkg} could not be documented under the frozen context"
+            || fail "12/12 api" "${pkg} could not be documented under the frozen context"
         printf '\n' >> "$dest"
     done < <(recorded_packages)
 }
@@ -275,7 +287,7 @@ api_version_lt() {
     fi
 }
 
-# Check 11: the records under api/ freeze what a release shipped. A release is
+# Check 12: the records under api/ freeze what a release shipped. A release is
 # their only writer. Between releases the gate asks one question: did any
 # released byte move? A modification or a deletion refuses outright, read from
 # both views, because a commit carries the index and not the working tree. The
@@ -294,7 +306,7 @@ api_version_lt() {
 # a minor bump may break and a patch may not, and from v1 only a major bump
 # may. tools/freeze.sh writes the pair and runs this gate, so a release PR
 # arrives already judged.
-header "11/11 api"
+header "12/12 api"
 api_tmp=$(mktemp -d)
 
 api_rows=$({
@@ -306,7 +318,7 @@ api_rows=$({
 api_strays=$(git status --porcelain -- api/ | sed -n 's/^?? //p')
 if [ -n "$api_strays" ]; then
     printf '%s\n' "$api_strays"
-    fail "11/11 api" "untracked files above sit under api/, stage the release pair or remove the strays"
+    fail "12/12 api" "untracked files above sit under api/, stage the release pair or remove the strays"
 fi
 
 # Any row that is not an addition moved a released record. History does not
@@ -314,7 +326,7 @@ fi
 # way records are written, by a release.
 api_moved=$(printf '%s\n' "$api_rows" | grep -v '^A' | cut -f2- || true)
 if [ -n "$api_moved" ]; then
-    fail "11/11 api" "a released record changed: ${api_moved}, releases add records and never move them"
+    fail "12/12 api" "a released record changed: ${api_moved}, releases add records and never move them"
 fi
 
 api_added=$(printf '%s\n' "$api_rows" | grep '^A' | cut -f2 || true)
@@ -325,7 +337,7 @@ if [ -z "$api_added" ]; then
 else
     api_pair_fail() {
         printf '%s\n' "$api_added"
-        fail "11/11 api" "$1"
+        fail "12/12 api" "$1"
     }
     if [ "$(printf '%s\n' "$api_added" | grep -c '\.txt$')" -ne 1 ] \
             || [ "$(printf '%s\n' "$api_added" | grep -c '\.export$')" -ne 1 ] \
@@ -362,23 +374,23 @@ else
 
     regenerate_api_doc "$api_tmp/regen.txt"
     git show ":${api_doc_added}" > "$api_tmp/staged.txt" \
-        || fail "11/11 api" "the staged ${api_doc_added} could not be read from the index"
+        || fail "12/12 api" "the staged ${api_doc_added} could not be read from the index"
     diff -u "$api_tmp/staged.txt" "$api_tmp/regen.txt" \
-        || fail "11/11 api" "the staged transcript ${api_doc_added} does not match the regenerated record, see the diff above"
+        || fail "12/12 api" "the staged transcript ${api_doc_added} does not match the regenerated record, see the diff above"
 
     # The pinned apidiff refuses to build when GOOS is set for its own build, so
     # build it once for the host and run that binary under the frozen context.
     # GOBIN keeps the tool out of go.mod.
     mkdir -p "$api_tmp/bin"
     GOBIN="$api_tmp/bin" go install "golang.org/x/exp/cmd/apidiff@${apidiff_version}" \
-        || fail "11/11 api" "apidiff could not be installed at ${apidiff_version}"
+        || fail "12/12 api" "apidiff could not be installed at ${apidiff_version}"
     git show ":${api_export_added}" > "$api_tmp/staged.export" \
-        || fail "11/11 api" "the staged ${api_export_added} could not be read from the index"
+        || fail "12/12 api" "the staged ${api_export_added} could not be read from the index"
     api_report=$(GOOS="$frozen_goos" GOARCH="$frozen_goarch" "$api_tmp/bin/apidiff" -incompatible -m "$api_tmp/staged.export" "$(go list -m)") \
-        || fail "11/11 api" "apidiff could not compare the staged ${api_export_added} against the build"
+        || fail "12/12 api" "apidiff could not compare the staged ${api_export_added} against the build"
     if [ -n "$api_report" ]; then
         printf '%s\n' "$api_report"
-        fail "11/11 api" "the staged ${api_export_added} does not match the build, regenerate it with tools/freeze.sh"
+        fail "12/12 api" "the staged ${api_export_added} does not match the build, regenerate it with tools/freeze.sh"
     fi
 
     # The bump policy. apidiff of the previous export against the build names
@@ -393,9 +405,9 @@ else
         sed -n 's/^########## //p' "$api_tmp/regen.txt" | sort -u > "$api_tmp/new-headers.txt"
         api_removed=$(comm -23 "$api_tmp/prev-headers.txt" "$api_tmp/new-headers.txt")
         git show "HEAD:api/${api_prev}.export" > "$api_tmp/previous.export" \
-            || fail "11/11 api" "the previous record api/${api_prev}.export is missing from HEAD"
+            || fail "12/12 api" "the previous record api/${api_prev}.export is missing from HEAD"
         api_breaks=$(GOOS="$frozen_goos" GOARCH="$frozen_goarch" "$api_tmp/bin/apidiff" -incompatible -m "$api_tmp/previous.export" "$(go list -m)") \
-            || fail "11/11 api" "apidiff could not compare ${api_prev} against the build"
+            || fail "12/12 api" "apidiff could not compare ${api_prev} against the build"
         if [ -n "$api_removed" ]; then
             printf '%s\n' "$api_removed"
             api_breaks="${api_breaks}
@@ -418,7 +430,7 @@ removed packages above are incompatible and were never reported by apidiff"
             fi
             if [ "$allowed" -ne 1 ]; then
                 printf '%s\n' "$api_breaks"
-                fail "11/11 api" "${api_new} breaks the surface ${api_prev} shipped, an incompatible change needs ${api_want}"
+                fail "12/12 api" "${api_new} breaks the surface ${api_prev} shipped, an incompatible change needs ${api_want}"
             fi
         fi
     fi
