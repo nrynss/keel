@@ -15,8 +15,21 @@ import (
 // as it is written. During a quiet period a ping comment keeps an
 // intermediary from reaping the connection. The heartbeat timer resets on
 // every real event, so pings appear only between events.
+//
+// When the request carries Last-Event-ID and that id is still in the
+// topic's ring, the frames published after it are written first, each
+// with the id it was published under, and only then does the handler
+// follow the live subscription. Ids increase for the life of the broker,
+// so a cursor from a topic this process has already dropped cannot match
+// a frame in a later ring. A missing header, a cursor this process
+// does not remember, or a cursor of zero skips that replay and subscribes
+// exactly as before. Ping comments are not part of the ring. A replayed
+// terminal frame ends the response, and so does a cursor equal to the
+// retained terminal: there is nothing further to send, and the response
+// closes instead of waiting.
 func (b *Broker) ServeTopic(w http.ResponseWriter, r *http.Request, topic string) {
-	sub := b.Subscribe(r.Context(), topic)
+	after, resume := lastEventID(r)
+	replay, sub := b.catchUp(r.Context(), topic, after, resume)
 	defer sub.Cancel()
 
 	wire.SetEventHeaders(w)
@@ -28,6 +41,19 @@ func (b *Broker) ServeTopic(w http.ResponseWriter, r *http.Request, topic string
 
 	heartbeat := time.NewTicker(b.cfg.Heartbeat)
 	defer heartbeat.Stop()
+
+	for _, ev := range replay {
+		if r.Context().Err() != nil {
+			return
+		}
+		if err := wire.WriteEvent(w, ev.Name, ev.ID, ev.Data); err != nil {
+			return
+		}
+		if err := rc.Flush(); err != nil {
+			return
+		}
+		heartbeat.Reset(b.cfg.Heartbeat)
+	}
 
 	for {
 		select {

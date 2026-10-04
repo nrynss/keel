@@ -8,8 +8,9 @@ import (
 )
 
 // TestSubscribeDefaultConfigSubstituted pins the zero-Config defaults:
-// New(Config{}) must substitute defaultHeartbeat, defaultBuffer and
-// defaultRetain. A default nobody executes is a default nobody tests.
+// New(Config{}) must substitute defaultHeartbeat, defaultBuffer,
+// defaultRetain and defaultReplay. A default nobody executes is a default
+// nobody tests.
 func TestSubscribeDefaultConfigSubstituted(t *testing.T) {
 	b := New(Config{})
 	if b.cfg.Heartbeat != defaultHeartbeat {
@@ -21,8 +22,12 @@ func TestSubscribeDefaultConfigSubstituted(t *testing.T) {
 	if b.cfg.Retain != defaultRetain {
 		t.Errorf("retain = %v, want %v", b.cfg.Retain, defaultRetain)
 	}
-	neg := Config{Heartbeat: -1, Buffer: -5, Retain: -1}
-	if got := neg.withDefaults(); got.Heartbeat != defaultHeartbeat || got.Buffer != defaultBuffer || got.Retain != defaultRetain {
+	if b.cfg.Replay != defaultReplay {
+		t.Errorf("replay = %d, want %d", b.cfg.Replay, defaultReplay)
+	}
+	neg := Config{Heartbeat: -1, Buffer: -5, Retain: -1, Replay: -1}
+	got := neg.withDefaults()
+	if got.Heartbeat != defaultHeartbeat || got.Buffer != defaultBuffer || got.Retain != defaultRetain || got.Replay != defaultReplay {
 		t.Errorf("withDefaults on negative values = %+v, want the defaults", got)
 	}
 }
@@ -75,9 +80,10 @@ func TestSlowSubscriberDropOldest(t *testing.T) {
 	}
 }
 
-// TestPublishAssignsIncreasingIDsPerTopic: every published event carries
-// the topic's next id, and a second topic numbers from its own first event.
-func TestPublishAssignsIncreasingIDsPerTopic(t *testing.T) {
+// TestPublishAssignsIncreasingIDs: every published event carries the
+// broker's next id. A second topic continues that sequence, so a dropped
+// topic cannot be reincarnated at id 1.
+func TestPublishAssignsIncreasingIDs(t *testing.T) {
 	b := New(Config{})
 	sub := b.Subscribe(context.Background(), "t")
 	defer sub.Cancel()
@@ -101,8 +107,8 @@ func TestPublishAssignsIncreasingIDsPerTopic(t *testing.T) {
 	b.Publish("u", Event{Name: "progress", Data: 0})
 	select {
 	case ev := <-other.Events:
-		if ev.ID != 1 {
-			t.Errorf("second topic id = %d, want 1", ev.ID)
+		if ev.ID != 4 {
+			t.Errorf("second topic id = %d, want 4", ev.ID)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for the second topic event")
@@ -283,4 +289,76 @@ func TestPublishConcurrentWithSubscribe(t *testing.T) {
 	}
 	close(stop)
 	publishers.Wait()
+}
+
+// TestReplayRingDropsOldestAndForgetsAMissedCursor pins the bound: a ring
+// of two keeps the newest pair, so a cursor that has fallen out does not
+// match, and a cursor still inside yields only the events after it.
+func TestReplayRingDropsOldestAndForgetsAMissedCursor(t *testing.T) {
+	b := New(Config{Replay: 2, Retain: time.Hour})
+	for i := 1; i <= 3; i++ {
+		b.Publish("t", Event{Name: "progress", Data: i})
+	}
+	if _, sub := b.catchUp(context.Background(), "t", 1, true); sub == nil {
+		t.Fatal("catchUp returned a nil subscription")
+	} else {
+		sub.Cancel()
+	}
+	replay, sub := b.catchUp(context.Background(), "t", 1, true)
+	sub.Cancel()
+	if len(replay) != 0 {
+		t.Fatalf("replay after a dropped cursor = %+v, want none", replay)
+	}
+	replay, sub = b.catchUp(context.Background(), "t", 2, true)
+	defer sub.Cancel()
+	if len(replay) != 1 || replay[0].ID != 3 || replay[0].Data != 3 {
+		t.Fatalf("replay = %+v, want only event 3", replay)
+	}
+}
+
+// TestReplayRingDroppedAfterIdleRetain: once Retain passes with nobody
+// listening, a Last-Event-ID that used to match is a fresh subscribe.
+func TestReplayRingDroppedAfterIdleRetain(t *testing.T) {
+	b := New(Config{Retain: 20 * time.Millisecond})
+	b.Publish("t", Event{Name: "progress", Data: "gone"})
+	time.Sleep(60 * time.Millisecond)
+	replay, sub := b.catchUp(context.Background(), "t", 1, true)
+	defer sub.Cancel()
+	if len(replay) != 0 {
+		t.Fatalf("replay after the ring was dropped = %+v, want none", replay)
+	}
+	if got := b.subscribers("t"); got != 1 {
+		t.Errorf("subscribers = %d, want 1 (a live subscription)", got)
+	}
+}
+
+// TestEventIDsDoNotRestartWhenATopicIsRecreated: a topic dropped after
+// Retain is a new incarnation, but its ids continue from the broker. An
+// old Last-Event-ID must not match a later id in the new ring and replay
+// only the tail.
+func TestEventIDsDoNotRestartWhenATopicIsRecreated(t *testing.T) {
+	b := New(Config{Retain: 20 * time.Millisecond, Replay: 16})
+	b.Publish("t", Event{Name: "progress", Data: "old-1"})
+	b.Publish("t", Event{Name: "progress", Data: "old-2"})
+	b.Publish("t", Event{Name: "progress", Data: "old-3"})
+	time.Sleep(60 * time.Millisecond)
+	for i := 1; i <= 5; i++ {
+		b.Publish("t", Event{Name: "progress", Data: "new"})
+	}
+	replay, sub := b.catchUp(context.Background(), "t", 3, true)
+	sub.Cancel()
+	if len(replay) != 0 {
+		t.Fatalf("replay of an old cursor = %+v, want none", replay)
+	}
+	b.mu.Lock()
+	ring := append([]Event(nil), b.topics["t"].ring.buf...)
+	b.mu.Unlock()
+	if len(ring) != 5 || ring[0].ID != 4 || ring[4].ID != 8 {
+		t.Fatalf("new ring ids = %+v, want 4 through 8", ring)
+	}
+	for _, event := range ring {
+		if event.ID <= 3 {
+			t.Fatalf("new ring reused id %d", event.ID)
+		}
+	}
 }
