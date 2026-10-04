@@ -97,7 +97,7 @@ func (s *Store) Snapshot(ctx context.Context, dir string, sel Selection) error {
 	}
 	dir = filepath.Clean(dir)
 	if dir == "." {
-		return fmt.Errorf("mediastore: snapshot: %w: directory must not be .", ErrSnapshot)
+		return fmt.Errorf("mediastore: snapshot: %w: directory must not be the current directory", ErrSnapshot)
 	}
 	if err := ctx.Err(); err != nil {
 		return err
