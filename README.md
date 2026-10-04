@@ -313,6 +313,23 @@ caller measured. A silent page is held for `film.SilentHold`. `Render` returns
 that sum and does not probe the file. `film.Total` is the same sum without
 rendering, which is what a later mix anchors a fade to.
 
+`film.Page.N` is only the number named in an error. Image and narration bytes
+are staged by the page's position, so two pages may share an N.
+
+The caller is trusted. `Render` uses the ffmpeg binary and the font, image,
+audio, work, and output paths it is given. It checks that a path exists, and
+it does not authorize it or confine the process. Quoting a path keeps the
+filter syntax intact. It is not an access check. `Concat` passes the caller's
+segment paths through with `-safe 0`. An integration that accepts untrusted
+jobs keeps the binary and those paths under its own policy, and runs ffmpeg
+where the filesystem and the network are already limited.
+
+The finished file replaces `Output` by a rename. A copy onto another
+filesystem is written beside `Output` and renamed only when the copy and its
+sync have succeeded, so a failed or cancelled publish leaves the previous
+file in place. Renders that name the same output are not queued. The last
+successful rename is the file a reader sees.
+
 
 ### Bound a paid session with a lease
 

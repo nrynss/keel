@@ -286,3 +286,65 @@ func writePNG(t *testing.T, path string) {
 		t.Fatal(err)
 	}
 }
+
+func TestPageNumberIsOnlyALabel(t *testing.T) {
+	_, err := Total(Config{}, []Page{{N: 7, Audio: []byte{1}}})
+	if err == nil || !strings.Contains(err.Error(), "page 7") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestRenderStagesRepeatedPageNumbersSeparately(t *testing.T) {
+	dir := t.TempDir()
+	log := filepath.Join(dir, "seen.txt")
+	stub := filepath.Join(dir, "ffmpeg")
+	quoted := "'" + strings.ReplaceAll(log, "'", "'\\''") + "'"
+	script := "#!/bin/sh\n" +
+		"prev=\n" +
+		"last=\n" +
+		"for arg in \"$@\"; do\n" +
+		"  if [ \"$prev\" = \"-i\" ] && [ -f \"$arg\" ]; then\n" +
+		"    printf 'BEGIN\\n' >> " + quoted + "\n" +
+		"    cat \"$arg\" >> " + quoted + "\n" +
+		"    printf '\\nEND\\n' >> " + quoted + "\n" +
+		"  fi\n" +
+		"  prev=$arg\n" +
+		"  last=$arg\n" +
+		"done\n" +
+		"if [ -n \"$last\" ]; then\n" +
+		"  : > \"$last\"\n" +
+		"fi\n" +
+		"exit 0\n"
+	if err := os.WriteFile(stub, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	font := filepath.Join(dir, "font.ttf")
+	if err := os.WriteFile(font, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(dir, "film.mp4")
+	pages := []Page{
+		{N: 4, Text: "one", Image: []byte("IMG-ONE"), Audio: []byte("AUD-ONE"), Duration: time.Second},
+		{N: 4, Text: "two", Image: []byte("IMG-TWO"), Audio: []byte("AUD-TWO"), Duration: time.Second},
+	}
+	_, err := Render(context.Background(), ffmpeg.Tools{FFmpeg: stub}, Config{
+		FontFile:  font,
+		EndTitle:  "End",
+		WorkDir:   dir,
+		TitleHold: time.Millisecond,
+		EndHold:   time.Millisecond,
+	}, Input{Title: "Story", Pages: pages, Output: out})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := string(raw)
+	for _, want := range []string{"IMG-ONE", "IMG-TWO", "AUD-ONE", "AUD-TWO"} {
+		if !strings.Contains(seen, want) {
+			t.Fatalf("staged inputs missing %s:\n%s", want, seen)
+		}
+	}
+}

@@ -284,26 +284,124 @@ func writeTemp(dir, pattern string, data []byte) (string, error) {
 	return name, nil
 }
 
-// moveFile renames src to dst, and copies when the rename crosses devices.
-func moveFile(src, dst string) error {
+// publish moves src onto dst without truncating a previous dst first.
+// A same-filesystem rename replaces dst in one step. Any other rename error,
+// including a cross-filesystem move, copies the bytes to a temporary file in
+// dst's directory and renames that complete file onto dst. A copy, sync, or
+// context error removes the temporary file and leaves the previous dst in
+// place. Callers that publish the same dst together are not queued: the last
+// successful rename is the file a reader sees.
+func publish(ctx context.Context, src, dst string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := os.Rename(src, dst); err == nil {
 		return nil
+	}
+	return publishBeside(ctx, src, dst)
+}
+
+// publishBeside copies src to a temporary file next to dst, then renames it
+// onto dst. dst is not opened for writing until that rename.
+func publishBeside(ctx context.Context, src, dst string) error {
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	in, err := os.Open(src)
 	if err != nil {
 		return fmt.Errorf("open %s: %w", src, err)
 	}
 	defer in.Close()
-	out, err := os.Create(dst)
+	info, err := in.Stat()
 	if err != nil {
-		return fmt.Errorf("create %s: %w", dst, err)
+		return fmt.Errorf("stat %s: %w", src, err)
 	}
-	defer out.Close()
-	if _, err := io.Copy(out, in); err != nil {
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("publish %s: source is not a regular file", dst)
+	}
+	if err := publishReader(ctx, in, info.Mode().Perm(), dst); err != nil {
+		return err
+	}
+	_ = os.Remove(src)
+	return nil
+}
+
+// publishReader writes r to a temporary file in dst's directory and renames
+// it onto dst only after the copy and sync succeed. mode is the permission
+// of the published file. A failure or a cancelled context removes the
+// temporary file and does not modify dst.
+func publishReader(ctx context.Context, r io.Reader, mode os.FileMode, dst string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	dir := filepath.Dir(dst)
+	tmp, err := os.CreateTemp(dir, ".keel-film-*.partial")
+	if err != nil {
+		return fmt.Errorf("create publish temp for %s: %w", dst, err)
+	}
+	tmpName := tmp.Name()
+	committed := false
+	defer func() {
+		if !committed {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if err := copyContext(ctx, tmp, r); err != nil {
+		_ = tmp.Close()
 		return fmt.Errorf("copy %s: %w", dst, err)
 	}
-	if err := out.Sync(); err != nil {
+	if err := tmp.Chmod(mode); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("chmod %s: %w", dst, err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
 		return fmt.Errorf("sync %s: %w", dst, err)
 	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close %s: %w", dst, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, dst); err != nil {
+		return fmt.Errorf("replace %s: %w", dst, err)
+	}
+	committed = true
+	syncDir(dir)
 	return nil
+}
+
+// copyContext copies until src ends, ctx is cancelled, or a read or write
+// fails.
+func copyContext(ctx context.Context, dst io.Writer, src io.Reader) error {
+	buf := make([]byte, 32*1024)
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		n, rerr := src.Read(buf)
+		if n > 0 {
+			if _, werr := dst.Write(buf[:n]); werr != nil {
+				return werr
+			}
+		}
+		if rerr == io.EOF {
+			return nil
+		}
+		if rerr != nil {
+			return rerr
+		}
+	}
+}
+
+// syncDir best-effort flushes the directory entry of a published file.
+// A filesystem that cannot sync a directory does not undo the rename.
+func syncDir(dir string) {
+	d, err := os.Open(dir)
+	if err != nil {
+		return
+	}
+	_ = d.Sync()
+	_ = d.Close()
 }

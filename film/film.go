@@ -10,6 +10,26 @@
 //
 // The drawtext face is the caller's font file. The package ships none,
 // because a runtime image often has no fonts of its own.
+//
+// The caller is trusted. Render, TitleCard, PageSegment, EndCard, and Concat
+// use Tools and the font, image, audio, work, and output paths they are
+// given. Render checks that a supplied image or audio path exists. It does
+// not authorize the path, choose which ffmpeg runs, or confine the process.
+// Quoting a path for drawtext or the concat list keeps the filter syntax
+// intact, and it is not an access check. Concat passes the caller's segment
+// paths to the concat demuxer with -safe 0. Scratch files go under
+// Config.WorkDir when that is set, and otherwise next to the segment output.
+// An integration that accepts untrusted jobs keeps the binary and the paths
+// under its own policy, and runs ffmpeg where the filesystem and the network
+// are already limited.
+//
+// Render replaces Output by renaming a finished file. When that rename fails,
+// including across filesystems, the bytes are copied to a temporary file
+// in the output's directory and renamed only after the copy and its sync
+// succeed. A failed copy, a failed sync, or a cancelled context removes that
+// temporary file and leaves any previous Output in place. Two renders that
+// name the same Output are not ordered: each replaces the whole file, and
+// the last successful rename is what a reader sees.
 package film
 
 import (
@@ -69,8 +89,10 @@ type Config struct {
 
 // Page is one still, its words, and its optional narration.
 type Page struct {
-	// N is the page number used in errors. Zero means the position in the
-	// slice, starting at one.
+	// N is the page number named in errors. It does not choose a filename.
+	// Zero means the position in the slice, starting at one. Image and
+	// narration bytes are staged by that position, so two pages may share
+	// an N without overwriting each other's media.
 	N int
 	// ImagePath is the still. Image is used when ImagePath is empty.
 	ImagePath string
@@ -161,7 +183,9 @@ func Total(cfg Config, pages []Page) (time.Duration, error) {
 // Render writes the film to in.Output and returns its length from Total.
 // tools names ffmpeg. A missing binary reports ffmpeg.ErrNotFound and a
 // failed run reports ffmpeg.ErrFailed. The context stops every segment still
-// running when one fails.
+// running when one fails. A cancelled or failed publish leaves any previous
+// file at in.Output in place. The caller is trusted, as the package comment
+// describes, and renders that share an output path are not queued.
 func Render(ctx context.Context, tools ffmpeg.Tools, cfg Config, in Input) (time.Duration, error) {
 	if strings.TrimSpace(in.Title) == "" {
 		return 0, fmt.Errorf("%w: title is required", ErrInvalid)
@@ -207,10 +231,13 @@ func Render(ctx context.Context, tools ffmpeg.Tools, cfg Config, in Input) (time
 	audios := make([]string, len(in.Pages))
 	for i, page := range in.Pages {
 		n := pageNumber(i, page)
+		// Position in the film is the staging identity. Page.N only names
+		// the page in an error, and a repeated N must not reuse a file.
+		slot := i + 1
 		if page.ImagePath != "" {
 			images[i] = page.ImagePath
 		} else {
-			path := filepath.Join(work, fmt.Sprintf("page-%02d.bin", n))
+			path := filepath.Join(work, fmt.Sprintf("page-%02d.bin", slot))
 			if err := os.WriteFile(path, page.Image, 0o600); err != nil {
 				return 0, fmt.Errorf("write page %d image: %w", n, err)
 			}
@@ -219,7 +246,7 @@ func Render(ctx context.Context, tools ffmpeg.Tools, cfg Config, in Input) (time
 		if page.AudioPath != "" {
 			audios[i] = page.AudioPath
 		} else if len(page.Audio) > 0 {
-			path := filepath.Join(work, fmt.Sprintf("narration-%02d.bin", n))
+			path := filepath.Join(work, fmt.Sprintf("narration-%02d.bin", slot))
 			if err := os.WriteFile(path, page.Audio, 0o600); err != nil {
 				return 0, fmt.Errorf("write page %d audio: %w", n, err)
 			}
@@ -262,7 +289,7 @@ func Render(ctx context.Context, tools ffmpeg.Tools, cfg Config, in Input) (time
 	if err := os.MkdirAll(filepath.Dir(in.Output), 0o755); err != nil {
 		return 0, fmt.Errorf("create output directory: %w", err)
 	}
-	if err := moveFile(tmp, in.Output); err != nil {
+	if err := publish(ctx, tmp, in.Output); err != nil {
 		return 0, err
 	}
 	return total, nil
