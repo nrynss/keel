@@ -38,7 +38,7 @@ else is pure Go, and `CGO_ENABLED=0` builds the whole module.
 | `sqlite` | One SQLite file with WAL, a writer handle, a read-only reader pool, namespaced migrations and online backup |
 | `ffmpeg` | ffmpeg and ffprobe bound to a context, with a bounded wait on shutdown |
 | `duration` | WAV and MP3 length read from the bytes themselves, for a runtime that ships ffmpeg without ffprobe |
-| `cost` | Money as integer nanodollars, a ledger of charges, budgets that refuse before a call, keyed budgets that divide one pool by owner, and a meter that runs one paid call |
+| `cost` | Money as integer nanodollars, a ledger of charges, budgets that refuse before a call, keyed budgets that divide one pool by owner, and a meter that runs one paid call and records the settle in an app-chosen charge sink |
 | `throttle` | Retry of a paid call that failed for a reason a wait can clear, with full-jitter backoff and an optional cap on how many calls run at once |
 | `flag` | Runtime flags an operator flips without a restart, read through to the store with a declared default for a missing row |
 | `caption` | Word timings to SRT and WebVTT subtitle files as a pure function, with cues grouped by line length and duration |
@@ -165,8 +165,13 @@ A store opened with `Period: cost.DailyUTC` restarts its ceiling every UTC day, 
 every month, so a limit bounds one window rather than all spend ever booked. A `cost.KeyedBudget` divides one pool by owner under a global ceiling, so one owner cannot spend
 another owner's headroom. Each owner reserves and settles through its own account from `Owner`.
 A `cost.Meter` runs one paid call against an account: it reserves the estimate, runs the work,
-settles the measured price, and frees the reservation on every failure path. A call that reports
-no usage settles at its estimate and says so in the returned `Usage`. `KeyedBudget.ForgetOwner`
+and settles the measured price. It frees the reservation on every failure up to the settle.
+A call that reports no usage settles at its estimate and says so in the returned `Usage`. The
+settle lands in a `cost.ChargeSink`. The in-memory `cost.Ledger` is one sink, and the
+`cost/sqlitestore` store is another. An application with its own spend store writes the
+one-method sink itself. A charge the sink cannot record is the one failure past the settle.
+`Meter.Call` reports it as `cost.ErrUnrecordedCharge`, with a zero `Usage`, so a figure no
+store backs is never shown as booked. `KeyedBudget.ForgetOwner`
 removes an owner's budget, reservations and settle history after its live reservations finish.
 
 ### Retry a paid call that a wait can clear

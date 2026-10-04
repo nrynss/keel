@@ -40,7 +40,9 @@
 //
 // This package is one of the few allowed to import the SQLite driver. The
 // ledger arithmetic itself stays in the cost package, and every total is
-// summed through a cost.Ledger so the overflow rule never drifts.
+// summed through a cost.Ledger so the overflow rule never drifts. The Store
+// satisfies cost.ChargeSink, so a cost.Meter can record its settled charges
+// straight into the durable ledger.
 package sqlitestore
 
 import (
@@ -127,6 +129,10 @@ type Store struct {
 	reservationTTL time.Duration
 	period         cost.Period
 }
+
+// A Store satisfies cost.ChargeSink, so a meter can take it as the sink that
+// records settled charges.
+var _ cost.ChargeSink = (*Store)(nil)
 
 // Reservation is one outstanding budget hold. Reserve returns it and the caller
 // passes it back to Settle or Release.
@@ -270,7 +276,7 @@ func (s *Store) total(ctx context.Context, query string, args ...any) (cost.Pric
 	}
 	ledger := cost.NewLedger()
 	for _, c := range charges {
-		ledger.Add(c)
+		_ = ledger.Add(ctx, c) // an in-memory add cannot fail
 	}
 	return ledger.Total()
 }

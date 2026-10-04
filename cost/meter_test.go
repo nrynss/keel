@@ -228,19 +228,19 @@ func TestMeterSettlesTheEstimateWhenUsageIsUnmeasured(t *testing.T) {
 	}
 }
 
-// TestMeterRefusesNilAccountAndNilLedger pins that neither half of a meter
+// TestMeterRefusesNilAccountAndNilSink pins that neither half of a meter
 // may be nil, because a meter that cannot bound or cannot record a call
 // would only pretend to.
-func TestMeterRefusesNilAccountAndNilLedger(t *testing.T) {
+func TestMeterRefusesNilAccountAndNilSink(t *testing.T) {
 	if _, err := NewMeter(nil, NewLedger()); !errors.Is(err, ErrNilAccount) {
-		t.Errorf("NewMeter(nil, ledger) error = %v, want ErrNilAccount", err)
+		t.Errorf("NewMeter(nil, sink) error = %v, want ErrNilAccount", err)
 	}
 	budget, err := NewBudget(100 * Cent)
 	if err != nil {
 		t.Fatalf("NewBudget: %v", err)
 	}
-	if _, err := NewMeter(budget, nil); !errors.Is(err, ErrNilLedger) {
-		t.Errorf("NewMeter(budget, nil) error = %v, want ErrNilLedger", err)
+	if _, err := NewMeter(budget, nil); !errors.Is(err, ErrNilSink) {
+		t.Errorf("NewMeter(budget, nil) error = %v, want ErrNilSink", err)
 	}
 }
 
@@ -273,6 +273,183 @@ func TestMeterRefusesANegativeMeasuredPrice(t *testing.T) {
 	}
 	if err := budget.Reserve(100 * Cent); err != nil {
 		t.Errorf("Reserve after the refused call: %v", err)
+	}
+}
+
+// refusingSink records nothing and reports its error from every write.
+type refusingSink struct{ err error }
+
+func (s refusingSink) Add(context.Context, Charge) error { return s.err }
+
+// TestMeterReportsAChargeTheSinkRefuses pins that a sink write that fails
+// reports ErrUnrecordedCharge carrying the sink's own error, with the zero
+// usage. The call ran and the settle booked its spend, so the budget holds
+// the fact even though no record of it landed. The reservation stays
+// consumed rather than released a second time.
+func TestMeterReportsAChargeTheSinkRefuses(t *testing.T) {
+	sinkErr := errors.New("disk refused the write")
+	budget, err := NewBudget(100 * Cent)
+	if err != nil {
+		t.Fatalf("NewBudget: %v", err)
+	}
+	meter, err := NewMeter(budget, refusingSink{err: sinkErr})
+	if err != nil {
+		t.Fatalf("NewMeter: %v", err)
+	}
+	usage, err := meter.Call(context.Background(), 30*Cent, "transcribe", "job-9",
+		func(context.Context) (Usage, error) {
+			return Usage{Price: 12 * Cent, Measured: true}, nil
+		})
+	if !errors.Is(err, ErrUnrecordedCharge) {
+		t.Fatalf("Call error = %v, want ErrUnrecordedCharge", err)
+	}
+	if !errors.Is(err, sinkErr) {
+		t.Errorf("Call error = %v, want it to wrap the sink error %v", err, sinkErr)
+	}
+	if usage != (Usage{}) {
+		t.Errorf("Call usage = %+v, want the zero usage", usage)
+	}
+	if got := budget.Spent(); got != 12*Cent {
+		t.Errorf("Spent() = %d, want %d, the call happened and its spend is booked", got, 12*Cent)
+	}
+	if got := budget.Reserved(); got != 0 {
+		t.Errorf("Reserved() = %d, want 0, the settle consumed the hold", got)
+	}
+	if got, err := budget.Remaining(); err != nil || got != 88*Cent {
+		t.Errorf("Remaining() = %d, %v, want %d", got, err, 88*Cent)
+	}
+}
+
+// onceRefusingSink refuses the first write and records every later one, so a
+// test can drive a refusal and a recovery through one sink in sequence.
+type onceRefusingSink struct {
+	err   error
+	fail  bool
+	taken []Charge
+}
+
+func (s *onceRefusingSink) Add(_ context.Context, c Charge) error {
+	if s.fail {
+		s.fail = false
+		return s.err
+	}
+	s.taken = append(s.taken, c)
+	return nil
+}
+
+// TestMeterRecoversAfterARefusedCharge pins that a refused write does not
+// poison the meter. The next call settles and records again, and the
+// refused call's charge never appears late.
+func TestMeterRecoversAfterARefusedCharge(t *testing.T) {
+	budget, err := NewBudget(100 * Cent)
+	if err != nil {
+		t.Fatalf("NewBudget: %v", err)
+	}
+	sink := &onceRefusingSink{err: errors.New("first write refused"), fail: true}
+	meter, err := NewMeter(budget, sink)
+	if err != nil {
+		t.Fatalf("NewMeter: %v", err)
+	}
+	work := func(context.Context) (Usage, error) {
+		return Usage{Price: 12 * Cent, Measured: true}, nil
+	}
+	first, err := meter.Call(context.Background(), 30*Cent, "transcribe", "job-1", work)
+	if !errors.Is(err, ErrUnrecordedCharge) {
+		t.Fatalf("first Call error = %v, want ErrUnrecordedCharge", err)
+	}
+	if first != (Usage{}) {
+		t.Errorf("first Call usage = %+v, want the zero usage", first)
+	}
+	second, err := meter.Call(context.Background(), 30*Cent, "transcribe", "job-2", work)
+	if err != nil {
+		t.Fatalf("second Call: %v", err)
+	}
+	if want := (Usage{Price: 12 * Cent, Measured: true}); second != want {
+		t.Errorf("second Call usage = %+v, want %+v", second, want)
+	}
+	if len(sink.taken) != 1 {
+		t.Fatalf("sink took %d charges, want 1", len(sink.taken))
+	}
+	if sink.taken[0].Ref != "job-2" {
+		t.Errorf("recorded charge ref = %q, want job-2, the refused charge never lands", sink.taken[0].Ref)
+	}
+}
+
+// countingAccount wraps an Account and records every Release, so a test can
+// pin that no release ran.
+type countingAccount struct {
+	Account
+	mu       sync.Mutex
+	releases []Price
+}
+
+func (a *countingAccount) Release(reserved Price) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.releases = append(a.releases, reserved)
+	a.Account.Release(reserved)
+}
+
+// TestMeterRefusedWriteReleasesNoHold pins the invariant the booked flag
+// carries. A refused charge write comes back after the settle consumed the
+// reservation, so it must release nothing. A release there would eat a
+// sibling caller's live hold instead. Every other refusal test passes one
+// caller, and an account clamps a release past the holds it knows, so this
+// test stands a sibling hold beside the refused call.
+func TestMeterRefusedWriteReleasesNoHold(t *testing.T) {
+	budget, err := NewBudget(100 * Cent)
+	if err != nil {
+		t.Fatalf("NewBudget: %v", err)
+	}
+	account := &countingAccount{Account: budget}
+	sink := &onceRefusingSink{err: errors.New("first write refused"), fail: true}
+	meter, err := NewMeter(account, sink)
+	if err != nil {
+		t.Fatalf("NewMeter: %v", err)
+	}
+	// The sibling hold stands for another caller inside its work. A release
+	// past the settle would land on it, because the caller's own hold is
+	// already gone.
+	if err := budget.Reserve(30 * Cent); err != nil {
+		t.Fatalf("Reserve sibling hold: %v", err)
+	}
+	usage, err := meter.Call(context.Background(), 30*Cent, "transcribe", "job-1",
+		func(context.Context) (Usage, error) {
+			return Usage{Price: 12 * Cent, Measured: true}, nil
+		})
+	if !errors.Is(err, ErrUnrecordedCharge) {
+		t.Fatalf("Call error = %v, want ErrUnrecordedCharge", err)
+	}
+	if usage != (Usage{}) {
+		t.Errorf("Call usage = %+v, want the zero usage", usage)
+	}
+	if got := budget.Reserved(); got != 30*Cent {
+		t.Errorf("Reserved() = %d, want %d, the sibling hold survives the refused write", got, 30*Cent)
+	}
+	if got, err := budget.Remaining(); err != nil || got != 58*Cent {
+		t.Errorf("Remaining() = %d, %v, want %d", got, err, 58*Cent)
+	}
+	account.mu.Lock()
+	defer account.mu.Unlock()
+	if len(account.releases) != 0 {
+		t.Errorf("Release ran %d times, want 0, the settle consumed the reservation", len(account.releases))
+	}
+}
+
+// TestMeterRefusesTypedNilAccountAndSink pins that an interface holding a
+// nil pointer is refused like a plain nil. Such a value passes a plain
+// equality check against nil and would panic on first use, after the settle
+// had already booked spend.
+func TestMeterRefusesTypedNilAccountAndSink(t *testing.T) {
+	if _, err := NewMeter((*Budget)(nil), NewLedger()); !errors.Is(err, ErrNilAccount) {
+		t.Errorf("NewMeter((*Budget)(nil), sink) error = %v, want ErrNilAccount", err)
+	}
+	budget, err := NewBudget(100 * Cent)
+	if err != nil {
+		t.Fatalf("NewBudget: %v", err)
+	}
+	if _, err := NewMeter(budget, (*Ledger)(nil)); !errors.Is(err, ErrNilSink) {
+		t.Errorf("NewMeter(budget, (*Ledger)(nil)) error = %v, want ErrNilSink", err)
 	}
 }
 
