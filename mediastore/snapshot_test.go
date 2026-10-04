@@ -369,6 +369,66 @@ func TestRestoreSurvivesDefaultSweep(t *testing.T) {
 	}
 }
 
+func TestSnapshotDirectoryIsWorldReadable(t *testing.T) {
+	s := openTestStore(t)
+	blobID := putBytes(t, s, "png-bytes", Put{ContentType: "image/png", Owner: "alice"})
+	parent := t.TempDir()
+	dir := filepath.Join(parent, "snap")
+	if err := s.Snapshot(t.Context(), dir+"/", Selection{IDs: []string{blobID}}); err != nil {
+		t.Fatalf("snapshot with trailing separator: %v", err)
+	}
+	entries, err := os.ReadDir(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "snap" {
+		names := make([]string, len(entries))
+		for i, e := range entries {
+			names[i] = e.Name()
+		}
+		t.Fatalf("parent entries = %v, want only snap and no stray partial directory", names)
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o755 {
+		t.Fatalf("snapshot mode = %o, want 0755", info.Mode().Perm())
+	}
+	blobInfo, err := os.Stat(filepath.Join(dir, blobID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if blobInfo.Mode().Perm() != 0o644 {
+		t.Fatalf("blob mode = %o, want 0644", blobInfo.Mode().Perm())
+	}
+	if _, err := os.Stat(filepath.Join(dir, manifestFile)); err != nil {
+		t.Fatalf("manifest: %v", err)
+	}
+}
+
+func TestSnapshotRefusesDot(t *testing.T) {
+	s := openTestStore(t)
+	putBytes(t, s, "png-bytes", Put{ContentType: "image/png", Owner: "alice"})
+	work := t.TempDir()
+	t.Chdir(work)
+	err := s.Snapshot(t.Context(), ".", Selection{Owner: "alice"})
+	if !errors.Is(err, ErrSnapshot) {
+		t.Fatalf("err = %v, want invalid snapshot", err)
+	}
+	entries, err := os.ReadDir(work)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		names := make([]string, len(entries))
+		for i, e := range entries {
+			names[i] = e.Name()
+		}
+		t.Fatalf("work dir entries = %v, want no stray directory", names)
+	}
+}
+
 func TestSnapshotCancelledContext(t *testing.T) {
 	s := openTestStore(t)
 	ctx, cancel := context.WithCancel(t.Context())

@@ -133,7 +133,7 @@ handler answers Range requests, which is what audio and video seeking needs.
 Bytes reach disk before the row that names them, so a crash never leaves a row pointing at nothing.
 The sweeper reclaims orphans and evicts whole groups over a byte budget.
 
-`Snapshot` writes `manifest.json` plus one file per blob, into a sibling directory that replaces `dir` only when the manifest is complete. A failed refresh leaves the previous snapshot in place. `Selection` is either an id list or an exact owner match, and a selection that matches nothing is refused. `Restore` recreates those blobs with the same ids, content types and visibility, stamps them with the store clock rather than the captured creation time, and refuses a hash mismatch or an id that is already stored. A restored row is an ordinary row. Visibility is not a retention pin. `Protected` and `Retain` are.
+`Snapshot` writes `manifest.json` plus one file per blob, into a sibling directory that replaces `dir` only when the manifest is complete. `dir` is cleaned first, so a trailing separator does not leave a stray directory, and `.` is refused. The committed directory is mode 0755. A failed refresh leaves the previous snapshot in place. `Selection` is either an id list or an exact owner match, and a selection that matches nothing is refused. `Restore` recreates those blobs with the same ids, content types and visibility, stamps them with the store clock rather than the captured creation time, and refuses a hash mismatch or an id that is already stored. A restored row is an ordinary row. Visibility is not a retention pin. `Protected` and `Retain` are. `Put.CreatedAt` is not how a restore keeps the captured timestamp.
 
 ### Accept a recording that survives a dropped connection
 

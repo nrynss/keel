@@ -72,9 +72,14 @@ type Selection struct {
 }
 
 // Snapshot writes a manifest and one file per blob into dir. dir is
-// created when it is absent. Each blob file is named by the blob id.
-// The manifest is written last, so a directory without manifest.json is
-// not a snapshot Restore will accept.
+// cleaned first, so a trailing separator names the same directory and
+// does not leave a stray empty directory behind. The cleaned path "."
+// is refused: this call replaces its destination, and the current
+// directory is not one it will claim. dir is created when it is absent.
+// The committed directory is mode 0755, which is what a portable
+// fixture needs; blob files inside it are mode 0644 and are named by
+// the blob id. The manifest is written last, so a directory without
+// manifest.json is not a snapshot Restore will accept.
 //
 // The capture is the rows and files as they stand while each blob is
 // read. Blob bytes are immutable once stored, so a row and its file
@@ -89,6 +94,10 @@ func (s *Store) Snapshot(ctx context.Context, dir string, sel Selection) error {
 	}
 	if dir == "" {
 		return fmt.Errorf("mediastore: snapshot: %w: directory must not be empty", ErrSnapshot)
+	}
+	dir = filepath.Clean(dir)
+	if dir == "." {
+		return fmt.Errorf("mediastore: snapshot: %w: directory must not be .", ErrSnapshot)
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -116,6 +125,13 @@ func (s *Store) Snapshot(ctx context.Context, dir string, sel Selection) error {
 	}()
 	if err := s.writeSnapshot(ctx, tmp, blobs); err != nil {
 		return err
+	}
+	// MkdirTemp creates the capture at 0700. A portable fixture is
+	// readable by others, matching the 0755 the store uses for its own
+	// directory. Chmod ignores umask. It happens before the swap so the
+	// name the caller asked for never appears as 0700.
+	if err := os.Chmod(tmp, 0o755); err != nil {
+		return fmt.Errorf("mediastore: snapshot: %w", err)
 	}
 	if err := swapSnapshot(dir, tmp); err != nil {
 		return fmt.Errorf("mediastore: snapshot: %w", err)
