@@ -19,7 +19,8 @@ import (
 // ErrSnapshot is returned for a snapshot this package cannot read or
 // write: an empty selection, a duplicate id, an unsupported manifest
 // version, a missing blob file, a size that disagrees with the bytes,
-// or a visibility the manifest does not define. Hash mismatches and id
+// a visibility the manifest does not define, or a destination that is
+// not absent, empty, or already a snapshot. Hash mismatches and id
 // collisions have their own sentinels.
 var ErrSnapshot = errors.New("mediastore: invalid snapshot")
 
@@ -75,11 +76,21 @@ type Selection struct {
 // cleaned first, so a trailing separator names the same directory and
 // does not leave a stray empty directory behind. The cleaned path "."
 // is refused: this call replaces its destination, and the current
-// directory is not one it will claim. dir is created when it is absent.
-// The committed directory is mode 0755, which is what a portable
-// fixture needs; blob files inside it are mode 0644 and are named by
-// the blob id. The manifest is written last, so a directory without
-// manifest.json is not a snapshot Restore will accept.
+// directory is not one it will claim. The store's own blob directory
+// is refused for the same reason. dir is created when it is absent.
+// An existing path is replaced only when it is an empty directory or
+// a directory that already contains manifest.json. A regular file, or
+// a directory that holds other files and no manifest, is left untouched.
+//
+// The committed directory is always mode 0755, including when a
+// previous snapshot was tighter. Blob files inside it are mode 0644
+// and are named by the blob id. That is the portable-fixture contract,
+// not a preservation of the destination's previous mode. A snapshot
+// can include private blobs, and those bytes are then readable by any
+// local user who can traverse dir's parents. Put a confidential
+// snapshot under a directory those users cannot traverse. The manifest
+// is written last, so a directory without manifest.json is not a
+// snapshot Restore will accept.
 //
 // The capture is the rows and files as they stand while each blob is
 // read. Blob bytes are immutable once stored, so a row and its file
@@ -98,6 +109,9 @@ func (s *Store) Snapshot(ctx context.Context, dir string, sel Selection) error {
 	dir = filepath.Clean(dir)
 	if dir == "." {
 		return fmt.Errorf("mediastore: snapshot: %w: directory must not be the current directory", ErrSnapshot)
+	}
+	if samePath(dir, s.dir) {
+		return fmt.Errorf("mediastore: snapshot: %w: will not replace the store directory", ErrSnapshot)
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -185,12 +199,18 @@ func (s *Store) writeSnapshot(ctx context.Context, dir string, blobs []Blob) err
 // swapSnapshot moves tmp onto dir. dir is renamed aside first when it
 // already exists, and moved back if the swap fails, so a reader never
 // sees a truncated fixture and a failed call does not replace a good one.
+// An existing path is claimed only when it is a directory that is empty
+// or already holds manifest.json. Anything else, including a regular
+// file or a directory of unrelated files, is refused before the rename.
 func swapSnapshot(dir, tmp string) error {
-	_, err := os.Stat(dir)
+	info, err := os.Stat(dir)
 	if errors.Is(err, os.ErrNotExist) {
 		return os.Rename(tmp, dir)
 	}
 	if err != nil {
+		return err
+	}
+	if err := snapshotDestination(dir, info); err != nil {
 		return err
 	}
 	backup, err := os.MkdirTemp(filepath.Dir(dir), filepath.Base(dir)+".previous-")
@@ -214,6 +234,41 @@ func swapSnapshot(dir, tmp string) error {
 	// fixture was kept.
 	os.RemoveAll(backup)
 	return nil
+}
+
+// snapshotDestination reports whether dir may be replaced. A directory
+// that already contains the manifest is a previous snapshot. An empty
+// directory was created by the caller and holds nothing to lose. A
+// file, or a directory with any other contents, is not.
+func snapshotDestination(dir string, info os.FileInfo) error {
+	if !info.IsDir() {
+		return fmt.Errorf("%w: %s is not a directory", ErrSnapshot, dir)
+	}
+	_, err := os.Stat(filepath.Join(dir, manifestFile))
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	if len(entries) > 0 {
+		return fmt.Errorf("%w: %s holds files and no %s", ErrSnapshot, dir, manifestFile)
+	}
+	return nil
+}
+
+// samePath reports whether a and b name the same path after cleaning.
+func samePath(a, b string) bool {
+	aa, errA := filepath.Abs(a)
+	bb, errB := filepath.Abs(b)
+	if errA != nil || errB != nil {
+		return filepath.Clean(a) == filepath.Clean(b)
+	}
+	return filepath.Clean(aa) == filepath.Clean(bb)
 }
 
 // selectBlobs resolves sel to metadata rows. IDs, when set, are read in
@@ -314,7 +369,10 @@ func (s *Store) openBlob(id string) (io.ReadCloser, error) {
 // manifest version is not ManifestVersion, a blob file is missing, a
 // size or digest disagrees, or any id is already stored. A failure
 // after the first blob has been stored removes the blobs this call
-// created and leaves anything that was already there untouched. Bytes
+// created and leaves anything that was already there untouched. That
+// cleanup deletes by id. It does not notice another caller deleting
+// one of those ids and creating it again before this call returns, so
+// do not reuse an id this Restore has written until it returns. Bytes
 // land only through PersistWithID.
 //
 // Visibility is not a retention pin. A restored row is swept on the same

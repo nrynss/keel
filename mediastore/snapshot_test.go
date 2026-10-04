@@ -429,6 +429,92 @@ func TestSnapshotRefusesDot(t *testing.T) {
 	}
 }
 
+func TestSnapshotRefusesADestinationThatIsNotASnapshot(t *testing.T) {
+	s := openTestStore(t)
+	blobID := putBytes(t, s, "png-bytes", Put{ContentType: "image/png", Owner: "alice", Visibility: Private})
+
+	file := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(file, []byte("keep"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := s.Snapshot(t.Context(), file, Selection{IDs: []string{blobID}})
+	if !errors.Is(err, ErrSnapshot) {
+		t.Fatalf("file dest err = %v, want invalid snapshot", err)
+	}
+	got, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "keep" {
+		t.Fatalf("file contents = %q, want keep", got)
+	}
+
+	busy := filepath.Join(t.TempDir(), "unrelated")
+	if err := os.Mkdir(busy, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(busy, "notes.txt"), []byte("keep"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err = s.Snapshot(t.Context(), busy, Selection{IDs: []string{blobID}})
+	if !errors.Is(err, ErrSnapshot) {
+		t.Fatalf("unrelated dir err = %v, want invalid snapshot", err)
+	}
+	notes, err := os.ReadFile(filepath.Join(busy, "notes.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(notes) != "keep" {
+		t.Fatalf("notes = %q, want keep", notes)
+	}
+	if _, statErr := os.Stat(filepath.Join(busy, manifestFile)); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("manifest in unrelated dir: %v", statErr)
+	}
+
+	err = s.Snapshot(t.Context(), s.dir, Selection{IDs: []string{blobID}})
+	if !errors.Is(err, ErrSnapshot) {
+		t.Fatalf("store dir err = %v, want invalid snapshot", err)
+	}
+	if _, err := s.find(t.Context(), blobID); err != nil {
+		t.Fatalf("store blob after refused snapshot: %v", err)
+	}
+
+	empty := filepath.Join(t.TempDir(), "empty")
+	if err := os.Mkdir(empty, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Snapshot(t.Context(), empty, Selection{IDs: []string{blobID}}); err != nil {
+		t.Fatalf("empty dir: %v", err)
+	}
+	info, err := os.Stat(empty)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o755 {
+		t.Fatalf("empty dir mode after snapshot = %o, want 0755", info.Mode().Perm())
+	}
+	if err := os.Chmod(empty, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Snapshot(t.Context(), empty, Selection{IDs: []string{blobID}}); err != nil {
+		t.Fatalf("refresh of a snapshot: %v", err)
+	}
+	info, err = os.Stat(empty)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o755 {
+		t.Fatalf("refresh mode = %o, want 0755 even after a tighter chmod", info.Mode().Perm())
+	}
+	dst := openTestStore(t)
+	if err := dst.Restore(t.Context(), empty); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dst.find(t.Context(), blobID); err != nil {
+		t.Fatalf("restored after refresh: %v", err)
+	}
+}
+
 func TestSnapshotCancelledContext(t *testing.T) {
 	s := openTestStore(t)
 	ctx, cancel := context.WithCancel(t.Context())
