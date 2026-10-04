@@ -284,7 +284,7 @@ func (s refusingSink) Add(context.Context, Charge) error { return s.err }
 // TestMeterReportsAChargeTheSinkRefuses pins that a sink write that fails
 // reports ErrUnrecordedCharge carrying the sink's own error, with the zero
 // usage. The call ran and the settle booked its spend, so the budget holds
-// the fact even though no record of it landed, and the reservation stays
+// the fact even though no record of it landed. The reservation stays
 // consumed rather than released a second time.
 func TestMeterReportsAChargeTheSinkRefuses(t *testing.T) {
 	sinkErr := errors.New("disk refused the write")
@@ -372,6 +372,84 @@ func TestMeterRecoversAfterARefusedCharge(t *testing.T) {
 	}
 	if sink.taken[0].Ref != "job-2" {
 		t.Errorf("recorded charge ref = %q, want job-2, the refused charge never lands", sink.taken[0].Ref)
+	}
+}
+
+// countingAccount wraps an Account and records every Release, so a test can
+// pin that no release ran.
+type countingAccount struct {
+	Account
+	mu       sync.Mutex
+	releases []Price
+}
+
+func (a *countingAccount) Release(reserved Price) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.releases = append(a.releases, reserved)
+	a.Account.Release(reserved)
+}
+
+// TestMeterRefusedWriteReleasesNoHold pins the invariant the booked flag
+// carries. A refused charge write comes back after the settle consumed the
+// reservation, so it must release nothing. A release there would eat a
+// sibling caller's live hold instead. Every other refusal test passes one
+// caller, and an account clamps a release past the holds it knows, so this
+// test stands a sibling hold beside the refused call.
+func TestMeterRefusedWriteReleasesNoHold(t *testing.T) {
+	budget, err := NewBudget(100 * Cent)
+	if err != nil {
+		t.Fatalf("NewBudget: %v", err)
+	}
+	account := &countingAccount{Account: budget}
+	sink := &onceRefusingSink{err: errors.New("first write refused"), fail: true}
+	meter, err := NewMeter(account, sink)
+	if err != nil {
+		t.Fatalf("NewMeter: %v", err)
+	}
+	// The sibling hold stands for another caller inside its work. A release
+	// past the settle would land on it, because the caller's own hold is
+	// already gone.
+	if err := budget.Reserve(30 * Cent); err != nil {
+		t.Fatalf("Reserve sibling hold: %v", err)
+	}
+	usage, err := meter.Call(context.Background(), 30*Cent, "transcribe", "job-1",
+		func(context.Context) (Usage, error) {
+			return Usage{Price: 12 * Cent, Measured: true}, nil
+		})
+	if !errors.Is(err, ErrUnrecordedCharge) {
+		t.Fatalf("Call error = %v, want ErrUnrecordedCharge", err)
+	}
+	if usage != (Usage{}) {
+		t.Errorf("Call usage = %+v, want the zero usage", usage)
+	}
+	if got := budget.Reserved(); got != 30*Cent {
+		t.Errorf("Reserved() = %d, want %d, the sibling hold survives the refused write", got, 30*Cent)
+	}
+	if got, err := budget.Remaining(); err != nil || got != 58*Cent {
+		t.Errorf("Remaining() = %d, %v, want %d", got, err, 58*Cent)
+	}
+	account.mu.Lock()
+	defer account.mu.Unlock()
+	if len(account.releases) != 0 {
+		t.Errorf("Release ran %d times, want 0, the settle consumed the reservation", len(account.releases))
+	}
+}
+
+// TestMeterRefusesTypedNilAccountAndSink pins that an interface holding a
+// nil pointer is refused like a plain nil. Such a value passes a plain
+// equality check against nil and would panic on first use, after the settle
+// had already booked spend.
+func TestMeterRefusesTypedNilAccountAndSink(t *testing.T) {
+	if _, err := NewMeter((*Budget)(nil), NewLedger()); !errors.Is(err, ErrNilAccount) {
+		t.Errorf("NewMeter((*Budget)(nil), sink) error = %v, want ErrNilAccount", err)
+	}
+	budget, err := NewBudget(100 * Cent)
+	if err != nil {
+		t.Fatalf("NewBudget: %v", err)
+	}
+	if _, err := NewMeter(budget, (*Ledger)(nil)); !errors.Is(err, ErrNilSink) {
+		t.Errorf("NewMeter(budget, (*Ledger)(nil)) error = %v, want ErrNilSink", err)
 	}
 }
 

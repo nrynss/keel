@@ -162,12 +162,13 @@ A store opened with `Period: cost.DailyUTC` restarts its ceiling every UTC day, 
 every month, so a limit bounds one window rather than all spend ever booked. A `cost.KeyedBudget` divides one pool by owner under a global ceiling, so one owner cannot spend
 another owner's headroom. Each owner reserves and settles through its own account from `Owner`.
 A `cost.Meter` runs one paid call against an account: it reserves the estimate, runs the work,
-settles the measured price, and frees the reservation on every failure path. A call that reports
-no usage settles at its estimate and says so in the returned `Usage`. The settle lands in a
-`cost.ChargeSink`: the in-memory `cost.Ledger` is one sink, and the `cost/sqlitestore` store is
-another, and an application with its own spend store writes the one-method sink itself. A charge
-the sink cannot record comes back from `Meter.Call` as `cost.ErrUnrecordedCharge`, so a figure
-no store backs is never shown as booked. `KeyedBudget.ForgetOwner`
+and settles the measured price. It frees the reservation on every failure up to the settle.
+A call that reports no usage settles at its estimate and says so in the returned `Usage`. The
+settle lands in a `cost.ChargeSink`. The in-memory `cost.Ledger` is one sink, and the
+`cost/sqlitestore` store is another. An application with its own spend store writes the
+one-method sink itself. A charge the sink cannot record is the one failure past the settle.
+`Meter.Call` reports it as `cost.ErrUnrecordedCharge`, with a zero `Usage`, so a figure no
+store backs is never shown as booked. `KeyedBudget.ForgetOwner`
 removes an owner's budget, reservations and settle history after its live reservations finish.
 
 ### Retry a paid call that a wait can clear

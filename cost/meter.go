@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 )
 
 // ErrNilAccount reports a meter built without a budget account.
@@ -69,9 +70,11 @@ type Usage struct {
 type Work func(context.Context) (Usage, error)
 
 // Meter runs paid calls against one account and records what each call
-// settles at in its sink. It reserves the estimate before the call runs,
-// settles the measured price after it, and frees the reservation on every
-// failure path, so a failed, cancelled or panicking call never holds budget.
+// settles at in its sink. It reserves the estimate before the call runs and
+// settles the measured price after it. It frees the reservation on every
+// failure up to and including the settle, so a failed, cancelled or
+// panicking call never holds budget. A charge the sink cannot record is the
+// one failure past the settle, and Call reports it as ErrUnrecordedCharge.
 // Build one with NewMeter. Call is safe for concurrent use, because every
 // method it drives is.
 type Meter struct {
@@ -79,15 +82,26 @@ type Meter struct {
 	sink    ChargeSink
 }
 
+// isNilValue reports whether v is nil or an interface holding a nil pointer.
+// A typed nil such as (*Ledger)(nil) passes a plain == nil check and would
+// panic at first use, so the constructor checks the pointer itself.
+func isNilValue(v any) bool {
+	if v == nil {
+		return true
+	}
+	r := reflect.ValueOf(v)
+	return r.Kind() == reflect.Pointer && r.IsNil()
+}
+
 // NewMeter returns a Meter that bounds every call by account and records
 // every settled charge in sink. It reports ErrNilAccount or ErrNilSink when
-// one of them is nil, because a meter that could not bound or record a call
-// would only pretend to.
+// one of them is nil, including an interface holding a nil pointer, because
+// a meter that could not bound or record a call would only pretend to.
 func NewMeter(account Account, sink ChargeSink) (*Meter, error) {
-	if account == nil {
+	if isNilValue(account) {
 		return nil, ErrNilAccount
 	}
-	if sink == nil {
+	if isNilValue(sink) {
 		return nil, ErrNilSink
 	}
 	return &Meter{account: account, sink: sink}, nil
@@ -101,16 +115,18 @@ func NewMeter(account Account, sink ChargeSink) (*Meter, error) {
 // measured price below zero reports ErrNegativePrice before any booking,
 // because a refund is a separate charge and never a negative booking.
 //
-// A returned error frees the reservation. So does a context that finishes
-// mid-call, which surfaces as the error the work returns. A panic in work
-// frees the reservation while it unwinds and continues past Call with its
-// own value and stack, because the panic belongs to the caller's code. No
-// failed call books spend or records a charge. A settle the account refuses
-// frees the reservation and reports the error, so a call that books nothing
-// leaves nothing held. A charge the sink refuses to record reports
+// Every failure on the way to the settle frees the reservation, so a call
+// that books nothing leaves nothing held. A context that finishes mid-call
+// surfaces as the error the work returns and frees the reservation the
+// same way. A panic in work frees the reservation while it unwinds and
+// continues past Call with its own value and stack, because the panic
+// belongs to the caller's code. A settle the account refuses frees the
+// reservation and reports the error, so no failed call books spend or
+// records a charge on any of those paths. A charge the sink then refuses
+// to record is the one error past the settle. The call ran and its spend
+// is booked, so the reservation stays consumed. Call reports
 // ErrUnrecordedCharge with the sink's error and the zero usage, because a
-// figure no record backs is not a result. The call ran and its spend is
-// booked, so the reservation stays consumed.
+// figure no record backs is not a result.
 func (m *Meter) Call(ctx context.Context, estimate Price, kind, ref string, work Work) (Usage, error) {
 	if err := ctx.Err(); err != nil {
 		return Usage{}, err
