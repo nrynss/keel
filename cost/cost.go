@@ -1,11 +1,14 @@
 // Package cost records what paid API calls spend. A Price counts nanodollars
 // in an int64, so sums stay exact to the cent. A Ledger keeps charges and
-// totals them by kind and by reference. A Budget bounds the spend of a
-// sequence of calls, and a KeyedBudget gives each of several owners a share
-// of one pool under a global ceiling. Rate cards stay in each application.
+// totals them by kind and by reference. A ChargeSink is where a settled
+// charge lands, and the Ledger is the in-memory one. A Budget bounds the
+// spend of a sequence of calls, and a KeyedBudget gives each of several
+// owners a share of one pool under a global ceiling. Rate cards stay in each
+// application.
 package cost
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math"
@@ -136,11 +139,14 @@ func NewLedger() *Ledger {
 	return &Ledger{}
 }
 
-// Add appends c to the ledger.
-func (l *Ledger) Add(c Charge) {
+// Add appends c to the ledger. The context and the error exist so a Ledger
+// satisfies ChargeSink. An in-memory append does no I/O and cannot fail, so
+// Add ignores the context and always returns nil.
+func (l *Ledger) Add(ctx context.Context, c Charge) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.charges = append(l.charges, c)
+	return nil
 }
 
 // Charges returns a copy of every recorded charge. A later Add never changes

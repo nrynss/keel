@@ -11,8 +11,14 @@ import (
 // share.
 func ExampleLedger() {
 	ledger := cost.NewLedger()
-	ledger.Add(cost.Charge{Kind: "tts", Units: 1200, UnitPrice: cost.Microdollar, Ref: "job-1"})
-	ledger.Add(cost.Charge{Kind: "llm", Units: 1, UnitPrice: cost.USD(0.25), Ref: "job-2"})
+	if err := ledger.Add(context.Background(), cost.Charge{Kind: "tts", Units: 1200, UnitPrice: cost.Microdollar, Ref: "job-1"}); err != nil {
+		fmt.Println("add failed:", err)
+		return
+	}
+	if err := ledger.Add(context.Background(), cost.Charge{Kind: "llm", Units: 1, UnitPrice: cost.USD(0.25), Ref: "job-2"}); err != nil {
+		fmt.Println("add failed:", err)
+		return
+	}
 
 	total, err := ledger.Total()
 	if err != nil {

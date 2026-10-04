@@ -1,6 +1,7 @@
 package cost
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math"
@@ -10,6 +11,15 @@ import (
 	"sync/atomic"
 	"testing"
 )
+
+// addCharge appends c to l, ending the test if the append ever fails. An
+// in-memory add cannot fail, so only a broken Ledger gets past it.
+func addCharge(t *testing.T, l *Ledger, c Charge) {
+	t.Helper()
+	if err := l.Add(context.Background(), c); err != nil {
+		t.Fatalf("add charge: %v", err)
+	}
+}
 
 func TestPriceArithmetic(t *testing.T) {
 	if USD(1.0) != Dollar {
@@ -95,7 +105,7 @@ func TestChargeTotalOverflow(t *testing.T) {
 // ErrOverflow from every total.
 func TestLedgerTotalOverflow(t *testing.T) {
 	l := NewLedger()
-	l.Add(Charge{Kind: "huge", Units: int(math.MaxInt64), UnitPrice: 2, Ref: "a"})
+	addCharge(t, l, Charge{Kind: "huge", Units: int(math.MaxInt64), UnitPrice: 2, Ref: "a"})
 
 	for name, total := range map[string]func() (Price, error){
 		"Total":       l.Total,
@@ -115,7 +125,7 @@ func TestLedgerConcurrentAdds(t *testing.T) {
 	const writers = 50
 	const perWriter = 40
 	l := NewLedger()
-	l.Add(Charge{Kind: "other", Units: 1, UnitPrice: Dollar, Ref: "job-b"})
+	addCharge(t, l, Charge{Kind: "other", Units: 1, UnitPrice: Dollar, Ref: "job-b"})
 
 	var wg sync.WaitGroup
 	for w := 0; w < writers; w++ {
@@ -123,7 +133,10 @@ func TestLedgerConcurrentAdds(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < perWriter; i++ {
-				l.Add(Charge{Kind: "synth", Units: 10, UnitPrice: Cent, Ref: "job-a"})
+				if err := l.Add(context.Background(), Charge{Kind: "synth", Units: 10, UnitPrice: Cent, Ref: "job-a"}); err != nil {
+					t.Errorf("add charge: %v", err)
+					return
+				}
 			}
 		}()
 	}
@@ -276,8 +289,8 @@ func TestLedgerTotalSumOverflow(t *testing.T) {
 	}
 
 	l := NewLedger()
-	l.Add(half)
-	l.Add(half)
+	addCharge(t, l, half)
+	addCharge(t, l, half)
 
 	for name, total := range map[string]func() (Price, error){
 		"Total":       l.Total,
@@ -475,7 +488,7 @@ func TestLedgerTotalExactSumOrders(t *testing.T) {
 	for name, order := range orders {
 		l := NewLedger()
 		for _, c := range order {
-			l.Add(c)
+			addCharge(t, l, c)
 		}
 		for accessor, total := range map[string]func() (Price, error){
 			"Total":       l.Total,
@@ -496,9 +509,9 @@ func TestLedgerTotalExactSumOrders(t *testing.T) {
 func TestLedgerTotalExactSumOverflow(t *testing.T) {
 	huge := Charge{Kind: "k", Units: 1, UnitPrice: math.MaxInt64, Ref: "r"}
 	l := NewLedger()
-	l.Add(huge)
-	l.Add(huge)
-	l.Add(huge)
+	addCharge(t, l, huge)
+	addCharge(t, l, huge)
+	addCharge(t, l, huge)
 	for accessor, total := range map[string]func() (Price, error){
 		"Total":       l.Total,
 		"TotalByKind": func() (Price, error) { return l.TotalByKind("k") },
@@ -515,8 +528,8 @@ func TestLedgerTotalExactSumOverflow(t *testing.T) {
 // accumulator is reached only when the exact sum leaves the range.
 func TestLedgerTotalFastPathAllocatesNothing(t *testing.T) {
 	l := NewLedger()
-	l.Add(Charge{Kind: "k", Units: 1, UnitPrice: Cent, Ref: "r"})
-	l.Add(Charge{Kind: "k", Units: 2, UnitPrice: Cent, Ref: "r"})
+	addCharge(t, l, Charge{Kind: "k", Units: 1, UnitPrice: Cent, Ref: "r"})
+	addCharge(t, l, Charge{Kind: "k", Units: 2, UnitPrice: Cent, Ref: "r"})
 	for accessor, total := range map[string]func() (Price, error){
 		"Total":       l.Total,
 		"TotalByKind": func() (Price, error) { return l.TotalByKind("k") },
@@ -548,7 +561,7 @@ func TestLedgerTotalCompensatingProductOverflow(t *testing.T) {
 	for name, order := range orders {
 		l := NewLedger()
 		for _, c := range order {
-			l.Add(c)
+			addCharge(t, l, c)
 		}
 		checkTotal(t, name, l, want, false)
 	}
@@ -559,8 +572,8 @@ func TestLedgerTotalCompensatingProductOverflow(t *testing.T) {
 // total does not fit either.
 func TestLedgerTotalExactProductSumOverflow(t *testing.T) {
 	l := NewLedger()
-	l.Add(Charge{Kind: "k", Units: 2, UnitPrice: math.MaxInt64, Ref: "r"})
-	l.Add(Charge{Kind: "k", Units: 1, UnitPrice: math.MaxInt64, Ref: "r"})
+	addCharge(t, l, Charge{Kind: "k", Units: 2, UnitPrice: math.MaxInt64, Ref: "r"})
+	addCharge(t, l, Charge{Kind: "k", Units: 1, UnitPrice: math.MaxInt64, Ref: "r"})
 	checkTotal(t, "product and sum overflow", l, 0, true)
 }
 
@@ -619,7 +632,7 @@ func TestLedgerTotalMatchesExactModel(t *testing.T) {
 		for _, order := range [][]Charge{charges, reverseCharges(charges)} {
 			l := NewLedger()
 			for _, c := range order {
-				l.Add(c)
+				addCharge(t, l, c)
 			}
 			checkTotal(t, fmt.Sprintf("case %d", i), l, want, wantOverflow)
 		}

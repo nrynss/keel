@@ -9,11 +9,16 @@ import (
 // ErrNilAccount reports a meter built without a budget account.
 var ErrNilAccount = errors.New("cost: nil meter account")
 
-// ErrNilLedger reports a meter built without a ledger.
-var ErrNilLedger = errors.New("cost: nil meter ledger")
+// ErrNilSink reports a meter built without a charge sink.
+var ErrNilSink = errors.New("cost: nil meter sink")
 
 // ErrNegativePrice reports a call that measured a price below zero.
 var ErrNegativePrice = errors.New("cost: negative measured price")
+
+// ErrUnrecordedCharge reports that a settled charge did not land in the
+// meter's sink. The call itself ran and its spend is booked against the
+// account, so the condition is a missing record, not an unrun call.
+var ErrUnrecordedCharge = errors.New("cost: unrecorded charge")
 
 // Account is the budget side a meter drives. A Budget is an account on its
 // own, and a KeyedBudget hands out one account per owner through Owner. The
@@ -29,6 +34,21 @@ type Account interface {
 	// Release frees a reservation the call never spent.
 	Release(reserved Price)
 }
+
+// ChargeSink is where a settled charge is recorded. The in-memory Ledger is
+// one sink, and the cost/sqlitestore Store is another. An application that
+// keeps its spend record somewhere else carries its own one-method sink and
+// hands it to NewMeter.
+type ChargeSink interface {
+	// Add records one charge before it returns. It reports the error
+	// when the charge did not land, so the caller never reports a figure
+	// the sink cannot back.
+	Add(ctx context.Context, c Charge) error
+}
+
+// A Ledger satisfies ChargeSink, so a meter can record into the in-memory
+// ledger out of the box.
+var _ ChargeSink = (*Ledger)(nil)
 
 // Usage is the price one paid call reports for itself. A work function
 // returns one when its call finishes, and Call returns the usage it settled
@@ -49,28 +69,28 @@ type Usage struct {
 type Work func(context.Context) (Usage, error)
 
 // Meter runs paid calls against one account and records what each call
-// settles at. It reserves the estimate before the call runs, settles the
-// measured price after it, and frees the reservation on every failure path,
-// so a failed, cancelled or panicking call never holds budget. Build one
-// with NewMeter. Call is safe for concurrent use, because every method it
-// drives is.
+// settles at in its sink. It reserves the estimate before the call runs,
+// settles the measured price after it, and frees the reservation on every
+// failure path, so a failed, cancelled or panicking call never holds budget.
+// Build one with NewMeter. Call is safe for concurrent use, because every
+// method it drives is.
 type Meter struct {
 	account Account
-	ledger  *Ledger
+	sink    ChargeSink
 }
 
 // NewMeter returns a Meter that bounds every call by account and records
-// every settled charge in ledger. It reports ErrNilAccount or ErrNilLedger
-// when one of them is nil, because a meter that could not bound or record a
-// call would only pretend to.
-func NewMeter(account Account, ledger *Ledger) (*Meter, error) {
+// every settled charge in sink. It reports ErrNilAccount or ErrNilSink when
+// one of them is nil, because a meter that could not bound or record a call
+// would only pretend to.
+func NewMeter(account Account, sink ChargeSink) (*Meter, error) {
 	if account == nil {
 		return nil, ErrNilAccount
 	}
-	if ledger == nil {
-		return nil, ErrNilLedger
+	if sink == nil {
+		return nil, ErrNilSink
 	}
-	return &Meter{account: account, ledger: ledger}, nil
+	return &Meter{account: account, sink: sink}, nil
 }
 
 // Call runs work as one paid call against the meter's account. It commits
@@ -87,7 +107,10 @@ func NewMeter(account Account, ledger *Ledger) (*Meter, error) {
 // own value and stack, because the panic belongs to the caller's code. No
 // failed call books spend or records a charge. A settle the account refuses
 // frees the reservation and reports the error, so a call that books nothing
-// leaves nothing held.
+// leaves nothing held. A charge the sink refuses to record reports
+// ErrUnrecordedCharge with the sink's error and the zero usage, because a
+// figure no record backs is not a result. The call ran and its spend is
+// booked, so the reservation stays consumed.
 func (m *Meter) Call(ctx context.Context, estimate Price, kind, ref string, work Work) (Usage, error) {
 	if err := ctx.Err(); err != nil {
 		return Usage{}, err
@@ -97,8 +120,8 @@ func (m *Meter) Call(ctx context.Context, estimate Price, kind, ref string, work
 	}
 	// booked lifts the release off the one path that already settled, so
 	// the settle consuming the reservation is never followed by a second
-	// release that would eat another caller's hold. A panic skips the
-	// assignment below, so unwinding runs the release and the panic
+	// release that would eat another caller's hold. A panic in work skips
+	// the assignment below, so unwinding runs the release and the panic
 	// continues past it on its own.
 	booked := false
 	defer func() {
@@ -120,7 +143,9 @@ func (m *Meter) Call(ctx context.Context, estimate Price, kind, ref string, work
 	if err := m.account.Settle(estimate, price); err != nil {
 		return Usage{}, err
 	}
-	m.ledger.Add(Charge{Kind: kind, Units: 1, UnitPrice: price, Ref: ref})
 	booked = true
+	if err := m.sink.Add(ctx, Charge{Kind: kind, Units: 1, UnitPrice: price, Ref: ref}); err != nil {
+		return Usage{}, fmt.Errorf("%w: %w", ErrUnrecordedCharge, err)
+	}
 	return Usage{Price: price, Measured: usage.Measured}, nil
 }
