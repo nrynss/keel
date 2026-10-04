@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -174,6 +175,24 @@ func TestReadCommittedMP3(t *testing.T) {
 	const frame = 26 * time.Millisecond
 	if got < 3*time.Second-frame || got > 3*time.Second+frame {
 		t.Fatalf("tone-48k.mp3 = %s, want within %s of 3s", got, frame)
+	}
+}
+
+func TestReadMalformedID3NamesTheTag(t *testing.T) {
+	// ID3, an invalid version byte, then a valid MPEG sync at offset 10.
+	b := make([]byte, 14)
+	copy(b, "ID3")
+	b[3] = 0xFF
+	b[10], b[11], b[12], b[13] = 0xFF, 0xFB, 0x90, 0xC0
+	_, err := Read(b)
+	if !errors.Is(err, ErrUnknown) {
+		t.Fatalf("err = %v, want ErrUnknown", err)
+	}
+	if strings.Contains(err.Error(), "frame header") {
+		t.Fatalf("message blames a frame header: %v", err)
+	}
+	if !strings.Contains(err.Error(), "malformed ID3 tag whose size cannot be trusted") {
+		t.Fatalf("message = %v", err)
 	}
 }
 

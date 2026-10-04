@@ -97,8 +97,11 @@ func wavDuration(b []byte) (time.Duration, error) {
 func mp3Duration(b []byte) (time.Duration, error) {
 	off := 0
 	if len(b) >= 10 && string(b[:3]) == "ID3" {
+		// Version 0xFF is not an ID3 version, so the size that follows cannot
+		// be trusted. A valid MPEG frame may still begin at offset 10. This
+		// is a malformed tag, not a missing frame.
 		if b[3] == 0xFF {
-			return 0, fmt.Errorf("%w: ID3 tag has no frame header", ErrUnknown)
+			return 0, fmt.Errorf("%w: malformed ID3 tag whose size cannot be trusted", ErrUnknown)
 		}
 		size := syncsafe(b[6:10])
 		if size < 0 {
