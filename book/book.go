@@ -4,7 +4,9 @@
 // The PDF library stays inside this package. Callers pass a font directory
 // and a file name, page size, and margins, and Write returns an error
 // instead of panicking when a page cannot be drawn. The result is image
-// pages and captions. It is not a typesetter.
+// pages and captions. It is not a typesetter. A caption is measured as
+// UTF-8, the same way it is drawn. The library does not shape complex
+// scripts, so a caption that needs shaping is drawn as a sequence of glyphs.
 package book
 
 import (
@@ -195,7 +197,10 @@ func drawPage(pdf *fpdf.Fpdf, cfg resolved, index int, page Page) error {
 		pdf.SetFont(fontFamily, "", cfg.fontSize)
 		_, unit := pdf.GetFontSize()
 		lineH = unit * lineFactor
-		lines := pdf.SplitLines([]byte(page.Caption), contentW)
+		// SplitText walks runes, which is what MultiCell uses for a UTF-8
+		// face. SplitLines walks bytes and both under- and over-measures
+		// a caption that is not ASCII.
+		lines := pdf.SplitText(page.Caption, contentW)
 		captionH = float64(len(lines)) * lineH
 		if captionH > contentH {
 			return fmt.Errorf("book: write: %w: caption is taller than the page", ErrInvalid)

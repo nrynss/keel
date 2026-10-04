@@ -168,3 +168,51 @@ func TestWriteNilWriter(t *testing.T) {
 		t.Fatalf("err = %v, want invalid input", err)
 	}
 }
+
+func TestWriteRejectsCaptionTallerThanThePage(t *testing.T) {
+	cfg := fontConfig(t)
+	// One line of this face is just under the content height. Two lines
+	// are taller than the page.
+	cfg.FontSize = 626
+	err := Write(t.Context(), &bytes.Buffer{}, cfg, []Page{{Caption: "HH"}})
+	if !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), "taller than the page") {
+		t.Fatalf("err = %v, want a caption taller than the page", err)
+	}
+}
+
+func TestWriteRejectsCaptionThatLeavesNoRoomForTheImage(t *testing.T) {
+	cfg := fontConfig(t)
+	cfg.FontSize = 626
+	err := Write(t.Context(), &bytes.Buffer{}, cfg, []Page{{
+		Image:     tinyPNG(t, 2, 2),
+		ImageType: "png",
+		Caption:   "H",
+	}})
+	if !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), "no room for the image") {
+		t.Fatalf("err = %v, want no room for the image", err)
+	}
+}
+
+func TestWriteAcceptsAccentedCaptionThatFits(t *testing.T) {
+	cfg := fontConfig(t)
+	// Byte-based measurement over-counts these words and refuses a caption
+	// that still fits. Rune measurement accepts it.
+	caption := strings.TrimSpace(strings.Repeat("éàü ", 600))
+	var buf bytes.Buffer
+	err := Write(t.Context(), &buf, cfg, []Page{{Caption: caption}})
+	if err != nil {
+		t.Fatalf("accented caption that fits was refused: %v", err)
+	}
+	if pageCount(buf.Bytes()) != 1 {
+		t.Fatalf("pages = %d, want 1", pageCount(buf.Bytes()))
+	}
+}
+
+func TestWriteRejectsAccentedCaptionThatOverflows(t *testing.T) {
+	cfg := fontConfig(t)
+	cfg.FontSize = 626
+	err := Write(t.Context(), &bytes.Buffer{}, cfg, []Page{{Caption: "éé"}})
+	if !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), "taller than the page") {
+		t.Fatalf("err = %v, want a non-ASCII caption taller than the page", err)
+	}
+}

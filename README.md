@@ -348,9 +348,11 @@ err := book.Write(ctx, &pdf, book.Config{
 `book` draws one sheet per page: the image fitted inside the margins, and the
 caption under it. The face is a file name inside `FontDir`, so a caption cannot
 point the loader at an arbitrary path. Image-only pages need no font. A caption
-taller than the page, or a page with neither an image nor a caption, is refused.
-`Write` returns an error, including when the PDF library panics, and a cancelled
-context writes nothing.
+taller than the page, or one that leaves no room for the image, is refused, and
+so is a page with neither an image nor a caption. Caption height is measured in
+runes, so a non-ASCII caption is not accepted when it would run past the margin.
+The PDF library does not shape complex scripts. `Write` returns an error,
+including when the PDF library panics, and a cancelled context writes nothing.
 
 ### Bound a paid session with a lease
 
