@@ -8,8 +8,9 @@ import (
 )
 
 // TestSubscribeDefaultConfigSubstituted pins the zero-Config defaults:
-// New(Config{}) must substitute defaultHeartbeat, defaultBuffer and
-// defaultRetain. A default nobody executes is a default nobody tests.
+// New(Config{}) must substitute defaultHeartbeat, defaultBuffer,
+// defaultRetain and defaultReplay. A default nobody executes is a default
+// nobody tests.
 func TestSubscribeDefaultConfigSubstituted(t *testing.T) {
 	b := New(Config{})
 	if b.cfg.Heartbeat != defaultHeartbeat {
@@ -21,8 +22,12 @@ func TestSubscribeDefaultConfigSubstituted(t *testing.T) {
 	if b.cfg.Retain != defaultRetain {
 		t.Errorf("retain = %v, want %v", b.cfg.Retain, defaultRetain)
 	}
-	neg := Config{Heartbeat: -1, Buffer: -5, Retain: -1}
-	if got := neg.withDefaults(); got.Heartbeat != defaultHeartbeat || got.Buffer != defaultBuffer || got.Retain != defaultRetain {
+	if b.cfg.Replay != defaultReplay {
+		t.Errorf("replay = %d, want %d", b.cfg.Replay, defaultReplay)
+	}
+	neg := Config{Heartbeat: -1, Buffer: -5, Retain: -1, Replay: -1}
+	got := neg.withDefaults()
+	if got.Heartbeat != defaultHeartbeat || got.Buffer != defaultBuffer || got.Retain != defaultRetain || got.Replay != defaultReplay {
 		t.Errorf("withDefaults on negative values = %+v, want the defaults", got)
 	}
 }
@@ -283,4 +288,45 @@ func TestPublishConcurrentWithSubscribe(t *testing.T) {
 	}
 	close(stop)
 	publishers.Wait()
+}
+
+// TestReplayRingDropsOldestAndForgetsAMissedCursor pins the bound: a ring
+// of two keeps the newest pair, so a cursor that has fallen out does not
+// match, and a cursor still inside yields only the events after it.
+func TestReplayRingDropsOldestAndForgetsAMissedCursor(t *testing.T) {
+	b := New(Config{Replay: 2, Retain: time.Hour})
+	for i := 1; i <= 3; i++ {
+		b.Publish("t", Event{Name: "progress", Data: i})
+	}
+	if _, sub := b.catchUp(context.Background(), "t", 1, true); sub == nil {
+		t.Fatal("catchUp returned a nil subscription")
+	} else {
+		sub.Cancel()
+	}
+	replay, sub := b.catchUp(context.Background(), "t", 1, true)
+	sub.Cancel()
+	if len(replay) != 0 {
+		t.Fatalf("replay after a dropped cursor = %+v, want none", replay)
+	}
+	replay, sub = b.catchUp(context.Background(), "t", 2, true)
+	defer sub.Cancel()
+	if len(replay) != 1 || replay[0].ID != 3 || replay[0].Data != 3 {
+		t.Fatalf("replay = %+v, want only event 3", replay)
+	}
+}
+
+// TestReplayRingDroppedAfterIdleRetain: once Retain passes with nobody
+// listening, a Last-Event-ID that used to match is a fresh subscribe.
+func TestReplayRingDroppedAfterIdleRetain(t *testing.T) {
+	b := New(Config{Retain: 20 * time.Millisecond})
+	b.Publish("t", Event{Name: "progress", Data: "gone"})
+	time.Sleep(60 * time.Millisecond)
+	replay, sub := b.catchUp(context.Background(), "t", 1, true)
+	defer sub.Cancel()
+	if len(replay) != 0 {
+		t.Fatalf("replay after the ring was dropped = %+v, want none", replay)
+	}
+	if got := b.subscribers("t"); got != 1 {
+		t.Errorf("subscribers = %d, want 1 (a live subscription)", got)
+	}
 }

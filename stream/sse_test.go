@@ -347,3 +347,126 @@ func TestServeTopicHeartbeatMatchesGolden(t *testing.T) {
 type errorAttempts struct {
 	Attempts int `json:"attempts"`
 }
+
+// serveRequest is serve with the caller's headers, so a test can send
+// Last-Event-ID.
+func serveRequest(t *testing.T, b *Broker, topic string, clientTimeout time.Duration, headers map[string]string) (*httptest.Server, *http.Response) {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b.ServeTopic(w, r, topic)
+	}))
+	t.Cleanup(srv.Close)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL, nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	for name, value := range headers {
+		req.Header.Set(name, value)
+	}
+	client := &http.Client{Timeout: clientTimeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	return srv, resp
+}
+
+// TestServeTopicReplaysAfterLastEventID: events published while the
+// subscriber was away are written in order, with their original ids,
+// before an event published after the reconnect.
+func TestServeTopicReplaysAfterLastEventID(t *testing.T) {
+	b := New(Config{Heartbeat: time.Hour, Retain: time.Hour})
+	b.Publish("job", Event{Name: "progress", Data: "one"})
+	b.Publish("job", Event{Name: "progress", Data: "two"})
+	b.Publish("job", Event{Name: "progress", Data: "three"})
+
+	_, resp := serveRequest(t, b, "job", 5*time.Second, map[string]string{"Last-Event-ID": "1"})
+	defer resp.Body.Close()
+
+	got := readN(t, resp.Body, 2, 5*time.Second)
+	want := "event: progress\nid: 2\ndata: \"two\"\n\nevent: progress\nid: 3\ndata: \"three\"\n\n"
+	if got != want {
+		t.Fatalf("replay = %q, want %q", got, want)
+	}
+
+	b.Publish("job", Event{Name: "progress", Data: "four"})
+	live := readN(t, resp.Body, 1, 5*time.Second)
+	if live != "event: progress\nid: 4\ndata: \"four\"\n\n" {
+		t.Fatalf("live after replay = %q, want event 4", live)
+	}
+}
+
+// TestServeTopicUnknownCursorDoesNotReplay: a cursor the ring does not
+// hold takes the ordinary late-subscribe path. A finished topic answers
+// with the retained terminal and not the earlier frames.
+func TestServeTopicUnknownCursorDoesNotReplay(t *testing.T) {
+	b := New(Config{Heartbeat: time.Hour, Retain: time.Hour})
+	b.Publish("job", Event{Name: "progress", Data: "old"})
+	b.Publish("job", Event{Name: "done", Data: "finished", Terminal: true})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/events", nil)
+	req.Header.Set("Last-Event-ID", "99")
+	b.ServeTopic(rec, req, "job")
+	want := "event: done\nid: 2\ndata: \"finished\"\n\n"
+	if rec.Body.String() != want {
+		t.Fatalf("body = %q, want %q", rec.Body.String(), want)
+	}
+}
+
+// TestServeTopicZeroCursorKeepsTerminalOnly: id 0 is the reset cursor, so
+// it does not walk the ring. A finished topic still answers with the
+// retained terminal alone. An unparsable cursor is the same.
+func TestServeTopicZeroCursorKeepsTerminalOnly(t *testing.T) {
+	b := New(Config{Heartbeat: time.Hour, Retain: time.Hour})
+	b.Publish("job", Event{Name: "progress", Data: "page"})
+	b.Publish("job", Event{Name: "done", Data: "finished", Terminal: true})
+
+	for _, cursor := range []string{"0", "nope", ""} {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/events", nil)
+		if cursor != "" {
+			req.Header.Set("Last-Event-ID", cursor)
+		}
+		b.ServeTopic(rec, req, "job")
+		want := "event: done\nid: 2\ndata: \"finished\"\n\n"
+		if rec.Body.String() != want {
+			t.Errorf("cursor %q body = %q, want %q", cursor, rec.Body.String(), want)
+		}
+	}
+}
+
+// TestServeTopicReplayedTerminalEndsTheResponse: a cursor still in the
+// ring replays through the terminal frame and the handler returns, rather
+// than holding the response open.
+func TestServeTopicReplayedTerminalEndsTheResponse(t *testing.T) {
+	b := New(Config{Heartbeat: time.Hour, Retain: time.Hour})
+	b.Publish("job", Event{Name: "progress", Data: "page"})
+	b.Publish("job", Event{Name: "done", Data: "finished", Terminal: true})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/events", nil)
+	req.Header.Set("Last-Event-ID", "1")
+	b.ServeTopic(rec, req, "job")
+	want := "event: done\nid: 2\ndata: \"finished\"\n\n"
+	if rec.Body.String() != want {
+		t.Fatalf("body = %q, want %q", rec.Body.String(), want)
+	}
+}
+
+// TestServeTopicCaughtUpCursorWaitsForTheNextEvent: a cursor equal to the
+// newest id replays nothing. The following publish is the first frame, so
+// a comment or an already-seen event is not written again.
+func TestServeTopicCaughtUpCursorWaitsForTheNextEvent(t *testing.T) {
+	b := New(Config{Heartbeat: time.Hour, Retain: time.Hour})
+	b.Publish("job", Event{Name: "progress", Data: "one"})
+	b.Publish("job", Event{Name: "progress", Data: "two"})
+
+	_, resp := serveRequest(t, b, "job", 5*time.Second, map[string]string{"Last-Event-ID": "2"})
+	defer resp.Body.Close()
+	b.Publish("job", Event{Name: "progress", Data: "three"})
+	got := readN(t, resp.Body, 1, 5*time.Second)
+	if got != "event: progress\nid: 3\ndata: \"three\"\n\n" {
+		t.Fatalf("body = %q, want event 3 only", got)
+	}
+}

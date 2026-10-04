@@ -31,7 +31,7 @@ else is pure Go, and `CGO_ENABLED=0` builds the whole module.
 | `wire` | The error envelope shared by gate, upload, and direct app routes, plus the event frames stream and job publish |
 | `id` | Unguessable 128-bit ids in lowercase hex, for anything served in public |
 | `gate` | Per-client and global token buckets, plus an optional passcode, in front of the routes that spend money |
-| `stream` | Topic broker and server-sent events, with heartbeats and a non-blocking slow-subscriber policy |
+| `stream` | Topic broker and server-sent events, with heartbeats, a non-blocking slow-subscriber policy, and best-effort replay after Last-Event-ID |
 | `job` | Long work started by a short request, observed over `stream`, durable across restarts |
 | `mediastore` | Blobs on disk under unguessable ids, served with Range support, with retention sweeps |
 | `upload` | Resumable chunked uploads that land in `mediastore`, resumable by id after a dropped connection |
@@ -110,7 +110,7 @@ mux.HandleFunc("GET /jobs/{id}/events", func(w http.ResponseWriter, r *http.Requ
 ```
 
 Subscribe first, then read the job's state. The broker retains the terminal event for the bound in `stream.Config.Retain`, one minute at defaults,
-so a subscriber that joins within retention still learns the outcome.
+so a subscriber that joins within retention still learns the outcome. A reconnect sends `Last-Event-ID`. When that id is still in the topic's ring (`stream.Config.Replay`, 512 events by default), `ServeTopic` writes every later frame with its original id before following the live subscription. A cursor the process has forgotten, a missing header, or `0` is a fresh subscribe: no replay and no error. Ping comments are not replayed. The ring is dropped with the topic, so a miss still falls back to the job's stored state.
 
 ### Store media privately and serve it with seeking
 
@@ -477,7 +477,7 @@ Event names travel in each frame: `progress` while work runs, then one terminal 
 ```
 
 An `error` terminal embeds the same envelope body a failed response carries, so one parser reads
-both. The broker retains the terminal event for the bound in `stream.Config.Retain`, one minute at defaults, so a subscriber that joins within retention still receives it. A subscriber that joins after expiry gets live events only. The client
+both. The broker retains the terminal event for the bound in `stream.Config.Retain`, one minute at defaults, so a subscriber that joins within retention still receives it. A subscriber that joins after expiry gets live events only. `ServeTopic` also replays frames after a `Last-Event-ID` that is still in the topic ring. The client
 subscribes first, then calls `Runner.Result` for the stored state, then drops a duplicate on the
 job id. A `Result` read for an unknown id fails with `job: unknown id` rather than a frame.
 `Store.Delete` removes a finished job and its whole attempt chain. `Store.PruneFinished` removes
