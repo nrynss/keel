@@ -39,7 +39,8 @@ type Account interface {
 // ChargeSink is where a settled charge is recorded. The in-memory Ledger is
 // one sink, and the cost/sqlitestore Store is another. An application that
 // keeps its spend record somewhere else carries its own one-method sink and
-// hands it to NewMeter.
+// hands it to NewMeter. Add must be safe for concurrent use, because
+// concurrent Calls drive one sink.
 type ChargeSink interface {
 	// Add records one charge before it returns. It reports the error
 	// when the charge did not land, so the caller never reports a figure
@@ -95,8 +96,9 @@ func isNilValue(v any) bool {
 
 // NewMeter returns a Meter that bounds every call by account and records
 // every settled charge in sink. It reports ErrNilAccount or ErrNilSink when
-// one of them is nil, including an interface holding a nil pointer, because
-// a meter that could not bound or record a call would only pretend to.
+// one of them is nil. Nil covers an interface holding a nil pointer as well
+// as a plain nil, because a meter that could not bound or record a call
+// would only pretend to.
 func NewMeter(account Account, sink ChargeSink) (*Meter, error) {
 	if isNilValue(account) {
 		return nil, ErrNilAccount
