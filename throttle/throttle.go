@@ -88,13 +88,21 @@ func Retry(ctx context.Context, cfg Config, retryable Retryable, call Call) erro
 }
 
 // Note annotates an error that survived every attempt, so a log can tell a
-// cap that was waited out from one that was never retried. An error retryable
-// rejects, a nil error, and a nil retryable are returned untouched.
+// cap that was waited out from one that was never retried. Pass the same
+// config the call used. Retry itself still returns the provider error
+// untouched; Note is the caller's annotation. An error retryable rejects, a
+// nil error, and a nil retryable are returned untouched. One attempt is
+// singular.
 func Note(err error, cfg Config, retryable Retryable) error {
 	if err == nil || retryable == nil || !retryable(err) {
 		return err
 	}
-	return fmt.Errorf("still throttled after %d attempts: %w", cfg.attempts(), err)
+	n := cfg.attempts()
+	word := "attempts"
+	if n == 1 {
+		word = "attempt"
+	}
+	return fmt.Errorf("still throttled after %d %s: %w", n, word, err)
 }
 
 // Gate caps how many paid calls run at once. The zero value and a nil Gate

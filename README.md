@@ -180,6 +180,8 @@ lockstep. The call's own error comes back untouched. A cancelled context ends
 the wait and still returns that error. `throttle.New` caps how many calls run
 at once. The cap is held only while a call runs, and the backoff waits outside
 it. `cost.Meter` still reserves and settles. This package only paces the call.
+`throttle.Note` is how a caller marks an error that used up the attempts,
+with the same config the call used. One spent attempt reads "1 attempt".
 
 
 ### Flip a switch without a restart

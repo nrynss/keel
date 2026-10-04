@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -139,8 +138,12 @@ func TestRetryCancelledBeforeCall(t *testing.T) {
 
 func TestNote(t *testing.T) {
 	noted := Note(errLimited, Config{Attempts: 3}, retryable)
-	if !errors.Is(noted, errLimited) || !strings.Contains(noted.Error(), "still throttled after 3 attempts") {
+	if !errors.Is(noted, errLimited) || noted.Error() != "still throttled after 3 attempts: limited" {
 		t.Fatalf("Note = %v", noted)
+	}
+	one := Note(errLimited, Config{Attempts: 1}, retryable)
+	if !errors.Is(one, errLimited) || one.Error() != "still throttled after 1 attempt: limited" {
+		t.Fatalf("Note one = %v", one)
 	}
 	plain := errors.New("something else")
 	if got := Note(plain, Config{}, retryable); got != plain {

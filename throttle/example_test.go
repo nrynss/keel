@@ -26,3 +26,15 @@ func ExampleRetry() {
 	// <nil>
 	// 2
 }
+
+func ExampleNote() {
+	limited := errors.New("limited")
+	cfg := throttle.Config{Attempts: 1}
+	classify := func(err error) bool { return errors.Is(err, limited) }
+	err := throttle.Retry(context.Background(), cfg, classify, func() error {
+		return limited
+	})
+	fmt.Println(throttle.Note(err, cfg, classify))
+	// Output:
+	// still throttled after 1 attempt: limited
+}
