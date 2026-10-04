@@ -180,6 +180,29 @@ func (s *Store) Groups(ctx context.Context) ([]mediastore.Group, error) {
 	return groups, nil
 }
 
+// Blobs returns every blob, earliest creation time first and then by id.
+// An unplaced blob is included. Snapshot uses the list when the caller
+// names an owner rather than ids.
+func (s *Store) Blobs(ctx context.Context) ([]mediastore.Blob, error) {
+	rows, err := s.db.Reader().QueryContext(ctx, selectColumns+` ORDER BY created_at, id`)
+	if err != nil {
+		return nil, fmt.Errorf("sqlitestore: list blobs: %w", err)
+	}
+	defer rows.Close()
+	var blobs []mediastore.Blob
+	for rows.Next() {
+		b, err := scanMedia(rows, "listed media")
+		if err != nil {
+			return nil, err
+		}
+		blobs = append(blobs, b)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("sqlitestore: list blobs: %w", err)
+	}
+	return blobs, nil
+}
+
 // rowScanner is the Scan subset shared by *sql.Row and *sql.Rows, so one
 // decode serves the single-row and the listing read.
 type rowScanner interface {

@@ -33,7 +33,7 @@ else is pure Go, and `CGO_ENABLED=0` builds the whole module.
 | `gate` | Per-client and global token buckets, plus an optional passcode, in front of the routes that spend money |
 | `stream` | Topic broker and server-sent events, with heartbeats and a non-blocking slow-subscriber policy |
 | `job` | Long work started by a short request, observed over `stream`, durable across restarts |
-| `mediastore` | Blobs on disk under unguessable ids, served with Range support, with retention sweeps |
+| `mediastore` | Blobs on disk under unguessable ids, served with Range support, with retention sweeps and a snapshot that restores the same ids |
 | `upload` | Resumable chunked uploads that land in `mediastore`, resumable by id after a dropped connection |
 | `sqlite` | One SQLite file with WAL, a writer handle, a read-only reader pool, namespaced migrations and online backup |
 | `ffmpeg` | ffmpeg and ffprobe bound to a context, with a bounded wait on shutdown |
@@ -132,6 +132,8 @@ handler answers Range requests, which is what audio and video seeking needs.
 
 Bytes reach disk before the row that names them, so a crash never leaves a row pointing at nothing.
 The sweeper reclaims orphans and evicts whole groups over a byte budget.
+
+`Snapshot` writes `manifest.json` plus one file per blob. `Selection` is either an id list or an exact owner match. `Restore` recreates those blobs with the same ids, content types, visibility and creation times, and refuses a hash mismatch or an id that is already stored. A restored row is an ordinary row. Visibility is what keeps it, not a separate pin.
 
 ### Accept a recording that survives a dropped connection
 
@@ -486,7 +488,7 @@ terminal chains older than a supplied time and leaves active chains alone.
 ### Private and public media with mediastore
 
 Entry points: `mediastore.Open`, `Store.Persist`, `Store.PersistWithID`, `Store.Delete`,
-`Store.ServeHTTP`, `Store.NewSweeper`.
+`Store.ServeHTTP`, `Store.NewSweeper`, `Store.Snapshot`, `Store.Restore`.
 
 `Store` is the handler. The app registers it at one route:
 

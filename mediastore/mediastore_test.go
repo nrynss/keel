@@ -139,6 +139,28 @@ func (m *memIndex) Groups(ctx context.Context) ([]Group, error) {
 	return groups, nil
 }
 
+func (m *memIndex) Blobs(ctx context.Context) ([]Blob, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.down {
+		return nil, errIndexDown
+	}
+	blobs := make([]Blob, 0, len(m.rows))
+	for _, b := range m.rows {
+		blobs = append(blobs, b)
+	}
+	sort.Slice(blobs, func(i, j int) bool {
+		if !blobs[i].CreatedAt.Equal(blobs[j].CreatedAt) {
+			return blobs[i].CreatedAt.Before(blobs[j].CreatedAt)
+		}
+		return blobs[i].ID < blobs[j].ID
+	})
+	return blobs, nil
+}
+
 // openTestStore builds a store over a throwaway directory and an
 // in-memory index.
 func openTestStore(t *testing.T) *Store {
