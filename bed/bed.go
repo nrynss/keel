@@ -1,14 +1,16 @@
 // Package bed mixes a looping music bed under a finished video.
 //
-// The film's length is known before the mix. The end fade starts that length
-// minus the fade and reaches silence at the film's end. A bed shorter than
-// the film loops. A longer bed is trimmed by the mix, which follows the
-// film's audio. The video stream is copied. Only the audio is encoded again.
+// The film's length is known before the mix, and that declared duration is
+// the timeline. The end fade starts that length minus the fade and reaches
+// silence there. Film audio that ends sooner is padded with silence, so the
+// fade is not cut off when the audio stream finishes before the picture. A
+// bed shorter than the film loops. A longer bed is trimmed by the mix. The
+// video stream is copied. Only the audio is encoded again.
 //
 // The filter pins are part of the contract. The bed is gained and faded on
-// its own chain. The mix does not normalise, because the default mix halves
-// the narration the moment a second input appears. The film's audio is the
-// timeline.
+// its own chain, then the film audio is padded to the declared duration.
+// The mix does not normalise, because the default mix halves the narration
+// the moment a second input appears.
 package bed
 
 import (
@@ -53,12 +55,14 @@ type Config struct {
 
 // Input names the finished film, the bed, and the output of one mix.
 type Input struct {
-	// Film is the finished video. Its audio is the timeline.
+	// Film is the finished video. Its picture is copied. Its audio is padded
+	// with silence up to Duration when that stream ends first.
 	Film string
 	// Bed is the music file mixed under Film.
 	Bed string
 	// Duration is Film's length, known before the mix. It must be positive.
-	// The fade is anchored to it, never to a probe of the file.
+	// The fade and the mix are anchored to it, never to a probe of the file,
+	// and never to the audio stream when that stream is shorter.
 	Duration time.Duration
 	// Output is where the mixed file is written.
 	Output string
@@ -106,10 +110,14 @@ func Mix(ctx context.Context, tools ffmpeg.Tools, cfg Config, in Input) error {
 	}
 	gain := cfg.gain()
 	start := in.Duration.Seconds() - fade.Seconds()
+	// amix duration=first ends at the first input. Pad the film audio to the
+	// declared duration first, or a short audio stream hard-cuts the bed
+	// before the fade.
 	filter := "[1:a]volume=" + strconv.FormatFloat(gain, 'f', -1, 64) +
 		",afade=t=out:st=" + strconv.FormatFloat(start, 'f', 3, 64) +
 		":d=" + strconv.FormatFloat(fade.Seconds(), 'f', 3, 64) +
-		"[bed];[0:a][bed]amix=inputs=2:duration=first:normalize=0[a]"
+		"[bed];[0:a]apad=whole_dur=" + strconv.FormatFloat(in.Duration.Seconds(), 'f', 3, 64) +
+		"[film];[film][bed]amix=inputs=2:duration=first:normalize=0[a]"
 	args := []string{
 		"-i", in.Film,
 		"-stream_loop", "-1",

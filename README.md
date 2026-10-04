@@ -232,11 +232,12 @@ err := bed.Mix(ctx, tools, bed.Config{}, bed.Input{
 ```
 
 `bed` loops or trims a music file under a finished video. The fade starts
-`Duration` minus the fade, two seconds by default, and reaches silence at the
-known end. The video stream is copied. The bed is gained on its own chain,
-and the mix does not normalise, so the film's audio stays at its own level.
-`Duration` is the length the caller already computed. The mix does not probe
-the file.
+`Duration` minus the fade, two seconds by default, and reaches silence at
+that known end. Film audio that stops early is padded with silence to
+`Duration`, so the fade is not cut off at the audio stream. The video stream
+is copied. The bed is gained on its own chain, and the mix does not
+normalise, so the film's audio stays at its own level. `Duration` is the
+length the caller already computed. The mix does not probe the file.
 
 
 ### Render a still plus audio to video

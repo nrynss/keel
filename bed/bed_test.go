@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -61,7 +62,8 @@ func TestMixArgs(t *testing.T) {
 	for _, want := range []string{
 		"-stream_loop\n-1\n",
 		"volume=0.2,afade=t=out:st=9.000:d=1.000",
-		"amix=inputs=2:duration=first:normalize=0",
+		"apad=whole_dur=10.000",
+		"[film][bed]amix=inputs=2:duration=first:normalize=0",
 		"-c:v\ncopy\n",
 		"-b:a\n96k\n",
 		"-map\n0:v\n",
@@ -109,6 +111,46 @@ func TestMixWithFFmpeg(t *testing.T) {
 	probe := run(t, "ffprobe", "-v", "error", "-show_entries", "stream=codec_type", "-of", "csv=p=0", out)
 	if !strings.Contains(probe, "video") || !strings.Contains(probe, "audio") {
 		t.Fatalf("probe = %q", probe)
+	}
+}
+
+func TestMixPadsShortFilmAudio(t *testing.T) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		if os.Getenv("KEEL_REQUIRE_FFMPEG") != "" {
+			t.Fatal(err)
+		}
+		t.Skip(err)
+	}
+	if _, err := exec.LookPath("ffprobe"); err != nil {
+		if os.Getenv("KEEL_REQUIRE_FFMPEG") != "" {
+			t.Fatal(err)
+		}
+		t.Skip(err)
+	}
+	dir := t.TempDir()
+	film := filepath.Join(dir, "film.mp4")
+	audio := filepath.Join(dir, "bed.wav")
+	out := filepath.Join(dir, "mixed.mp4")
+	// Six seconds of picture, four seconds of film audio. Without padding,
+	// amix duration=first ends the mix at 4s and the fade never plays.
+	run(t, "ffmpeg", "-y", "-f", "lavfi", "-i", "color=c=black:s=320x240:r=25:d=6",
+		"-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100:duration=4",
+		"-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", film)
+	run(t, "ffmpeg", "-y", "-f", "lavfi", "-i", "sine=frequency=220:sample_rate=44100:duration=2", audio)
+	err := Mix(context.Background(), ffmpeg.Tools{}, Config{Gain: 1, Fade: 2 * time.Second}, Input{
+		Film: film, Bed: audio, Duration: 6 * time.Second, Output: out,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	probe := run(t, "ffprobe", "-v", "error", "-select_streams", "a:0",
+		"-show_entries", "stream=duration", "-of", "csv=p=0", out)
+	secs, err := strconv.ParseFloat(strings.TrimSpace(probe), 64)
+	if err != nil {
+		t.Fatalf("probe %q: %v", probe, err)
+	}
+	if secs < 5.5 {
+		t.Fatalf("audio duration = %.3fs, want about 6s", secs)
 	}
 }
 
