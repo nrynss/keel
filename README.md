@@ -42,6 +42,7 @@ else is pure Go, and `CGO_ENABLED=0` builds the whole module.
 | `throttle` | Retry of a paid call that failed for a reason a wait can clear, with full-jitter backoff and an optional cap on how many calls run at once |
 | `flag` | Runtime flags an operator flips without a restart, read through to the store with a declared default for a missing row |
 | `caption` | Word timings to SRT and WebVTT subtitle files as a pure function, with cues grouped by line length and duration |
+| `film` | A title card, captioned stills, and an end card joined by a stream copy, with the length computed in Go |
 | `erase` | A delete that finishes, fanned out over consumer targets with per-target progress, restart-safe resume, and a stuck report that names what is owed |
 | `edl` | A cut list rendered into one audio file, with merged ranges, crossfades or cuts at the joins, and two-pass loudness normalisation |
 | `bed` | A looping music bed mixed under a finished video, with gain and an end fade anchored to a known duration |
@@ -285,6 +286,49 @@ d, err := duration.Read(clip)
 frame headers. A Xing or Info count is trimmed by the encoder delay and tail
 padding when a LAME, Lavf, or Lavc tag carries them, which is the playable
 length. `ffmpeg.Duration` stays the measurement when ffprobe is installed.
+
+### Assemble a captioned still film
+
+```go
+length, err := film.Render(ctx, tools, film.Config{
+    FontFile: "Face.ttf",
+    EndTitle: "The end",
+}, film.Input{
+    Title: "A story",
+    Output: "film.mp4",
+    Pages: []film.Page{{
+        ImagePath: "page.png",
+        Text:      "The gate opens.",
+        AudioPath: "page.mp3",
+        Duration:  clip,
+    }},
+})
+```
+
+`film` builds a title card, one segment per page, and an end card, then joins
+them with a stream copy. Every segment is 1080 by 1620. The page caption is
+wrapped in Go and burned in from a text file, which is separate from the
+word-timed cues in `caption`. A narrated page is held for the duration the
+caller measured. A silent page is held for `film.SilentHold`. `Render` returns
+that sum and does not probe the file. `film.Total` is the same sum without
+rendering, which is what a later mix anchors a fade to.
+
+`film.Page.N` is only the number named in an error. Image and narration bytes
+are staged by the page's position, so two pages may share an N.
+
+The caller is trusted. `Render` uses the ffmpeg binary and the font, image,
+audio, work, and output paths it is given. It checks that a path exists, and
+it does not authorize it or confine the process. Quoting a path keeps the
+filter syntax intact. It is not an access check. `Concat` passes the caller's
+segment paths through with `-safe 0`. An integration that accepts untrusted
+jobs keeps the binary and those paths under its own policy, and runs ffmpeg
+where the filesystem and the network are already limited.
+
+The finished file replaces `Output` by a rename. A copy onto another
+filesystem is written beside `Output` and renamed only when the copy and its
+sync have succeeded, so a failed or cancelled publish leaves the previous
+file in place. Renders that name the same output are not queued. The last
+successful rename is the file a reader sees.
 
 
 ### Bound a paid session with a lease
