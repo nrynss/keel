@@ -320,6 +320,41 @@ func TestGroupsOrdersByIDAndCarriesTheEarliestCreation(t *testing.T) {
 	}
 }
 
+// TestBlobsListsEveryRowEarliestFirst: the list includes an unplaced
+// blob and orders by creation time, then id.
+func TestBlobsListsEveryRowEarliestFirst(t *testing.T) {
+	idx := openIndex(t)
+	rows := []mediastore.Blob{
+		{ID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Group: "zebra", ContentType: "image/png", CreatedAt: base.Add(2 * time.Hour)},
+		{ID: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", Group: "zebra", ContentType: "image/png", CreatedAt: base},
+		{ID: "cccccccccccccccccccccccccccccccc", Group: "alpha", ContentType: "image/png", CreatedAt: base.Add(time.Hour)},
+		{ID: "dddddddddddddddddddddddddddddddd", ContentType: "image/png", CreatedAt: base},
+	}
+	for _, row := range rows {
+		if err := idx.Create(t.Context(), row); err != nil {
+			t.Fatalf("create %s: %v", row.ID, err)
+		}
+	}
+	blobs, err := idx.Blobs(t.Context())
+	if err != nil {
+		t.Fatalf("blobs: %v", err)
+	}
+	want := []string{
+		"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		"dddddddddddddddddddddddddddddddd",
+		"cccccccccccccccccccccccccccccccc",
+		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+	}
+	if len(blobs) != len(want) {
+		t.Fatalf("blobs = %d, want %d", len(blobs), len(want))
+	}
+	for i, id := range want {
+		if blobs[i].ID != id {
+			t.Fatalf("blobs[%d] = %s, want %s", i, blobs[i].ID, id)
+		}
+	}
+}
+
 // TestCreateRejectsUnstorableRows: this package refuses a row it cannot
 // describe rather than storing a broken one.
 func TestCreateRejectsUnstorableRows(t *testing.T) {

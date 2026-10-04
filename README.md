@@ -33,7 +33,7 @@ else is pure Go, and `CGO_ENABLED=0` builds the whole module.
 | `gate` | Per-client and global token buckets, plus an optional passcode, in front of the routes that spend money |
 | `stream` | Topic broker and server-sent events, with heartbeats, a non-blocking slow-subscriber policy, and best-effort replay after Last-Event-ID |
 | `job` | Long work started by a short request, observed over `stream`, durable across restarts |
-| `mediastore` | Blobs on disk under unguessable ids, served with Range support, with retention sweeps |
+| `mediastore` | Blobs on disk under unguessable ids, served with Range support, with retention sweeps and a snapshot that restores the same ids |
 | `upload` | Resumable chunked uploads that land in `mediastore`, resumable by id after a dropped connection |
 | `sqlite` | One SQLite file with WAL, a writer handle, a read-only reader pool, namespaced migrations and online backup |
 | `ffmpeg` | ffmpeg and ffprobe bound to a context, with a bounded wait on shutdown |
@@ -133,6 +133,8 @@ handler answers Range requests, which is what audio and video seeking needs.
 
 Bytes reach disk before the row that names them, so a crash never leaves a row pointing at nothing.
 The sweeper reclaims orphans and evicts whole groups over a byte budget.
+
+`Snapshot` writes `manifest.json` plus one file per blob, into a sibling directory that replaces `dir` only when the manifest is complete. `dir` is cleaned first, so a trailing separator does not leave a stray directory. `.` is refused, and so is the store's own blob directory. An existing path is replaced only when it is an empty directory or already contains `manifest.json`. A regular file, or a directory of unrelated files, is left untouched. The committed directory is always mode 0755, even when the previous snapshot was tighter. That is the portable-fixture contract. Private blob bytes in the fixture are readable to any local user who can traverse its parents, so a confidential snapshot belongs under a directory those users cannot traverse. A failed refresh leaves the previous snapshot in place. `Selection` is either an id list or an exact owner match. It is not an owner prefix, and a selection that matches nothing is refused. `Restore` recreates those blobs with the same ids, content types and visibility, stamps them with the store clock rather than the captured creation time, and refuses a hash mismatch or an id that is already stored. Cleanup after a failed restore deletes by id and does not notice another caller that deleted one of those ids and created it again before the call returns. A restored row is an ordinary row. Visibility is copied, and it is not a retention pin. `Protected` and `Retain` are. `Put.CreatedAt` lets a caller stamp a creation time. Restore leaves it zero on purpose, so an old fixture is not swept on arrival.
 
 ### Accept a recording that survives a dropped connection
 
@@ -509,7 +511,7 @@ terminal chains older than a supplied time and leaves active chains alone.
 ### Private and public media with mediastore
 
 Entry points: `mediastore.Open`, `Store.Persist`, `Store.PersistWithID`, `Store.Delete`,
-`Store.ServeHTTP`, `Store.NewSweeper`.
+`Store.ServeHTTP`, `Store.NewSweeper`, `Store.Snapshot`, `Store.Restore`.
 
 `Store` is the handler. The app registers it at one route:
 
