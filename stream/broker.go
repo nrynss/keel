@@ -93,8 +93,11 @@ func (cfg Config) withDefaults() Config {
 // last terminal event for its configured retention, so a subscriber that
 // joins after it still receives it.
 //
-// ID is assigned by the Broker at publish time and increases per topic. A
-// publisher leaves it at zero, and the Broker overwrites any value.
+// ID is assigned by the Broker at publish time and increases for the
+// life of the Broker, not per topic. A topic that is dropped and created
+// again does not reuse an earlier id, so a Last-Event-ID from the old
+// incarnation cannot select a frame in the new ring. A publisher leaves
+// ID at zero, and the Broker overwrites any value.
 type Event struct {
 	Name     string
 	Data     any
@@ -110,11 +113,11 @@ type subscriber struct {
 	gone chan struct{}
 }
 
-// topicState holds the subscribers of one topic, the id counter for its
-// frames, its retained terminal event, and the replay ring.
+// topicState holds the subscribers of one topic, its retained terminal
+// event, and the replay ring. Event ids come from the broker, so a new
+// topic does not start them over.
 type topicState struct {
 	subs     map[uint64]*subscriber
-	nextID   uint64
 	terminal *retained
 	ring     *eventRing
 	idle     *time.Timer
@@ -187,10 +190,11 @@ type retained struct {
 // listening, so a reconnect can catch up. The ring holds Config.Replay
 // events and is dropped with the topic.
 type Broker struct {
-	cfg     Config
-	mu      sync.Mutex
-	nextSub uint64
-	topics  map[string]*topicState
+	cfg       Config
+	mu        sync.Mutex
+	nextSub   uint64
+	nextEvent uint64
+	topics    map[string]*topicState
 }
 
 // Subscription is one consumer's registration on one topic. Events is
@@ -272,7 +276,18 @@ func (b *Broker) catchUp(ctx context.Context, topic string, after uint64, resume
 	t := b.topics[topic]
 	if resume && t != nil && t.ring.has(after) {
 		replay := t.ring.after(after)
-		if len(replay) > 0 && replay[len(replay)-1].Terminal {
+		// A replay that already ends on the terminal is finished. So is
+		// an empty replay whose cursor is the retained terminal: the
+		// client has that frame, and holding the response open would
+		// keep the topic alive for a subscriber that has nothing to
+		// receive.
+		finished := len(replay) > 0 && replay[len(replay)-1].Terminal
+		cursorIsTerminal := len(replay) == 0 && t.terminal != nil &&
+			t.terminal.event.ID == after && time.Now().Before(t.terminal.expires)
+		if !finished && cursorIsTerminal {
+			finished = true
+		}
+		if finished {
 			b.mu.Unlock()
 			ch := make(chan Event)
 			close(ch)
@@ -340,7 +355,7 @@ func (b *Broker) watch(ctx context.Context, live liveSub) {
 // event dropped, per the Broker policy.
 //
 // The event is recorded on the topic's ring whether or not anyone is
-// listening, and it receives the topic's next id. A topic with no
+// listening, and it receives the broker's next id. A topic with no
 // subscriber and no terminal event is kept for Retain after this publish
 // so a reconnect can still find the id.
 //
@@ -357,8 +372,8 @@ func (b *Broker) Publish(topic string, event Event) {
 		t = newTopic(b.cfg.Replay)
 		b.topics[topic] = t
 	}
-	t.nextID++
-	event.ID = t.nextID
+	b.nextEvent++
+	event.ID = b.nextEvent
 	t.ring.add(event)
 	for _, sub := range t.subs {
 		deliver(sub, event)

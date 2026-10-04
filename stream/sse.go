@@ -19,10 +19,14 @@ import (
 // When the request carries Last-Event-ID and that id is still in the
 // topic's ring, the frames published after it are written first, each
 // with the id it was published under, and only then does the handler
-// follow the live subscription. A missing header, a cursor this process
+// follow the live subscription. Ids increase for the life of the broker,
+// so a cursor from a topic this process has already dropped cannot match
+// a frame in a later ring. A missing header, a cursor this process
 // does not remember, or a cursor of zero skips that replay and subscribes
 // exactly as before. Ping comments are not part of the ring. A replayed
-// terminal frame ends the response, because the topic's work is finished.
+// terminal frame ends the response, and so does a cursor equal to the
+// retained terminal: there is nothing further to send, and the response
+// closes instead of waiting.
 func (b *Broker) ServeTopic(w http.ResponseWriter, r *http.Request, topic string) {
 	after, resume := lastEventID(r)
 	replay, sub := b.catchUp(r.Context(), topic, after, resume)

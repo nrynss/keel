@@ -80,9 +80,10 @@ func TestSlowSubscriberDropOldest(t *testing.T) {
 	}
 }
 
-// TestPublishAssignsIncreasingIDsPerTopic: every published event carries
-// the topic's next id, and a second topic numbers from its own first event.
-func TestPublishAssignsIncreasingIDsPerTopic(t *testing.T) {
+// TestPublishAssignsIncreasingIDs: every published event carries the
+// broker's next id. A second topic continues that sequence, so a dropped
+// topic cannot be reincarnated at id 1.
+func TestPublishAssignsIncreasingIDs(t *testing.T) {
 	b := New(Config{})
 	sub := b.Subscribe(context.Background(), "t")
 	defer sub.Cancel()
@@ -106,8 +107,8 @@ func TestPublishAssignsIncreasingIDsPerTopic(t *testing.T) {
 	b.Publish("u", Event{Name: "progress", Data: 0})
 	select {
 	case ev := <-other.Events:
-		if ev.ID != 1 {
-			t.Errorf("second topic id = %d, want 1", ev.ID)
+		if ev.ID != 4 {
+			t.Errorf("second topic id = %d, want 4", ev.ID)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for the second topic event")
@@ -328,5 +329,36 @@ func TestReplayRingDroppedAfterIdleRetain(t *testing.T) {
 	}
 	if got := b.subscribers("t"); got != 1 {
 		t.Errorf("subscribers = %d, want 1 (a live subscription)", got)
+	}
+}
+
+// TestEventIDsDoNotRestartWhenATopicIsRecreated: a topic dropped after
+// Retain is a new incarnation, but its ids continue from the broker. An
+// old Last-Event-ID must not match a later id in the new ring and replay
+// only the tail.
+func TestEventIDsDoNotRestartWhenATopicIsRecreated(t *testing.T) {
+	b := New(Config{Retain: 20 * time.Millisecond, Replay: 16})
+	b.Publish("t", Event{Name: "progress", Data: "old-1"})
+	b.Publish("t", Event{Name: "progress", Data: "old-2"})
+	b.Publish("t", Event{Name: "progress", Data: "old-3"})
+	time.Sleep(60 * time.Millisecond)
+	for i := 1; i <= 5; i++ {
+		b.Publish("t", Event{Name: "progress", Data: "new"})
+	}
+	replay, sub := b.catchUp(context.Background(), "t", 3, true)
+	sub.Cancel()
+	if len(replay) != 0 {
+		t.Fatalf("replay of an old cursor = %+v, want none", replay)
+	}
+	b.mu.Lock()
+	ring := append([]Event(nil), b.topics["t"].ring.buf...)
+	b.mu.Unlock()
+	if len(ring) != 5 || ring[0].ID != 4 || ring[4].ID != 8 {
+		t.Fatalf("new ring ids = %+v, want 4 through 8", ring)
+	}
+	for _, event := range ring {
+		if event.ID <= 3 {
+			t.Fatalf("new ring reused id %d", event.ID)
+		}
 	}
 }

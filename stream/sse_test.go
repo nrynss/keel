@@ -89,7 +89,7 @@ func readGolden(t *testing.T, name string) []byte {
 
 // TestServeTopicHeadersAndFraming pins the SSE surface: the three stream
 // headers, a 200, and the exact wire framing, an event field, an id that
-// increases per topic, one compact JSON data line, and a blank-line
+// increases, one compact JSON data line, and a blank-line
 // terminator.
 func TestServeTopicHeadersAndFraming(t *testing.T) {
 	b := New(Config{Heartbeat: time.Hour}) // no heartbeat noise in the framing assertions
@@ -116,7 +116,7 @@ func TestServeTopicHeadersAndFraming(t *testing.T) {
 
 	b.Publish("frame", Event{Name: "progress", Data: wire.ProgressEvent{JobID: "j", Stage: "page 2"}})
 	if got, want := readN(t, resp.Body, 1, 5*time.Second), "event: progress\nid: 2\ndata: {\"job_id\":\"j\",\"stage\":\"page 2\"}\n\n"; got != want {
-		t.Errorf("framed second event = %q, want %q (id increases per topic)", got, want)
+		t.Errorf("framed second event = %q, want %q (id increases)", got, want)
 	}
 }
 
@@ -468,5 +468,34 @@ func TestServeTopicCaughtUpCursorWaitsForTheNextEvent(t *testing.T) {
 	got := readN(t, resp.Body, 1, 5*time.Second)
 	if got != "event: progress\nid: 3\ndata: \"three\"\n\n" {
 		t.Fatalf("body = %q, want event 3 only", got)
+	}
+}
+
+// TestServeTopicCursorOnTheTerminalCloses: a reconnect whose cursor is the
+// retained terminal has nothing to replay. The handler returns instead of
+// holding the response open on a finished topic.
+func TestServeTopicCursorOnTheTerminalCloses(t *testing.T) {
+	b := New(Config{Heartbeat: time.Hour, Retain: time.Hour})
+	b.Publish("job", Event{Name: "progress", Data: "page"})
+	b.Publish("job", Event{Name: "done", Data: "finished", Terminal: true})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/events", nil)
+	req.Header.Set("Last-Event-ID", "2")
+	done := make(chan struct{})
+	go func() {
+		b.ServeTopic(rec, req, "job")
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(300 * time.Millisecond):
+		t.Fatal("ServeTopic stayed open after a cursor equal to the terminal")
+	}
+	if rec.Body.Len() != 0 {
+		t.Fatalf("body = %q, want no frame; the client already has the terminal", rec.Body.String())
+	}
+	if got := b.subscribers("job"); got != 0 {
+		t.Fatalf("subscribers = %d, want 0", got)
 	}
 }
