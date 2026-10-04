@@ -19,10 +19,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/nrynss/keel/ffmpeg"
+	"golang.org/x/sync/errgroup"
 )
 
 // ErrInvalid reports input that cannot be assembled. A missing title, page,
@@ -287,35 +287,18 @@ func mkdirWork(parent, pattern string) (string, error) {
 }
 
 // runLimited runs fns with at most n in flight. The first error cancels the
-// rest and is returned.
+// rest and is returned. A limit below one still runs one segment at a time.
 func runLimited(ctx context.Context, n int, fns []func(context.Context) error) error {
 	if n < 1 {
 		n = 1
 	}
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	sem := make(chan struct{}, n)
-	var wg sync.WaitGroup
-	var once sync.Once
-	var first error
+	g, ctx := errgroup.WithContext(ctx)
+	g.SetLimit(n)
 	for _, fn := range fns {
 		fn := fn
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			select {
-			case sem <- struct{}{}:
-			case <-ctx.Done():
-				once.Do(func() { first = ctx.Err() })
-				return
-			}
-			defer func() { <-sem }()
-			if err := fn(ctx); err != nil {
-				once.Do(func() { first = err })
-				cancel()
-			}
-		}()
+		g.Go(func() error {
+			return fn(ctx)
+		})
 	}
-	wg.Wait()
-	return first
+	return g.Wait()
 }

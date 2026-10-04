@@ -3,6 +3,7 @@ package film
 import (
 	"context"
 	"errors"
+	"fmt"
 	"image"
 	"image/png"
 	"os"
@@ -128,6 +129,78 @@ func TestPageSegmentNarratedArgs(t *testing.T) {
 	}
 	if !strings.Contains(args, "textfile=") || !strings.Contains(args, "text_align=C") {
 		t.Fatalf("caption filter missing:\n%s", args)
+	}
+}
+
+func TestPageSegmentSilentBoundsTheStill(t *testing.T) {
+	dir := t.TempDir()
+	log := filepath.Join(dir, "args.txt")
+	stub := filepath.Join(dir, "ffmpeg")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > " + "'" + strings.ReplaceAll(log, "'", "'\\''") + "'\nexit 0\n"
+	if err := os.WriteFile(stub, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	font := filepath.Join(dir, "font.ttf")
+	if err := os.WriteFile(font, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	image := filepath.Join(dir, "still.png")
+	if err := os.WriteFile(image, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(dir, "page.mp4")
+	text := "Hello from the band."
+	err := PageSegment(context.Background(), ffmpeg.Tools{FFmpeg: stub}, Config{FontFile: font, WorkDir: dir},
+		image, text, "", 0, out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := string(raw)
+	hold := fmt.Sprintf("%.3f", SilentHold(text).Seconds())
+	if !strings.Contains(args, "-loop\n1\n-t\n"+hold+"\n-i\n") {
+		t.Fatalf("silent still is not input-bounded:\n%s", args)
+	}
+	if !strings.Contains(args, "-f\nlavfi\n-t\n"+hold+"\n-i\nanullsrc=") {
+		t.Fatalf("silent audio is not bounded:\n%s", args)
+	}
+	if !strings.Contains(args, "-shortest\n") {
+		t.Fatalf("silent segment dropped -shortest:\n%s", args)
+	}
+}
+
+func TestEndCardBoundsTheColorSource(t *testing.T) {
+	dir := t.TempDir()
+	log := filepath.Join(dir, "args.txt")
+	stub := filepath.Join(dir, "ffmpeg")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > " + "'" + strings.ReplaceAll(log, "'", "'\\''") + "'\nexit 0\n"
+	if err := os.WriteFile(stub, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	font := filepath.Join(dir, "font.ttf")
+	if err := os.WriteFile(font, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(dir, "end.mp4")
+	err := EndCard(context.Background(), ffmpeg.Tools{FFmpeg: stub}, Config{
+		FontFile: font, WorkDir: dir, EndTitle: "The end", EndHold: 3 * time.Second,
+	}, out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := string(raw)
+	if !strings.Contains(args, "-f\nlavfi\n-t\n3.000\n-i\ncolor=") {
+		t.Fatalf("end card color source is not input-bounded:\n%s", args)
+	}
+	if !strings.Contains(args, "-shortest\n") {
+		t.Fatalf("end card dropped -shortest:\n%s", args)
 	}
 }
 

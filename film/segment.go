@@ -65,7 +65,10 @@ func TitleCard(ctx context.Context, tools ffmpeg.Tools, cfg Config, image, title
 // silent hold. hold is the narration's known length and is required when
 // audio is set. A silent page ignores hold and uses SilentHold(text). The
 // narrated segment is bounded with an output duration, not with -shortest,
-// because -shortest on a looped still can run past the clip.
+// because -shortest on a looped still can run past the clip. A silent
+// segment bounds the still itself with an input -t and keeps -shortest:
+// an unbounded looped still flushes frames already queued when the audio
+// ends, so the page runs past its hold under load.
 func PageSegment(ctx context.Context, tools ffmpeg.Tools, cfg Config, image, text, audio string, hold time.Duration, out string) error {
 	if image == "" || out == "" {
 		return fmt.Errorf("%w: page segment needs an image and an output path", ErrInvalid)
@@ -91,12 +94,15 @@ func PageSegment(ctx context.Context, tools ffmpeg.Tools, cfg Config, image, tex
 			fontOpt(cfg.FontFile), escapeFilterPath(captionFile), inkColor, layout.FontSize, artHeight, bandHeight)
 	}
 	vf += ",format=yuv420p"
-	args := []string{"-loop", "1", "-i", image}
+	var args []string
 	if audio != "" {
-		args = append(args, "-i", audio)
+		args = []string{"-loop", "1", "-i", image, "-i", audio}
 	} else {
 		silent := fmt.Sprintf("%.3f", SilentHold(text).Seconds())
-		args = append(args, "-f", "lavfi", "-t", silent, "-i", "anullsrc=channel_layout=stereo:sample_rate=44100")
+		args = []string{
+			"-loop", "1", "-t", silent, "-i", image,
+			"-f", "lavfi", "-t", silent, "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+		}
 	}
 	args = append(args,
 		"-vf", vf,
@@ -114,6 +120,8 @@ func PageSegment(ctx context.Context, tools ffmpeg.Tools, cfg Config, image, tex
 }
 
 // EndCard writes a flat card with cfg.EndTitle and the optional domain.
+// The color source is bounded with an input -t. An unbounded source plus
+// -shortest can flush frames past the hold, the same way an unbounded still can.
 func EndCard(ctx context.Context, tools ffmpeg.Tools, cfg Config, out string) error {
 	if out == "" || strings.TrimSpace(cfg.EndTitle) == "" {
 		return fmt.Errorf("%w: end card needs an output path and a title", ErrInvalid)
@@ -147,7 +155,7 @@ func EndCard(ctx context.Context, tools ffmpeg.Tools, cfg Config, out string) er
 	hold := fmt.Sprintf("%.3f", cfg.endHold().Seconds())
 	color := fmt.Sprintf("color=c=%s:s=%dx%d:r=25", filmColor, frameWidth, frameHeight)
 	args := []string{
-		"-f", "lavfi", "-i", color,
+		"-f", "lavfi", "-t", hold, "-i", color,
 		"-f", "lavfi", "-t", hold, "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
 		"-vf", vf.String(),
 		"-r", "25",
