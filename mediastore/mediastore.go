@@ -19,9 +19,10 @@
 // under an id are never truncated or removed.
 //
 // Snapshot writes a manifest and one file per blob, and Restore recreates
-// those blobs under their original ids. A restored row is an ordinary row:
-// retention treats it like any other blob, and visibility is what keeps a
-// public fixture from being swept as private.
+// those blobs under their original ids. A restored row is an ordinary row
+// stamped with the store clock, not the captured creation time, so the
+// first default sweep does not delete it for being old. Visibility is not
+// a retention pin. Protected and Retain are.
 package mediastore
 
 import (
@@ -169,9 +170,9 @@ type Put struct {
 	// Visibility is who may read the blob. The zero value is private.
 	Visibility Visibility
 	// CreatedAt, when non-zero, is stored instead of the store clock.
-	// Snapshot restore sets it so a captured blob keeps the time it was
-	// first accepted. The zero value means Config.Now, which is what
-	// Persist uses.
+	// The zero value means Config.Now, which is what Persist uses.
+	// Restore leaves it zero. Copying the captured time would make an
+	// old fixture eligible for the first unplaced sweep.
 	CreatedAt time.Time
 }
 
@@ -342,8 +343,8 @@ func (s *Store) PersistWithID(ctx context.Context, blobID string, src io.Reader,
 }
 
 // createdAt picks the timestamp stored on a new row. A non-zero
-// Put.CreatedAt wins, so a restore can keep the captured time. Otherwise
-// the store clock is used.
+// Put.CreatedAt wins. Otherwise the store clock is used. Restore leaves
+// CreatedAt zero so the row is stamped at restore time.
 func createdAt(p Put, now time.Time) time.Time {
 	if !p.CreatedAt.IsZero() {
 		return p.CreatedAt.UTC()

@@ -73,6 +73,9 @@ func TestSnapshotRestoreRoundTrip(t *testing.T) {
 	if manifest.Blobs[0].ID != publicID || manifest.Blobs[1].ID != privateID {
 		t.Fatalf("order = %s then %s, want creation order", manifest.Blobs[0].ID, manifest.Blobs[1].ID)
 	}
+	if !manifest.Blobs[0].CreatedAt.Equal(stamps[0]) || !manifest.Blobs[1].CreatedAt.Equal(stamps[1]) {
+		t.Fatalf("manifest times = %s, %s, want the captured clock", manifest.Blobs[0].CreatedAt, manifest.Blobs[1].CreatedAt)
+	}
 
 	later := when.Add(24 * time.Hour)
 	dst := openClockedStore(t, func() time.Time { return later })
@@ -91,12 +94,8 @@ func TestSnapshotRestoreRoundTrip(t *testing.T) {
 		if err != nil {
 			t.Fatalf("find %s: %v", want.id, err)
 		}
-		wantAt := stamps[0]
-		if want.id == privateID {
-			wantAt = stamps[1]
-		}
-		if got.Owner != "alice" || got.Visibility != want.vis || !got.CreatedAt.Equal(wantAt) {
-			t.Fatalf("restored %s = %+v, want alice, visibility %q, created %s", want.id, got, want.vis, wantAt)
+		if got.Owner != "alice" || got.Visibility != want.vis || !got.CreatedAt.Equal(later) {
+			t.Fatalf("restored %s = %+v, want alice, visibility %q, created at restore %s", want.id, got, want.vis, later)
 		}
 		if want.id == publicID && got.Group != "book" {
 			t.Fatalf("group = %q, want book", got.Group)
@@ -263,7 +262,7 @@ func TestSnapshotRejectsEmptyAndDuplicateSelection(t *testing.T) {
 	}
 }
 
-func TestRestoreAcceptsPrivateWordAndEmptySnapshot(t *testing.T) {
+func TestRestoreAcceptsPrivateWord(t *testing.T) {
 	src := openTestStore(t)
 	blobID := putBytes(t, src, "x", Put{ContentType: "image/png", Visibility: Private})
 	dir := filepath.Join(t.TempDir(), "snap")
@@ -282,13 +281,91 @@ func TestRestoreAcceptsPrivateWordAndEmptySnapshot(t *testing.T) {
 	if got.Visibility != Private {
 		t.Fatalf("visibility = %q, want private", got.Visibility)
 	}
+}
 
-	empty := filepath.Join(t.TempDir(), "empty")
-	if err := src.Snapshot(t.Context(), empty, Selection{Owner: "nobody"}); err != nil {
+func TestSnapshotRefusesOwnerWithNoBlobs(t *testing.T) {
+	s := openTestStore(t)
+	putBytes(t, s, "x", Put{ContentType: "image/png", Owner: "alice"})
+	dir := filepath.Join(t.TempDir(), "snap")
+	err := s.Snapshot(t.Context(), dir, Selection{Owner: "landnig"})
+	if !errors.Is(err, ErrSnapshot) {
+		t.Fatalf("err = %v, want invalid snapshot", err)
+	}
+	if _, statErr := os.Stat(dir); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("stat snapshot dir = %v, want absent", statErr)
+	}
+}
+
+func TestSnapshotRefreshFailureKeepsPrevious(t *testing.T) {
+	src := openTestStore(t)
+	a := putBytes(t, src, "aaa", Put{ContentType: "image/png", Owner: "alice"})
+	b := putBytes(t, src, "bbb", Put{ContentType: "image/png", Owner: "alice"})
+	dir := filepath.Join(t.TempDir(), "snap")
+	if err := src.Snapshot(t.Context(), dir, Selection{IDs: []string{a}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := openTestStore(t).Restore(t.Context(), empty); err != nil {
-		t.Fatalf("empty restore: %v", err)
+	if err := src.root.Remove(b); err != nil {
+		t.Fatal(err)
+	}
+	err := src.Snapshot(t.Context(), dir, Selection{IDs: []string{a, b}})
+	if err == nil {
+		t.Fatal("refresh of a missing blob succeeded")
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, manifestFile)); statErr != nil {
+		t.Fatalf("old manifest: %v", statErr)
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, a)); statErr != nil {
+		t.Fatalf("old blob file: %v", statErr)
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, b)); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("partial blob b: %v, want absent", statErr)
+	}
+	dst := openTestStore(t)
+	if err := dst.Restore(t.Context(), dir); err != nil {
+		t.Fatalf("restore of the previous snapshot: %v", err)
+	}
+	got, err := dst.find(t.Context(), a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != a {
+		t.Fatalf("restored %s, want %s", got.ID, a)
+	}
+}
+
+func TestRestoreSurvivesDefaultSweep(t *testing.T) {
+	captured := time.Now().Add(-3 * time.Hour).UTC()
+	src := openClockedStore(t, func() time.Time { return captured })
+	blobID := putBytes(t, src, "fixture-bytes", Put{
+		ContentType: "image/png",
+		Owner:       "alice",
+		Visibility:  Public,
+	})
+	dir := filepath.Join(t.TempDir(), "snap")
+	if err := src.Snapshot(t.Context(), dir, Selection{IDs: []string{blobID}}); err != nil {
+		t.Fatal(err)
+	}
+	restoredAt := time.Now().UTC()
+	dst := openClockedStore(t, func() time.Time { return restoredAt })
+	if err := dst.Restore(t.Context(), dir); err != nil {
+		t.Fatal(err)
+	}
+	w, err := dst.NewSweeper(RetentionConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := w.Sweep(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.UnplacedDeleted != 0 {
+		t.Fatalf("sweep deleted %d unplaced blobs, want the restored fixture kept", result.UnplacedDeleted)
+	}
+	if _, err := dst.find(t.Context(), blobID); err != nil {
+		t.Fatalf("find after sweep: %v", err)
+	}
+	if _, err := dst.root.Stat(blobID); err != nil {
+		t.Fatalf("stat after sweep: %v", err)
 	}
 }
 

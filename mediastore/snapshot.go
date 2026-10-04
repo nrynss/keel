@@ -10,6 +10,7 @@ import (
 	"hash"
 	"io"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/nrynss/keel/id"
@@ -53,7 +54,9 @@ type ManifestBlob struct {
 	Visibility  Visibility `json:"visibility"`
 	SizeBytes   int64      `json:"size_bytes"`
 	SHA256      string     `json:"sha256"`
-	CreatedAt   time.Time  `json:"created_at"`
+	// CreatedAt is when the blob was first accepted. Restore keeps it in
+	// the manifest and stamps the new row with the store clock instead.
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // Selection names the blobs Snapshot captures.
@@ -61,7 +64,8 @@ type ManifestBlob struct {
 // A non-empty IDs list captures those blobs in that order and ignores
 // Owner. When IDs is empty, Owner captures every blob whose Owner field
 // equals Owner. The comparison is exact. It is not a prefix match and it
-// does not walk a directory. Both empty is refused.
+// does not walk a directory. Both empty is refused, and so is a
+// selection that resolves to no blobs.
 type Selection struct {
 	IDs   []string
 	Owner string
@@ -75,8 +79,10 @@ type Selection struct {
 // The capture is the rows and files as they stand while each blob is
 // read. Blob bytes are immutable once stored, so a row and its file
 // describe one artifact. A file that disappears mid-capture fails the
-// snapshot, and files already written into dir for this call are removed.
-// An id that is not in the store fails the snapshot the same way.
+// snapshot. The capture is written in a sibling directory and swapped
+// into dir only after the manifest is in place, so a failed refresh
+// leaves a previous snapshot untouched. An id that is not in the store
+// fails the snapshot the same way.
 func (s *Store) Snapshot(ctx context.Context, dir string, sel Selection) error {
 	if s == nil {
 		return fmt.Errorf("mediastore: snapshot: %w: nil store", ErrSnapshot)
@@ -91,9 +97,37 @@ func (s *Store) Snapshot(ctx context.Context, dir string, sel Selection) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	parent := filepath.Dir(dir)
+	if parent == "" {
+		parent = "."
+	}
+	if err := os.MkdirAll(parent, 0o755); err != nil {
 		return fmt.Errorf("mediastore: snapshot: %w", err)
 	}
+	tmp, err := os.MkdirTemp(parent, filepath.Base(dir)+".partial-")
+	if err != nil {
+		return fmt.Errorf("mediastore: snapshot: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			os.RemoveAll(tmp)
+		}
+	}()
+	if err := s.writeSnapshot(ctx, tmp, blobs); err != nil {
+		return err
+	}
+	if err := swapSnapshot(dir, tmp); err != nil {
+		return fmt.Errorf("mediastore: snapshot: %w", err)
+	}
+	committed = true
+	return nil
+}
+
+// writeSnapshot fills an empty directory with blob files and a manifest.
+// On failure it removes the files this call created. The directory itself
+// is the caller's to discard.
+func (s *Store) writeSnapshot(ctx context.Context, dir string, blobs []Blob) error {
 	root, err := os.OpenRoot(dir)
 	if err != nil {
 		return fmt.Errorf("mediastore: snapshot: %w", err)
@@ -132,6 +166,40 @@ func (s *Store) Snapshot(ctx context.Context, dir string, sel Selection) error {
 	return nil
 }
 
+// swapSnapshot moves tmp onto dir. dir is renamed aside first when it
+// already exists, and moved back if the swap fails, so a reader never
+// sees a truncated fixture and a failed call does not replace a good one.
+func swapSnapshot(dir, tmp string) error {
+	_, err := os.Stat(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return os.Rename(tmp, dir)
+	}
+	if err != nil {
+		return err
+	}
+	backup, err := os.MkdirTemp(filepath.Dir(dir), filepath.Base(dir)+".previous-")
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(backup); err != nil {
+		return err
+	}
+	if err := os.Rename(dir, backup); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, dir); err != nil {
+		if rbErr := os.Rename(backup, dir); rbErr != nil {
+			return fmt.Errorf("%w (restoring the previous snapshot: %v)", err, rbErr)
+		}
+		return err
+	}
+	// The new snapshot is already at dir. A leftover backup is not a
+	// failed capture, and reporting one would tell the caller the old
+	// fixture was kept.
+	os.RemoveAll(backup)
+	return nil
+}
+
 // selectBlobs resolves sel to metadata rows. IDs, when set, are read in
 // order. Otherwise every blob with the named owner is returned in the
 // index's list order, which is creation time then id.
@@ -165,13 +233,18 @@ func (s *Store) selectBlobs(ctx context.Context, sel Selection) ([]Blob, error) 
 			out = append(out, b)
 		}
 	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("mediastore: snapshot: %w: selection matches no blobs", ErrSnapshot)
+	}
 	return out, nil
 }
 
 // captureBlob copies one blob into the snapshot directory and returns its
-// manifest entry. The digest is of the bytes just written.
+// manifest entry. The digest is of the bytes just written. The bytes come
+// from openBlob, so a storage backend replaces that read without this
+// function learning where they live. The snapshot directory stays local.
 func (s *Store) captureBlob(root *os.Root, b Blob) (ManifestBlob, error) {
-	src, err := s.root.Open(b.ID)
+	src, err := s.openBlob(b.ID)
 	if err != nil {
 		return ManifestBlob{}, fmt.Errorf("mediastore: snapshot %s: %w", b.ID, err)
 	}
@@ -206,18 +279,31 @@ func (s *Store) captureBlob(root *os.Root, b Blob) (ManifestBlob, error) {
 	}, nil
 }
 
+// openBlob returns a reader for the stored bytes of id. Snapshot is the
+// caller. A storage backend replaces this function. The snapshot
+// directory, a manifest plus files, is a local fixture and is not read
+// through here.
+func (s *Store) openBlob(id string) (io.ReadCloser, error) {
+	return s.root.Open(id)
+}
+
 // Restore recreates every blob in the snapshot at dir. Each blob keeps
-// the id, owner, group, content type, visibility and creation time the
-// manifest records, so a URL that named the blob still names it.
+// the id, owner, group, content type and visibility the manifest records,
+// so a URL that named the blob still names it. The manifest's creation
+// time is not copied onto the row. The restored row is stamped with the
+// store clock, the same clock Persist uses, so a fixture older than
+// UnplacedAge is not deleted by the first default sweep.
 //
 // Restore refuses the whole snapshot, and writes nothing, when the
 // manifest version is not ManifestVersion, a blob file is missing, a
 // size or digest disagrees, or any id is already stored. A failure
 // after the first blob has been stored removes the blobs this call
-// created and leaves anything that was already there untouched.
+// created and leaves anything that was already there untouched. Bytes
+// land only through PersistWithID.
 //
-// Visibility is the only retention pin. A restored row is swept on the
-// same rules as a row Persist wrote.
+// Visibility is not a retention pin. A restored row is swept on the same
+// rules as a row Persist wrote. Protected and Retain are what keep a row
+// a sweep would otherwise remove.
 func (s *Store) Restore(ctx context.Context, dir string) error {
 	if s == nil {
 		return fmt.Errorf("mediastore: restore: %w: nil store", ErrSnapshot)
@@ -325,7 +411,6 @@ func (s *Store) restoreBlob(ctx context.Context, root *os.Root, b ManifestBlob) 
 		Owner:       b.Owner,
 		Group:       b.Group,
 		Visibility:  vis,
-		CreatedAt:   b.CreatedAt,
 	})
 	if err != nil {
 		return fmt.Errorf("mediastore: restore %s: %w", b.ID, err)
@@ -377,15 +462,18 @@ func parseVisibility(v Visibility) (Visibility, error) {
 	}
 }
 
-// removeSnapshotFiles deletes names this call created. A remove that
-// fails is logged by the caller only when it still has the store; here
-// the snapshot directory is the caller's fixture, so a leftover partial
-// is reported by returning after the first error is already in hand.
+// removeSnapshotFiles deletes names this call created. Cleanup is best
+// effort. A remove error is logged and then ignored, because the error
+// that failed the snapshot is already being returned. The snapshot
+// directory is the caller's fixture, not the store.
 func (s *Store) removeSnapshotFiles(root *os.Root, names []string) {
+	names = append(append([]string{}, names...), manifestFile+".partial")
 	for _, name := range names {
-		root.Remove(name)
+		err := root.Remove(name)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			s.log.Error("mediastore: snapshot cleanup failed", "name", name, "err", err.Error())
+		}
 	}
-	root.Remove(manifestFile + ".partial")
 }
 
 // writeRootFile replaces name with raw.
