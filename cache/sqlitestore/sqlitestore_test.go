@@ -551,6 +551,67 @@ func TestTwoNamespacesOwnTwoTables(t *testing.T) {
 	}
 }
 
+// TestNamespaceCaseIsCanonical: a namespace reads as lowercase, because
+// SQLite folds table names that differ only in ASCII case into one. A case
+// twin of an open namespace is that namespace, never a silent second one,
+// and the ledger and table carry the lowercase names.
+func TestNamespaceCaseIsCanonical(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cache.db")
+	ctx := t.Context()
+
+	// A fresh file opened with a mixed-case namespace owns the lowercase
+	// ledger and table.
+	mixed, err := sqlitestore.Open(ctx, sqlitestore.Config{DB: openDB(t, path), Namespace: "Cache"})
+	if err != nil {
+		t.Fatalf("open with a mixed-case namespace: %v", err)
+	}
+	fresh := openFresh(t, path)
+	var tables int
+	if err := fresh.QueryRow(
+		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'cache_entry'`,
+	).Scan(&tables); err != nil {
+		t.Fatalf("count cache_entry: %v", err)
+	}
+	if tables != 1 {
+		t.Errorf("sqlite_master holds %d cache_entry tables, want 1", tables)
+	}
+	if err := fresh.QueryRow(
+		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'Cache_entry'`,
+	).Scan(&tables); err != nil {
+		t.Fatalf("count Cache_entry: %v", err)
+	}
+	if tables != 0 {
+		t.Errorf("sqlite_master holds %d Cache_entry tables, want 0, because the name reads as lowercase", tables)
+	}
+
+	// The case twin of an open namespace is that namespace. The row one
+	// store writes, the other reads, and no second pair of tables
+	// appears.
+	lower, err := sqlitestore.Open(ctx, sqlitestore.Config{DB: openDB(t, path)})
+	if err != nil {
+		t.Fatalf("open the lowercase twin: %v", err)
+	}
+	entry := cache.Entry{Payload: []byte("twin"), ContentType: "application/json", CreatedAt: base}
+	if err := lower.Put(ctx, "key-case", entry); err != nil {
+		t.Fatalf("Put through the lowercase store: %v", err)
+	}
+	got, err := mixed.Get(ctx, "key-case")
+	if err != nil {
+		t.Fatalf("Get through the mixed-case store: %v", err)
+	}
+	if string(got.Payload) != "twin" {
+		t.Errorf("the case twin read %q, want the row its twin wrote", got.Payload)
+	}
+	if err := fresh.QueryRow(
+		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name LIKE '%cache%'`,
+	).Scan(&tables); err != nil {
+		t.Fatalf("count the cache tables: %v", err)
+	}
+	if tables != 2 {
+		t.Errorf("sqlite_master holds %d tables named like cache, want one entry table and one ledger", tables)
+	}
+}
+
 // TestOrphanSweepSparesAFreshEntry: an entry a concurrent make stores while
 // the sweep holds its snapshot survives the pass, and the next caller is
 // served instead of paying again.

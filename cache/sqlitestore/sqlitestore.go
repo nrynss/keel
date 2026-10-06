@@ -11,8 +11,9 @@
 // of the one it replaces. The commit lands before Put returns, so a process
 // that dies right after a make keeps the entry it paid for.
 //
-// Each namespace owns its ledger and its entry table. Two stores with
-// different namespaces therefore share one database file as two isolated
+// Each namespace owns its ledger and its entry table. A namespace reads as
+// lowercase, so two names that differ only in ASCII case are one namespace.
+// Two different namespaces therefore share one database file as two isolated
 // tables, which is how two cache levels stay apart.
 //
 // Sweep deletes the rows time has expired and the rows whose mediastore
@@ -36,6 +37,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/nrynss/keel/cache"
@@ -66,9 +68,11 @@ type Config struct {
 	DB *sqlite.DB
 
 	// Namespace names the ledger and the entry table this store owns.
-	// Empty means the one this package owns. Two stores with different
-	// namespaces share one database file as two isolated tables, which
-	// is how two cache levels stay apart.
+	// It reads as lowercase, so two names that differ only in ASCII
+	// case are one namespace, because SQLite folds table names to one.
+	// Empty means the one this package owns. Two different namespaces
+	// share one database file as two isolated tables, which is how two
+	// cache levels stay apart.
 	Namespace string
 
 	// Now supplies the clock a row with no stored time is stamped with
@@ -96,7 +100,10 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 	if cfg.DB == nil {
 		return nil, fmt.Errorf("sqlitestore: open: %w: nil db", ErrInvalid)
 	}
-	namespace := cfg.Namespace
+	// SQLite folds table names that differ only in ASCII case into one,
+	// so the namespace folds with them. A case twin of an open
+	// namespace is that namespace, and never a silent second one.
+	namespace := strings.ToLower(cfg.Namespace)
 	if namespace == "" {
 		namespace = schemaNamespace
 	}
@@ -383,11 +390,10 @@ type blobRow struct {
 
 // deleteOrphans reads every row that names a blob and deletes the ones
 // whose blob no longer resolves. A delete only lands on the row the pass
-// snapshotted, because a fresh entry a concurrent make stores during the
-// pass carries a different stamp, and the next caller must be served
-// instead of paying again. The read and the deletes do not share one
-// transaction, because a row removed under this pass deletes nothing the
-// second time.
+// snapshotted, so a fresh entry a concurrent make stores during the pass
+// never matches. The next caller is served instead of paying again. The
+// read and the deletes do not share one transaction, because a row removed
+// under this pass deletes nothing the second time.
 func (s *Store) deleteOrphans(ctx context.Context, present func(context.Context, string) (bool, error)) (int, error) {
 	rows, err := s.db.Reader().QueryContext(ctx,
 		`SELECT key, blob_id, created_at FROM `+s.table+` WHERE blob_id != ''`)
