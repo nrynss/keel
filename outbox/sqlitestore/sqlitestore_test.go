@@ -2,11 +2,15 @@ package sqlitestore_test
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -314,41 +318,129 @@ func TestRecordFailuresBumpsOncePerCall(t *testing.T) {
 	}
 }
 
-// TestEntriesSurviveReopen: a store closed the way a dying process leaves
-// one keeps every entry, in order, for the next open.
-func TestEntriesSurviveReopen(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "outbox.db")
-	db := openDB(t, path)
-	first, err := sqlitestore.Open(t.Context(), sqlitestore.Config{DB: db})
+// The environment the parent passes to the child it launches.
+const (
+	crashChildEnv = "KEEL_OUTBOX_CRASH_CHILD"
+	crashDirEnv   = "KEEL_OUTBOX_CRASH_DIR"
+	crashRunName  = "TestCrashHelperProcess"
+)
+
+// nopSink is the sink the crash child opens with, because the child adds
+// entries and dies before any pass could deliver them.
+type nopSink struct{}
+
+// Deliver accepts the batch and does nothing with it.
+func (nopSink) Deliver(ctx context.Context, batch []outbox.Entry) error { return nil }
+
+// TestCrashHelperProcess is the child half of the crash harness. A plain go
+// test run skips it, because only the parent sets the child variable.
+func TestCrashHelperProcess(t *testing.T) {
+	if os.Getenv(crashChildEnv) == "" {
+		t.Skip("child of the outbox crash harness")
+	}
+	dir := os.Getenv(crashDirEnv)
+	ctx := context.Background()
+	db, err := sqlite.Open(ctx, sqlite.Config{Path: filepath.Join(dir, "outbox.db")})
 	if err != nil {
-		t.Fatalf("first Open: %v", err)
+		t.Fatalf("child sqlite.Open: %v", err)
+	}
+	store, err := sqlitestore.Open(ctx, sqlitestore.Config{DB: db})
+	if err != nil {
+		t.Fatalf("child sqlitestore.Open: %v", err)
+	}
+	box, err := outbox.Open(ctx, outbox.Config{Store: store, Sink: nopSink{}})
+	if err != nil {
+		t.Fatalf("child outbox.Open: %v", err)
 	}
 
-	var want []outbox.Entry
-	for _, name := range []string{"one", "two", "three"} {
-		e := entry(name, []byte("payload-of-"+name))
-		if err := first.Add(t.Context(), e); err != nil {
-			t.Fatalf("Add %s: %v", name, err)
+	var ids []string
+	for _, payload := range []string{"alpha", "beta", "gamma"} {
+		e, err := box.Add(ctx, []byte(payload))
+		if err != nil {
+			t.Fatalf("child Add %s: %v", payload, err)
 		}
-		want = append(want, e)
+		ids = append(ids, e.ID)
 	}
-	if err := db.Close(); err != nil {
-		t.Fatalf("close the first process: %v", err)
+	// The ids leave through a file, so the parent compares them against a
+	// record the dead process wrote outside the database it is re-read
+	// from.
+	if err := os.WriteFile(filepath.Join(dir, "ids.txt"), []byte(strings.Join(ids, "\n")+"\n"), 0o644); err != nil {
+		t.Fatalf("child record ids: %v", err)
+	}
+	// The exit path: this process dies here with its handles open, so no
+	// close runs, no checkpoint runs, and the WAL keeps the committed
+	// frames for the parent's reopen to recover.
+	os.Exit(3)
+}
+
+// TestEntriesSurviveAKilledProcess kills a process right after it added
+// entries and reads them back in this one. The child never closes its
+// handles, so the committed frames are still in the WAL, and the reopen
+// recovers them the way a real crash recovery runs. A polite close would
+// have checkpointed the WAL away, which is a weaker end state.
+func TestEntriesSurviveAKilledProcess(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "outbox.db")
+	idsPath := filepath.Join(dir, "ids.txt")
+
+	child := exec.Command(os.Args[0], "-test.run="+crashRunName)
+	child.Env = append(os.Environ(), crashChildEnv+"=1", crashDirEnv+"="+dir)
+	var childLog strings.Builder
+	child.Stdout, child.Stderr = &childLog, &childLog
+	if err := child.Start(); err != nil {
+		t.Fatalf("start child: %v", err)
+	}
+	// The child exits by itself, so the wait below reaps it with the wanted
+	// exit status. The kill is the watchdog, because a hung child would
+	// otherwise hang the suite.
+	waitCh := make(chan error, 1)
+	go func() { waitCh <- child.Wait() }()
+	select {
+	case err := <-waitCh:
+		var ee *exec.ExitError
+		if !errors.As(err, &ee) || ee.ExitCode() != 3 {
+			t.Fatalf("child exit = %v, want status 3. Output:\n%s", err, childLog.String())
+		}
+	case <-time.After(30 * time.Second):
+		_ = child.Process.Kill() // the watchdog fired, so the child only needs reaping
+		<-waitCh
+		t.Fatalf("child hung. Output:\n%s", childLog.String())
 	}
 
-	reopened := openStore(t, path)
+	// The WAL is the crash residue: a process that closed politely would
+	// have checkpointed it away, and a journal that never leaves a WAL
+	// behind cannot hold this package's durability promise.
+	wal, err := os.Stat(dbPath + "-wal")
+	if err != nil {
+		t.Fatalf("stat the WAL the dead child left: %v", err)
+	}
+	if wal.Size() == 0 {
+		t.Fatalf("the WAL the child left is empty, want the committed frames in it")
+	}
+
+	data, err := os.ReadFile(idsPath)
+	if err != nil {
+		t.Fatalf("read the ids the child recorded: %v", err)
+	}
+	want := strings.Split(strings.TrimSpace(string(data)), "\n")
+
+	reopened := openStore(t, dbPath)
 	got, err := reopened.Pending(t.Context(), 1, -1)
 	if err != nil {
-		t.Fatalf("Pending after reopen: %v", err)
+		t.Fatalf("Pending after the crash: %v", err)
 	}
 	if len(got) != len(want) {
-		t.Fatalf("Pending = %d entries, want the %d the first process stored", len(got), len(want))
+		t.Fatalf("Pending = %d entries, want the %d the dead process stored", len(got), len(want))
 	}
-	for i := range want {
-		if got[i].ID != want[i].ID || !bytes.Equal(got[i].Payload, want[i].Payload) || !got[i].AddedAt.Equal(want[i].AddedAt) {
-			t.Errorf("entry %d = %s %x %v, want %s %x %v", i,
-				got[i].ID, got[i].Payload, got[i].AddedAt,
-				want[i].ID, want[i].Payload, want[i].AddedAt)
+	for i, entryID := range want {
+		if got[i].ID != entryID {
+			t.Errorf("entry %d ID = %s, want the stable %s", i, got[i].ID, entryID)
+		}
+		if got[i].Failures != 0 {
+			t.Errorf("entry %d Failures = %d, want 0, because the crash spent no attempt", i, got[i].Failures)
+		}
+		if wantPayload := []byte([]string{"alpha", "beta", "gamma"}[i]); !bytes.Equal(got[i].Payload, wantPayload) {
+			t.Errorf("entry %d payload = %q, want %q", i, got[i].Payload, wantPayload)
 		}
 	}
 }
