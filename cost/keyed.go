@@ -10,12 +10,13 @@ import (
 // no ceiling for.
 var ErrUnknownOwner = errors.New("cost: unknown budget owner")
 
-// KeyedBudget bounds the spend of several owners that share one pool. Every
-// owner carries a ceiling of its own, and one global ceiling bounds the sum
-// of what all owners spend and hold together. An owner that exhausts its
-// share therefore never touches another owner's headroom. The owner key is
-// whatever string the caller uses to name an owner. Build one with
-// NewKeyedBudget. Every method is safe for concurrent use.
+// KeyedBudget bounds the spend of several owners that share one pool in one
+// denomination. Every owner carries a ceiling of its own, and one global
+// ceiling bounds the sum of what all owners spend and hold together. An owner
+// that exhausts its share therefore never touches another owner's headroom.
+// The owner key is whatever string the caller uses to name an owner. Build
+// one with NewKeyedBudget for USD nanodollars or NewKeyedBudgetIn for a named
+// denomination. Every method is safe for concurrent use.
 type KeyedBudget struct {
 	mu     sync.Mutex
 	global *Budget
@@ -23,15 +24,37 @@ type KeyedBudget struct {
 }
 
 // NewKeyedBudget returns a KeyedBudget whose global ceiling is limit. It
-// reports ErrNegativeLimit when limit is below zero, as NewBudget does,
-// because a negative ceiling admits no spend and only creates misleading
-// headroom.
+// counts USD nanodollars, which is the behaviour every keyed budget had
+// before denominations existed. It reports ErrNegativeLimit when limit is
+// below zero, as NewBudget does, because a negative ceiling admits no spend
+// and only creates misleading headroom.
 func NewKeyedBudget(limit Price) (*KeyedBudget, error) {
 	global, err := NewBudget(limit)
 	if err != nil {
 		return nil, err
 	}
 	return &KeyedBudget{global: global, owners: make(map[string]*Budget)}, nil
+}
+
+// NewKeyedBudgetIn returns a KeyedBudget that counts in denomination, with a
+// global ceiling of limit. The zero denomination names USD nanodollars, so
+// NewKeyedBudget and NewKeyedBudgetIn with the zero denomination behave the
+// same. It reports ErrNegativeLimit when limit is below zero, as NewBudget
+// does.
+func NewKeyedBudgetIn(denomination Denomination, limit Price) (*KeyedBudget, error) {
+	global, err := NewBudgetIn(denomination, limit)
+	if err != nil {
+		return nil, err
+	}
+	return &KeyedBudget{global: global, owners: make(map[string]*Budget)}, nil
+}
+
+// Denomination reports the unit every owner of this budget counts in. The
+// zero value names USD nanodollars. The denomination never changes, because
+// a budget that switched unit mid life would silently reprice its recorded
+// spend.
+func (k *KeyedBudget) Denomination() Denomination {
+	return k.global.Denomination()
 }
 
 // Limit returns the global ceiling every owner shares.
@@ -156,6 +179,12 @@ func (k *KeyedBudget) Owner(owner string) (Account, error) {
 type ownerAccount struct {
 	keyed *KeyedBudget
 	owner string
+}
+
+// Denomination reports the unit this owner's prices count, which is the one
+// the keyed budget was built with.
+func (a ownerAccount) Denomination() Denomination {
+	return a.keyed.Denomination()
 }
 
 func (a ownerAccount) Reserve(estimate Price) error {
