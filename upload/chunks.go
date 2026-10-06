@@ -39,6 +39,11 @@ type upload struct {
 	highest   int64
 	expiresAt time.Time
 	chunks    map[int64]chunk
+	// onVisit, when non-nil, runs once for every index the state render
+	// examines. A test sets it to count the render's work rather than time
+	// it, so the proportionality bound holds on a loaded workstation. A
+	// serving handler leaves it nil, which costs one nil check per index.
+	onVisit func()
 }
 
 // chunk records one stored chunk.
@@ -69,6 +74,9 @@ func (u *upload) missing() []int {
 	}
 	out := make([]int, 0, span-len(u.chunks))
 	for index := 0; index < span; index++ {
+		if u.onVisit != nil {
+			u.onVisit()
+		}
 		if _, ok := u.chunks[int64(index)]; !ok {
 			out = append(out, index)
 		}
@@ -80,6 +88,9 @@ func (u *upload) missing() []int {
 func (u *upload) received() []int {
 	out := make([]int, 0, len(u.chunks))
 	for index := range u.chunks {
+		if u.onVisit != nil {
+			u.onVisit()
+		}
 		out = append(out, int(index))
 	}
 	sort.Ints(out)
