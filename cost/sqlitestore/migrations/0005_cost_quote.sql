@@ -14,3 +14,4 @@ CREATE TABLE cost_quote (
 
 CREATE INDEX cost_quote_expires ON cost_quote (expires_at);
 CREATE INDEX cost_quote_owner ON cost_quote (owner);
+CREATE INDEX cost_quote_claim ON cost_quote (claim_expires_at);
