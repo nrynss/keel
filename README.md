@@ -35,6 +35,7 @@ else is pure Go, and `CGO_ENABLED=0` builds the whole module.
 | `job` | Long work started by a short request, observed over `stream`, durable across restarts |
 | `mediastore` | Blobs on disk under unguessable ids, served with Range support, with retention sweeps and a snapshot that restores the same ids |
 | `upload` | Resumable chunked uploads that land in `mediastore`, resumable by id after a dropped connection |
+| `photo` | Normalises an uploaded photo: EXIF orientation applied to the pixels, metadata stripped, resized under side and pixel caps, re-encoded under a byte cap |
 | `sqlite` | One SQLite file with WAL, a writer handle, a read-only reader pool, namespaced migrations and online backup |
 | `ffmpeg` | ffmpeg and ffprobe bound to a context, with a bounded wait on shutdown |
 | `duration` | WAV and MP3 length read from the bytes themselves, for a runtime that ships ffmpeg without ffprobe |
@@ -150,6 +151,36 @@ handler, err := upload.New(upload.Config{Dir: "staging", Store: store})
 mux := http.NewServeMux()
 handler.Mount(mux)
 ```
+
+### Normalise an uploaded photo
+
+```go
+res, err := photo.Normalize(ctx, r, photo.Config{
+	MaxLongSide:   1024,
+	MaxBytes:      10 << 20,
+	Format:        photo.JPEG,
+	Quality:       85,
+	MaxPixels:     100_000_000,
+	MaxInputBytes: 32 << 20,
+})
+```
+
+`photo` takes one uploaded image and returns the bytes a paid model or a store can accept. It
+decodes JPEG, PNG and WebP, applies the EXIF orientation to the pixels, resizes under the side
+limits without ever enlarging, and re-encodes from the decoded pixels. The re-encode is what
+strips metadata, so no EXIF, XMP or ICC block from the input survives. The decode set is the
+package's own, so a binary that links other image decoders does not widen what an upload can
+be. The result carries a SHA-256 of the normalised bytes, so the same pixels uploaded twice
+hash to one cache key, whatever metadata each upload carried.
+
+Refusals are deterministic. Each is a `photo.Error` whose `Code` maps into the `wire` envelope,
+with a sentinel behind it for `errors.Is`. The codes are `unsupported_format`, `heic`,
+`too_many_input_bytes`, `too_many_pixels` and `output_cannot_fit`. The HEIC refusal sniffs the
+ISO BMFF brands before the rest of a large upload is read. The pixel cap reads the header alone
+before any full decode, which is what bounds a decompression bomb. When a byte cap is set
+and the output is over it, the JPEG quality steps down to a floor, then the scale steps down, and
+the last floor refuses. Orientation is read only from a JPEG APP1 Exif segment, so a PNG or WebP
+input is trusted to be upright.
 
 ### Count what it cost, and refuse before you overspend
 
