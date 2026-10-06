@@ -11,11 +11,19 @@ import (
 	"github.com/nrynss/keel/sqlite"
 )
 
-// TestSweepQuotesPlanUsesIndexes pins the query plan of the quote sweep.
-// The statement pairs an expiry branch with a claim branch, and SQLite
-// only keeps the indexes when every branch has one of its own. A missing
-// index drops the whole statement to a full scan, and every quote write
-// then pays for the whole table on the single writer.
+// TestSweepQuotesPlanUsesIndexes pins the query plan of the quote sweep
+// and the shape of the index the claim branch seeks. The statement pairs
+// an expiry branch with a claim branch, and SQLite only keeps the indexes
+// when every branch has one of its own. A missing index drops the whole
+// statement to a full scan, and every quote write then pays for the whole
+// table on the single writer.
+//
+// The plan alone cannot see the data the store writes. Every open and
+// done row keeps claim_expires_at at 0, which sits inside the claim
+// branch's range, so a full index on that column makes the sweep fetch
+// and reject every live row. The claim index is partial for exactly that
+// reason, and the schema pin below refuses the full form, whose plan is
+// identical while its cost grows with the table.
 func TestSweepQuotesPlanUsesIndexes(t *testing.T) {
 	logger := slog.New(slog.DiscardHandler)
 	db, err := sqlite.Open(t.Context(), sqlite.Config{
@@ -65,5 +73,17 @@ func TestSweepQuotesPlanUsesIndexes(t *testing.T) {
 	}
 	if strings.Contains(plan, "SCAN cost_quote") {
 		t.Fatalf("sweep plan scans the quote table:\n%s", plan)
+	}
+	// The partial clause is what keeps the claim index as small as the
+	// claims it serves. A full index on the same column plans the same
+	// way and still walks every live row, because open and done rows
+	// carry a claim deadline of 0, and 0 sits inside the sweep's range.
+	var indexSQL string
+	if err := tx.QueryRowContext(t.Context(),
+		`SELECT sql FROM sqlite_schema WHERE type = 'index' AND name = 'cost_quote_claim'`).Scan(&indexSQL); err != nil {
+		t.Fatalf("read the claim index: %v", err)
+	}
+	if !strings.Contains(indexSQL, "WHERE state = 'claimed'") {
+		t.Fatalf("the claim index lost its partial clause: %s", indexSQL)
 	}
 }
