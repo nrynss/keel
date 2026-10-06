@@ -52,7 +52,7 @@ func ExampleOpen() {
 		return
 	}
 
-	live, err := store.Pending(ctx, 1)
+	live, err := store.Pending(ctx, 1, -1)
 	if err != nil {
 		fmt.Println("pending failed:", err)
 		return

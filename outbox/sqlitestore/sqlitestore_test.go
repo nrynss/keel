@@ -91,7 +91,7 @@ func TestOpenAppliesMigrationsOnce(t *testing.T) {
 	}
 
 	second := openStore(t, path)
-	got, err := second.Pending(t.Context(), 1)
+	got, err := second.Pending(t.Context(), 1, -1)
 	if err != nil {
 		t.Fatalf("Pending through the second store: %v", err)
 	}
@@ -124,7 +124,7 @@ func TestAddPendingRoundTrip(t *testing.T) {
 		t.Fatalf("Add: %v", err)
 	}
 
-	got, err := store.Pending(t.Context(), 3)
+	got, err := store.Pending(t.Context(), 3, -1)
 	if err != nil {
 		t.Fatalf("Pending: %v", err)
 	}
@@ -160,7 +160,7 @@ func TestPendingKeepsInsertionOrderOnAFrozenClock(t *testing.T) {
 		want = append(want, e.ID)
 	}
 
-	got, err := store.Pending(t.Context(), 1)
+	got, err := store.Pending(t.Context(), 1, -1)
 	if err != nil {
 		t.Fatalf("Pending: %v", err)
 	}
@@ -171,6 +171,43 @@ func TestPendingKeepsInsertionOrderOnAFrozenClock(t *testing.T) {
 		if got[i].ID != entryID {
 			t.Errorf("Pending[%d] = %s, want %s", i, got[i].ID, entryID)
 		}
+	}
+}
+
+// TestPendingLimitBoundsTheRead: the limit rides in the SQL, so a bounded
+// read returns the oldest matching rows and costs nothing like the backlog.
+func TestPendingLimitBoundsTheRead(t *testing.T) {
+	store := openStore(t, filepath.Join(t.TempDir(), "outbox.db"))
+
+	var want []string
+	for _, name := range []string{"one", "two", "three", "four"} {
+		e := entry(name, []byte(name))
+		if err := store.Add(t.Context(), e); err != nil {
+			t.Fatalf("Add %s: %v", name, err)
+		}
+		want = append(want, e.ID)
+	}
+
+	got, err := store.Pending(t.Context(), 1, 2)
+	if err != nil {
+		t.Fatalf("Pending with limit 2: %v", err)
+	}
+	if len(got) != 2 || got[0].ID != want[0] || got[1].ID != want[1] {
+		t.Fatalf("Pending(1, 2) = %+v, want the two oldest entries", got)
+	}
+	none, err := store.Pending(t.Context(), 1, 0)
+	if err != nil {
+		t.Fatalf("Pending with limit 0: %v", err)
+	}
+	if len(none) != 0 {
+		t.Fatalf("Pending(1, 0) = %+v, want nothing", none)
+	}
+	all, err := store.Pending(t.Context(), 1, -1)
+	if err != nil {
+		t.Fatalf("Pending with a negative limit: %v", err)
+	}
+	if len(all) != len(want) {
+		t.Fatalf("Pending(1, -1) = %d entries, want every matching one", len(all))
 	}
 }
 
@@ -190,7 +227,7 @@ func TestPendingAndExhaustedSplitOnTheThreshold(t *testing.T) {
 		t.Fatalf("RecordFailures: %v", err)
 	}
 
-	live, err := store.Pending(t.Context(), 1)
+	live, err := store.Pending(t.Context(), 1, -1)
 	if err != nil {
 		t.Fatalf("Pending: %v", err)
 	}
@@ -205,7 +242,7 @@ func TestPendingAndExhaustedSplitOnTheThreshold(t *testing.T) {
 		t.Errorf("Exhausted(1) = %+v, want the entry with one failure", spent)
 	}
 
-	all, err := store.Pending(t.Context(), 2)
+	all, err := store.Pending(t.Context(), 2, -1)
 	if err != nil {
 		t.Fatalf("Pending(2): %v", err)
 	}
@@ -230,7 +267,7 @@ func TestDeliveredRemovesWholeBatch(t *testing.T) {
 	if err := store.Delivered(t.Context(), []string{ids[0], ids[2], "id-never-stored"}); err != nil {
 		t.Fatalf("Delivered: %v", err)
 	}
-	got, err := store.Pending(t.Context(), 1)
+	got, err := store.Pending(t.Context(), 1, -1)
 	if err != nil {
 		t.Fatalf("Pending: %v", err)
 	}
@@ -268,7 +305,7 @@ func TestRecordFailuresBumpsOncePerCall(t *testing.T) {
 			t.Fatalf("Exhausted(%d) = %+v, want the counted entry at %d failures", want, got, want)
 		}
 	}
-	untouched, err := store.Pending(t.Context(), 1)
+	untouched, err := store.Pending(t.Context(), 1, -1)
 	if err != nil {
 		t.Fatalf("Pending: %v", err)
 	}
@@ -300,7 +337,7 @@ func TestEntriesSurviveReopen(t *testing.T) {
 	}
 
 	reopened := openStore(t, path)
-	got, err := reopened.Pending(t.Context(), 1)
+	got, err := reopened.Pending(t.Context(), 1, -1)
 	if err != nil {
 		t.Fatalf("Pending after reopen: %v", err)
 	}

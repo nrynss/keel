@@ -108,20 +108,24 @@ func (s *Store) Add(ctx context.Context, e outbox.Entry) error {
 	return nil
 }
 
-// Pending returns every entry still owed with fewer than maxFailures
-// recorded failures, oldest first.
-func (s *Store) Pending(ctx context.Context, maxFailures int) ([]outbox.Entry, error) {
+// Pending returns at most limit entries still owed with fewer than
+// maxFailures recorded failures, oldest first. The limit rides in the SQL,
+// so a read of one row costs one row. A negative limit removes the bound,
+// which is how an unbounded drain asks for everything, and zero returns
+// nothing.
+func (s *Store) Pending(ctx context.Context, maxFailures, limit int) ([]outbox.Entry, error) {
 	return s.query(ctx,
-		`SELECT id, payload, failures, added_at FROM outbox_entry WHERE failures < ? ORDER BY seq`,
-		maxFailures, "pending")
+		`SELECT id, payload, failures, added_at FROM outbox_entry WHERE failures < ? ORDER BY seq LIMIT ?`,
+		maxFailures, limit, "pending")
 }
 
 // Exhausted returns every entry still owed with at least maxFailures
-// recorded failures, oldest first.
+// recorded failures, oldest first. The read is the reporting read a caller
+// runs to see what is stuck, so it takes no limit.
 func (s *Store) Exhausted(ctx context.Context, maxFailures int) ([]outbox.Entry, error) {
 	return s.query(ctx,
-		`SELECT id, payload, failures, added_at FROM outbox_entry WHERE failures >= ? ORDER BY seq`,
-		maxFailures, "exhausted")
+		`SELECT id, payload, failures, added_at FROM outbox_entry WHERE failures >= ? ORDER BY seq LIMIT ?`,
+		maxFailures, -1, "exhausted")
 }
 
 // Delivered removes the named entries, which is this store's record of
@@ -162,8 +166,8 @@ func (s *Store) eachID(ctx context.Context, ids []string, stmt, what string) err
 
 // query runs one listing read and decodes every row under the name a caller
 // would use for it in an error.
-func (s *Store) query(ctx context.Context, query string, maxFailures int, what string) ([]outbox.Entry, error) {
-	rows, err := s.db.Reader().QueryContext(ctx, query, maxFailures)
+func (s *Store) query(ctx context.Context, query string, maxFailures, limit int, what string) ([]outbox.Entry, error) {
+	rows, err := s.db.Reader().QueryContext(ctx, query, maxFailures, limit)
 	if err != nil {
 		return nil, fmt.Errorf("sqlitestore: %s: %w", what, err)
 	}

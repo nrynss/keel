@@ -58,9 +58,13 @@ func (s *memStore) Add(ctx context.Context, e outbox.Entry) error {
 }
 
 // Pending returns the owed entries with fewer than maxFailures, oldest
-// first.
-func (s *memStore) Pending(ctx context.Context, maxFailures int) ([]outbox.Entry, error) {
-	return s.selectEntries(func(failures int) bool { return failures < maxFailures }), nil
+// first, bounded by limit the way the interface documents it.
+func (s *memStore) Pending(ctx context.Context, maxFailures, limit int) ([]outbox.Entry, error) {
+	out := s.selectEntries(func(failures int) bool { return failures < maxFailures })
+	if limit >= 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
 }
 
 // Exhausted returns the owed entries with at least maxFailures, oldest
@@ -243,7 +247,7 @@ type failPendingStore struct {
 }
 
 // Pending fails with the stored error.
-func (s *failPendingStore) Pending(ctx context.Context, maxFailures int) ([]outbox.Entry, error) {
+func (s *failPendingStore) Pending(ctx context.Context, maxFailures, limit int) ([]outbox.Entry, error) {
 	return nil, s.err
 }
 

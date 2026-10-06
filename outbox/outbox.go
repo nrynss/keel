@@ -104,10 +104,11 @@ type Store interface {
 	// before the call.
 	Add(ctx context.Context, e Entry) error
 
-	// Pending returns every entry still owed whose recorded failures are
-	// fewer than maxFailures, oldest first. A pass replays them in this
-	// order.
-	Pending(ctx context.Context, maxFailures int) ([]Entry, error)
+	// Pending returns at most limit entries still owed whose recorded
+	// failures are fewer than maxFailures, oldest first. A pass replays
+	// them in this order. A negative limit removes the bound, and zero
+	// returns nothing.
+	Pending(ctx context.Context, maxFailures, limit int) ([]Entry, error)
 
 	// Exhausted returns every entry still owed whose recorded failures
 	// have reached maxFailures, oldest first.
@@ -241,8 +242,9 @@ type Outbox struct {
 }
 
 // Open returns an Outbox that remembers entries in cfg.Store and delivers
-// them to cfg.Sink. It reads the store once, so a schema that is not in
-// place stops the open instead of the first flush.
+// them to cfg.Sink. It reads one row from the store, so a schema that is
+// not in place stops the open instead of the first flush. That read costs
+// the same however long the queue is.
 func Open(ctx context.Context, cfg Config) (*Outbox, error) {
 	if cfg.Store == nil {
 		return nil, ErrNoStore
@@ -269,7 +271,7 @@ func Open(ctx context.Context, cfg Config) (*Outbox, error) {
 		retryWait:   cfg.wait(),
 		retryMax:    cfg.maxWait(),
 	}
-	if _, err := o.store.Pending(ctx, math.MaxInt); err != nil {
+	if _, err := o.store.Pending(ctx, math.MaxInt, 1); err != nil {
 		return nil, fmt.Errorf("outbox: open: %w", err)
 	}
 	return o, nil
@@ -310,7 +312,7 @@ func (o *Outbox) Flush(ctx context.Context) (Summary, error) {
 	if err := ctx.Err(); err != nil {
 		return Summary{}, err
 	}
-	pending, err := o.store.Pending(ctx, o.maxAttempts)
+	pending, err := o.store.Pending(ctx, o.maxAttempts, math.MaxInt)
 	if err != nil {
 		return Summary{}, fmt.Errorf("outbox: flush: %w", err)
 	}
@@ -357,7 +359,7 @@ func (o *Outbox) nextBatch(pending []Entry, start int) ([]Entry, int) {
 // including entries whose attempts are spent. It is the durable but
 // unshipped record, and a caller that wants to know what is owed reads it.
 func (o *Outbox) Pending(ctx context.Context) ([]Entry, error) {
-	pending, err := o.store.Pending(ctx, math.MaxInt)
+	pending, err := o.store.Pending(ctx, math.MaxInt, math.MaxInt)
 	if err != nil {
 		return nil, fmt.Errorf("outbox: pending: %w", err)
 	}
