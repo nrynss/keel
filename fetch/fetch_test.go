@@ -74,6 +74,8 @@ func TestDefaultClassifierRefusesInternalRanges(t *testing.T) {
 		{"multicast v4", "224.0.0.1"},
 		{"multicast v6", "ff02::1"},
 		{"unspecified v4", "0.0.0.0"},
+		{"self range", "0.0.0.1"},
+		{"self range high", "0.255.255.255"},
 		{"unspecified v6", "::"},
 		{"broadcast", "255.255.255.255"},
 		{"six to four hides loopback", "2002:7f00:1::"},
