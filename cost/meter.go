@@ -23,9 +23,13 @@ var ErrUnrecordedCharge = errors.New("cost: unrecorded charge")
 
 // Account is the budget side a meter drives. A Budget is an account on its
 // own, and a KeyedBudget hands out one account per owner through Owner. The
-// three methods mean exactly what they mean on Budget, so both kinds of
-// budget drive a meter identically.
+// three spending methods mean exactly what they mean on Budget, so both
+// kinds of budget drive a meter identically.
 type Account interface {
+	// Denomination reports the unit the account's prices count. The meter
+	// stamps every charge it records with it, so a report never shows a
+	// unit the account does not speak.
+	Denomination() Denomination
 	// Reserve commits estimate against the account and fails when the
 	// estimate would pass its ceiling.
 	Reserve(estimate Price) error
@@ -74,13 +78,16 @@ type Work func(context.Context) (Usage, error)
 // settles at in its sink. It reserves the estimate before the call runs and
 // settles the measured price after it. It frees the reservation on every
 // failure up to and including the settle, so a failed, cancelled or
-// panicking call never holds budget. A charge the sink cannot record is the
-// one failure past the settle, and Call reports it as ErrUnrecordedCharge.
-// Build one with NewMeter. Call is safe for concurrent use, because every
-// method it drives is.
+// panicking call never holds budget. Every charge it records carries the
+// account's denomination, so a credit pool never lands in a report as
+// dollars. A charge the sink cannot record is the one failure past the
+// settle, and Call reports it as ErrUnrecordedCharge. Build one with
+// NewMeter. Call is safe for concurrent use, because every method it drives
+// is.
 type Meter struct {
 	account Account
 	sink    ChargeSink
+	denom   Denomination
 }
 
 // isNilValue reports whether v is nil or an interface holding a nil pointer.
@@ -106,7 +113,9 @@ func NewMeter(account Account, sink ChargeSink) (*Meter, error) {
 	if isNilValue(sink) {
 		return nil, ErrNilSink
 	}
-	return &Meter{account: account, sink: sink}, nil
+	// The denomination is fixed for the life of the account, so the meter
+	// reads it once and stamps every charge with the same unit.
+	return &Meter{account: account, sink: sink, denom: account.Denomination()}, nil
 }
 
 // Call runs work as one paid call against the meter's account. It commits
@@ -162,7 +171,7 @@ func (m *Meter) Call(ctx context.Context, estimate Price, kind, ref string, work
 		return Usage{}, err
 	}
 	booked = true
-	if err := m.sink.Add(ctx, Charge{Kind: kind, Units: 1, UnitPrice: price, Ref: ref}); err != nil {
+	if err := m.sink.Add(ctx, Charge{Kind: kind, Units: 1, UnitPrice: price, Ref: ref, Denomination: m.denom}); err != nil {
 		return Usage{}, fmt.Errorf("%w: %w", ErrUnrecordedCharge, err)
 	}
 	return Usage{Price: price, Measured: usage.Measured}, nil

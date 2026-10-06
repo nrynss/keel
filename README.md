@@ -39,7 +39,7 @@ else is pure Go, and `CGO_ENABLED=0` builds the whole module.
 | `sqlite` | One SQLite file with WAL, a writer handle, a read-only reader pool, namespaced migrations and online backup |
 | `ffmpeg` | ffmpeg and ffprobe bound to a context, with a bounded wait on shutdown |
 | `duration` | WAV and MP3 length read from the bytes themselves, for a runtime that ships ffmpeg without ffprobe |
-| `cost` | Money as integer nanodollars, a ledger of charges, budgets that refuse before a call, keyed budgets that divide one pool by owner, and a meter that runs one paid call and records the settle in an app-chosen charge sink |
+| `cost` | Prices in the minor units of one denomination, USD nanodollars by default or a provider's credit, a ledger of charges that name their unit, budgets that refuse before a call, keyed budgets that divide one pool by owner, grants that lapse, and a meter that records each settle in an app-chosen charge sink |
 | `throttle` | Retry of a paid call that failed for a reason a wait can clear, with full-jitter backoff and an optional cap on how many calls run at once |
 | `flag` | Runtime flags an operator flips without a restart, read through to the store with a declared default for a missing row |
 | `caption` | Word timings to SRT and WebVTT subtitle files as a pure function, with cues grouped by line length and duration |
@@ -193,11 +193,32 @@ if err := budget.Reserve(cost.USD(4.50)); err != nil {
 budget.Settle(cost.USD(4.50), actual)
 ```
 
-`cost.Price` counts nanodollars in an `int64`, so no rounding creeps in. `cost/sqlitestore` keeps
+`cost.Price` counts the minor units of one denomination in an `int64`, so no rounding creeps in.
+The zero denomination is USD nanodollars, which is what every budget and charge counted before
+denominations existed. `cost.NewBudgetIn` and `cost.NewKeyedBudgetIn` bound a pool of a
+provider's credit instead, and every budget and account reports its unit through `Denomination`.
+A `cost.Meter` stamps every charge it records with its account's denomination, so a report never
+shows a credit pool as dollars. A total that would sum charges naming different denominations
+refuses with `cost.ErrMixedDenomination`, and no path converts one unit into another.
+`cost/sqlitestore` refuses a charge that names a unit its store does not speak with
+`cost.ErrDenominationMismatch`, and refuses to reopen a file under another denomination. A
+reopen under another name would silently reprice every recorded amount. `cost.Conversion`
+prices a credit in nanodollars for reports alone. No budget, meter or store accepts one, so a
+conversion can never move a spending decision.
+
+`cost/sqlitestore` keeps
 the ledger and the reservations across a restart, and a reservation that expires releases itself.
 A store opened with `Period: cost.DailyUTC` restarts its ceiling every UTC day, and `MonthlyUTC`
-every month, so a limit bounds one window rather than all spend ever booked. A `cost.KeyedBudget` divides one pool by owner under a global ceiling, so one owner cannot spend
-another owner's headroom. Each owner reserves and settles through its own account from `Owner`.
+every month, so a limit bounds one window rather than all spend ever booked. `Store.Grant` funds
+the pool with credit that lapses. The balance is the unexpired grants minus what spend has
+drawn. Spend draws from the grant that expires soonest first, and expiry is judged at read and
+spend time, so a restart cannot resurrect lapsed credit. An allowance that resets every window
+posts one grant per window, keyed by the window's start, which `cost.Period.Start` computes. A
+repeated key answers `sqlitestore.ErrGrantRepeated` and changes nothing, so a restart or a
+double post cannot fund a window twice. Once a pool holds a grant, that balance bounds
+reservations beside the ceiling. A `cost.KeyedBudget` divides one pool by
+owner under a global ceiling, so one owner cannot spend another owner's headroom. It divides a
+granted pool by owner exactly as it divides dollars. Each owner reserves and settles through its own account from `Owner`.
 A `cost.Meter` runs one paid call against an account: it reserves the estimate, runs the work,
 and settles the measured price. It frees the reservation on every failure up to the settle.
 A call that reports no usage settles at its estimate and says so in the returned `Usage`. The

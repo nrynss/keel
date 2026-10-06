@@ -1,6 +1,9 @@
-// Package cost records what paid API calls spend. A Price counts nanodollars
-// in an int64, so sums stay exact to the cent. A Ledger keeps charges and
-// totals them by kind and by reference. A ChargeSink is where a settled
+// Package cost records what paid API calls spend. A Price counts the minor
+// units of one Denomination in an int64, so sums stay exact. The zero
+// denomination is USD nanodollars, and a budget, an account and a charge all
+// carry a denomination so a credit pool never reports itself in dollars. A
+// Ledger keeps charges and totals them by kind and by reference, and refuses
+// a total that would mix denominations. A ChargeSink is where a settled
 // charge lands, and the Ledger is the in-memory one. A Budget bounds the
 // spend of a sequence of calls, and a KeyedBudget gives each of several
 // owners a share of one pool under a global ceiling. Rate cards stay in each
@@ -107,8 +110,10 @@ func sub(a, b Price) (Price, error) {
 }
 
 // Charge is one billed operation. Kind names the operation, Units counts the
-// billed units, UnitPrice prices one unit, and Ref ties the charge back to the
-// caller's own record, for example a job or a request id.
+// billed units, UnitPrice prices one unit, and Ref ties the charge back to
+// the caller's own record, for example a job or a request id. Denomination
+// names the unit UnitPrice counts, and must name the same denomination as the
+// budget the charge settles against.
 type Charge struct {
 	// Kind names the billed operation.
 	Kind string
@@ -118,6 +123,10 @@ type Charge struct {
 	UnitPrice Price
 	// Ref ties the charge to the caller's own record.
 	Ref string
+	// Denomination names the unit UnitPrice counts. The zero value names
+	// USD nanodollars. A sink may refuse a charge that names a
+	// denomination it does not speak, and no path converts one.
+	Denomination Denomination
 }
 
 // Total returns the price of the charge. It reports ErrOverflow when Units
@@ -187,16 +196,26 @@ func (l *Ledger) TotalForRef(ref string) (Price, error) {
 // products on the int64 fast path and switches to a big integer accumulator
 // once a product or the running sum first leaves the range. It therefore
 // returns the exact sum of the selected charges' exact products, and reports
-// ErrOverflow only when that exact sum is unrepresentable.
+// ErrOverflow only when that exact sum is unrepresentable. When the selected
+// charges name more than one denomination it reports ErrMixedDenomination
+// instead of a sum, because no exchange rate exists to add them under.
 func (l *Ledger) total(match func(Charge) bool) (Price, error) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 	var sum Price
 	var exact *big.Int
+	var denom string
+	seen := false
 	for _, c := range l.charges {
 		if !match(c) {
 			continue
 		}
+		if seen && c.Denomination.Name != denom {
+			return 0, fmt.Errorf("cost: total spans %q and %q: %w",
+				denom, c.Denomination.Name, ErrMixedDenomination)
+		}
+		denom = c.Denomination.Name
+		seen = true
 		amount, err := c.Total()
 		if err != nil {
 			u := new(big.Int).Mul(big.NewInt(int64(c.Units)), big.NewInt(int64(c.UnitPrice)))

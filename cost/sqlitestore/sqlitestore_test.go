@@ -259,13 +259,13 @@ func TestTotalReportsOverflow(t *testing.T) {
 
 // TestOpenAppliesMigrationsOnce reopens the same file and counts the migration
 // ledger, so a second open cannot run a schema file again. The ledger holds
-// one row per schema file the package owns, and both files are applied.
+// one row per schema file the package owns, and every file is applied.
 func TestOpenAppliesMigrationsOnce(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "cost.db")
 	openStore(t, path)
 	openStore(t, path)
-	if n := freshCount(t, path, "cost_schema_migrations"); n != 3 {
-		t.Fatalf("migration ledger rows = %d, want 3", n)
+	if n := freshCount(t, path, "cost_schema_migrations"); n != 4 {
+		t.Fatalf("migration ledger rows = %d, want 4", n)
 	}
 }
 

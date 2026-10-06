@@ -16,26 +16,50 @@ var ErrNegativeLimit = errors.New("cost: negative budget limit")
 // ErrNegativeEstimate reports a reservation with an estimate below zero.
 var ErrNegativeEstimate = errors.New("cost: negative reservation estimate")
 
-// Budget bounds the total spend of a sequence of paid calls. Reserve commits
-// an estimate before a call and fails when the estimate would pass the limit.
-// Settle books the price the call actually cost and frees its reservation.
-// Release frees a reservation the caller never spent. Build one with NewBudget.
-// Every method is safe for concurrent use.
+// Budget bounds the total spend of a sequence of paid calls in one
+// denomination. Reserve commits an estimate before a call and fails when the
+// estimate would pass the limit. Settle books the price the call actually
+// cost and frees its reservation. Release frees a reservation the caller
+// never spent. Build one with NewBudget for USD nanodollars or NewBudgetIn
+// for a named denomination such as a provider's credit. Every method is safe
+// for concurrent use.
 type Budget struct {
 	mu       sync.Mutex
+	denom    Denomination
 	limit    Price
 	spent    Price
 	reserved Price
 }
 
 // NewBudget returns a Budget that never lets a reservation push spend past
-// limit. It reports ErrNegativeLimit when limit is below zero, because a
-// negative ceiling admits no spend and only creates misleading headroom.
+// limit. It counts USD nanodollars, which is the behaviour every budget had
+// before denominations existed. It reports ErrNegativeLimit when limit is
+// below zero, because a negative ceiling admits no spend and only creates
+// misleading headroom.
 func NewBudget(limit Price) (*Budget, error) {
 	if limit < 0 {
 		return nil, fmt.Errorf("cost: budget limit %d: %w", limit, ErrNegativeLimit)
 	}
 	return &Budget{limit: limit}, nil
+}
+
+// NewBudgetIn returns a Budget that counts in denomination and never lets a
+// reservation push spend past limit. The zero denomination names USD
+// nanodollars, so NewBudget and NewBudgetIn with the zero denomination
+// behave the same. It reports ErrNegativeLimit when limit is below zero, as
+// NewBudget does.
+func NewBudgetIn(denomination Denomination, limit Price) (*Budget, error) {
+	if limit < 0 {
+		return nil, fmt.Errorf("cost: budget limit %d: %w", limit, ErrNegativeLimit)
+	}
+	return &Budget{denom: denomination, limit: limit}, nil
+}
+
+// Denomination reports the unit this budget's prices count. The zero value
+// names USD nanodollars. The denomination never changes, because a budget
+// that switched unit mid life would silently reprice its recorded spend.
+func (b *Budget) Denomination() Denomination {
+	return b.denom
 }
 
 // Limit returns the ceiling the budget was built with.

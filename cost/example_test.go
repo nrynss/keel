@@ -81,6 +81,61 @@ func ExampleKeyedBudget() {
 	// $0.40
 }
 
+// ExampleNewBudgetIn bounds a pool of a provider's credits and runs one
+// measured call against it, so the charge names the credit and the report
+// never shows the pool as dollars.
+func ExampleNewBudgetIn() {
+	credit := cost.Denomination{Name: "provider.unit", Minor: 1}
+	budget, err := cost.NewBudgetIn(credit, 1000)
+	if err != nil {
+		fmt.Println("credit budget failed:", err)
+		return
+	}
+	ledger := cost.NewLedger()
+	meter, err := cost.NewMeter(budget, ledger)
+	if err != nil {
+		fmt.Println("meter failed:", err)
+		return
+	}
+
+	usage, err := meter.Call(context.Background(), 20, "check", "job-1",
+		func(context.Context) (cost.Usage, error) {
+			return cost.Usage{Price: 15, Measured: true}, nil
+		})
+	if err != nil {
+		fmt.Println("call failed:", err)
+		return
+	}
+	remaining, err := budget.Remaining()
+	if err != nil {
+		fmt.Println("remaining failed:", err)
+		return
+	}
+
+	fmt.Printf("%d %s\n", usage.Price, ledger.Charges()[0].Denomination.Name)
+	fmt.Printf("%d\n", remaining)
+	// Output:
+	// 15 provider.unit
+	// 985
+}
+
+// ExampleConversion prices a credit pool in dollars for one report line. The
+// conversion never reaches a budget or a store, so it cannot move a spending
+// decision.
+func ExampleConversion() {
+	credit := cost.Denomination{Name: "provider.unit", Minor: 1}
+	conversion := cost.Conversion{Denomination: credit, Nanodollars: cost.USD(0.01)}
+
+	worth, err := conversion.Convert(500)
+	if err != nil {
+		fmt.Println("convert failed:", err)
+		return
+	}
+	fmt.Println(worth)
+	// Output:
+	// $5.00
+}
+
 // ExampleMeter runs one measured call and one call without a usage report
 // for one owner of a keyed budget, through the same account shape a plain
 // budget offers.

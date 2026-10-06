@@ -38,6 +38,24 @@
 // Totals and charges keep all history either way. Spend booked before this
 // version stays in the lifetime total and outside every window.
 //
+// A store speaks one Denomination for its whole life: its ceiling, its
+// owners, its grants and its ledger. The zero denomination is USD
+// nanodollars, the behaviour every store had before denominations existed.
+// A charge that names another denomination is refused with
+// cost.ErrDenominationMismatch, and no path converts one unit into another,
+// so a credit pool never reports itself in dollars. Open refuses a file
+// whose stored denomination differs from the configured one, because a
+// reopen under another name would silently reprice every recorded amount.
+//
+// Grant funds the pool with credit that lapses. The balance a reservation
+// draws on is the sum of the unexpired grants minus what spend has drawn
+// from them. Spend draws from the grant that expires soonest first, so a
+// short grant is consumed before a longer one. Expiry is judged by the
+// store against its own clock at read and spend time, so a restart cannot
+// resurrect lapsed credit. Once a pool holds a grant, that balance bounds
+// reservations beside the ceiling, and the smaller bound decides. A pool
+// with no grant draws on its ceiling alone, exactly as before.
+//
 // This package is one of the few allowed to import the SQLite driver. The
 // ledger arithmetic itself stays in the cost package, and every total is
 // summed through a cost.Ledger so the overflow rule never drifts. The Store
@@ -107,6 +125,14 @@ type Config struct {
 	// another period re-windows the same history.
 	Period cost.Period
 
+	// Denomination names the unit every price in this store counts. The
+	// zero value keeps the USD nanodollar behaviour every store has. A
+	// store speaks one denomination for its whole life. Open refuses a
+	// file whose stored denomination differs from the configured one,
+	// because a reopen under another name would silently reprice every
+	// recorded amount.
+	Denomination cost.Denomination
+
 	// ReservationTTL is how long a reservation holds budget before the
 	// store treats it as expired. Zero means ten minutes.
 	ReservationTTL time.Duration
@@ -128,6 +154,7 @@ type Store struct {
 	log            *slog.Logger
 	reservationTTL time.Duration
 	period         cost.Period
+	denom          cost.Denomination
 }
 
 // A Store satisfies cost.ChargeSink, so a meter can take it as the sink that
@@ -150,8 +177,10 @@ type Reservation struct {
 
 // Open applies the cost schema to cfg.DB and returns the store. It writes the
 // configured ceiling and purges reservations that already expired, so a restart
-// frees the budget a dead process was holding. A cancelled context stops the
-// open and no store comes back, but the schema, its migration ledger row and
+// frees the budget a dead process was holding. It refuses a file whose stored
+// denomination differs from cfg.Denomination, because a reopen under another
+// name would silently reprice every recorded amount. A cancelled context stops
+// the open and no store comes back, but the schema, its migration ledger row and
 // the ceiling may already have landed. Those bytes are inert, so a caller
 // may retry the open and a second open on the same file is unaffected.
 func Open(ctx context.Context, cfg Config) (*Store, error) {
@@ -189,7 +218,10 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 	if ttl <= 0 {
 		ttl = defaultReservationTTL
 	}
-	store := &Store{db: cfg.DB, now: now, log: logger, reservationTTL: ttl, period: cfg.Period}
+	store := &Store{db: cfg.DB, now: now, log: logger, reservationTTL: ttl, period: cfg.Period, denom: cfg.Denomination}
+	if err := store.checkDenomination(ctx); err != nil {
+		return nil, fmt.Errorf("sqlitestore: open: %w", err)
+	}
 	if err := store.setLimit(ctx, cfg.Limit); err != nil {
 		return nil, fmt.Errorf("sqlitestore: open: %w", err)
 	}
@@ -197,16 +229,47 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("sqlitestore: open: %w", err)
 	}
-	logger.InfoContext(ctx, "sqlitestore: opened", "limit", int64(cfg.Limit), "expired_reservations", purged)
+	logger.InfoContext(ctx, "sqlitestore: opened", "limit", int64(cfg.Limit), "denomination", cfg.Denomination.Name, "expired_reservations", purged)
 	return store, nil
 }
 
+// checkDenomination refuses a file whose stored denomination differs from
+// the configured one. A file with no ceiling row yet accepts anything,
+// because the first open writes the denomination beside the ceiling.
+func (s *Store) checkDenomination(ctx context.Context) error {
+	var name string
+	var minor int64
+	err := s.db.Writer().QueryRowContext(ctx,
+		`SELECT denomination, minor_units FROM cost_budget WHERE id = 1`).Scan(&name, &minor)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("sqlitestore: read budget: %w", err)
+	}
+	stored := cost.Denomination{Name: name, Minor: int(minor)}
+	if stored != s.denom {
+		return fmt.Errorf("sqlitestore: open: stored denomination %q does not match configured %q: %w",
+			stored.Name, s.denom.Name, cost.ErrDenominationMismatch)
+	}
+	return nil
+}
+
+// Denomination reports the unit every price in this store counts. The zero
+// value names USD nanodollars.
+func (s *Store) Denomination() cost.Denomination {
+	return s.denom
+}
+
 // setLimit writes the configured ceiling. The row is created on the first open
-// and updated on every later one, so the stored spend survives a redeploy.
+// and updated on every later one, so the stored spend survives a redeploy. The
+// denomination is written with the ceiling on the first open, and every later
+// open has already checked itself against the stored one.
 func (s *Store) setLimit(ctx context.Context, limit cost.Price) error {
-	const query = `INSERT INTO cost_budget (id, limit_nd, spent_nd) VALUES (1, ?, 0)
+	const query = `INSERT INTO cost_budget (id, limit_nd, spent_nd, denomination, minor_units)
+		VALUES (1, ?, 0, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET limit_nd = excluded.limit_nd`
-	if _, err := s.db.Writer().ExecContext(ctx, query, int64(limit)); err != nil {
+	if _, err := s.db.Writer().ExecContext(ctx, query, int64(limit), s.denom.Name, int64(s.denom.Minor)); err != nil {
 		return fmt.Errorf("sqlitestore: set limit: %w", err)
 	}
 	return nil
@@ -228,42 +291,50 @@ func (s *Store) purgeExpired(ctx context.Context, now time.Time) (int, error) {
 }
 
 // Add records c in the ledger. It writes the row before it returns, so a charge
-// for a call that already happened survives a crash. A cancelled context stops
-// the write, so no charge is recorded.
+// for a call that already happened survives a crash. A charge that names a
+// denomination the store does not speak is refused with an error matching
+// cost.ErrDenominationMismatch, and no path converts it. A credit charge never
+// lands in a dollar ledger, or the other way round. A cancelled context
+// stops the write, so no charge is recorded.
 func (s *Store) Add(ctx context.Context, c cost.Charge) error {
-	const query = `INSERT INTO cost_charge (kind, units, unit_price, ref, created_at)
-		VALUES (?, ?, ?, ?, ?)`
+	if c.Denomination.Name != s.denom.Name {
+		return fmt.Errorf("sqlitestore: add charge in %q over a %q store: %w",
+			c.Denomination.Name, s.denom.Name, cost.ErrDenominationMismatch)
+	}
+	const query = `INSERT INTO cost_charge (kind, units, unit_price, ref, denomination, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)`
 	_, err := s.db.Writer().ExecContext(ctx, query,
-		c.Kind, int64(c.Units), int64(c.UnitPrice), c.Ref, s.now().UnixMilli())
+		c.Kind, int64(c.Units), int64(c.UnitPrice), c.Ref, s.denom.Name, s.now().UnixMilli())
 	if err != nil {
 		return fmt.Errorf("sqlitestore: add charge: %w", err)
 	}
 	return nil
 }
 
-// Charges returns every recorded charge in insertion order.
+// Charges returns every recorded charge in insertion order. Each charge names
+// the denomination it was written under.
 func (s *Store) Charges(ctx context.Context) ([]cost.Charge, error) {
-	return s.queryCharges(ctx, `SELECT kind, units, unit_price, ref FROM cost_charge ORDER BY id`)
+	return s.queryCharges(ctx, `SELECT kind, units, unit_price, ref, denomination FROM cost_charge ORDER BY id`)
 }
 
 // Total returns the sum of every charge in the ledger. It reports an error
 // matching cost.ErrOverflow when the exact sum leaves the int64 range.
 func (s *Store) Total(ctx context.Context) (cost.Price, error) {
-	return s.total(ctx, `SELECT kind, units, unit_price, ref FROM cost_charge ORDER BY id`)
+	return s.total(ctx, `SELECT kind, units, unit_price, ref, denomination FROM cost_charge ORDER BY id`)
 }
 
 // TotalByKind returns the sum of the charges whose Kind equals kind. It reports
 // an error matching cost.ErrOverflow when the exact sum leaves the int64 range.
 func (s *Store) TotalByKind(ctx context.Context, kind string) (cost.Price, error) {
 	return s.total(ctx,
-		`SELECT kind, units, unit_price, ref FROM cost_charge WHERE kind = ? ORDER BY id`, kind)
+		`SELECT kind, units, unit_price, ref, denomination FROM cost_charge WHERE kind = ? ORDER BY id`, kind)
 }
 
 // TotalForRef returns the sum of the charges whose Ref equals ref. It reports
 // an error matching cost.ErrOverflow when the exact sum leaves the int64 range.
 func (s *Store) TotalForRef(ctx context.Context, ref string) (cost.Price, error) {
 	return s.total(ctx,
-		`SELECT kind, units, unit_price, ref FROM cost_charge WHERE ref = ? ORDER BY id`, ref)
+		`SELECT kind, units, unit_price, ref, denomination FROM cost_charge WHERE ref = ? ORDER BY id`, ref)
 }
 
 // total loads the matching charges and sums them through a cost.Ledger, so the
@@ -281,7 +352,9 @@ func (s *Store) total(ctx context.Context, query string, args ...any) (cost.Pric
 	return ledger.Total()
 }
 
-// queryCharges runs one charge query and decodes every row.
+// queryCharges runs one charge query and decodes every row. The store's
+// ledger carries one denomination, so each charge is filled with the stored
+// name beside the store's own minor-unit count.
 func (s *Store) queryCharges(ctx context.Context, query string, args ...any) ([]cost.Charge, error) {
 	rows, err := s.db.Reader().QueryContext(ctx, query, args...)
 	if err != nil {
@@ -294,12 +367,14 @@ func (s *Store) queryCharges(ctx context.Context, query string, args ...any) ([]
 			c         cost.Charge
 			units     int64
 			unitPrice int64
+			denom     string
 		)
-		if err := rows.Scan(&c.Kind, &units, &unitPrice, &c.Ref); err != nil {
+		if err := rows.Scan(&c.Kind, &units, &unitPrice, &c.Ref, &denom); err != nil {
 			return nil, fmt.Errorf("sqlitestore: scan charge: %w", err)
 		}
 		c.Units = int(units)
 		c.UnitPrice = cost.Price(unitPrice)
+		c.Denomination = cost.Denomination{Name: denom, Minor: s.denom.Minor}
 		out = append(out, c)
 	}
 	if err := rows.Err(); err != nil {
@@ -353,8 +428,10 @@ func (s *Store) Reserved(ctx context.Context) (cost.Price, error) {
 // Remaining returns the headroom left for new reservations. It is the ceiling
 // minus booked spend minus unexpired holds. A store with a period reads the
 // spend and the holds of the current window, so each window starts with a
-// full ceiling. It reports an error matching cost.ErrOverflow when that
-// difference leaves the int64 range.
+// full ceiling. Once the pool holds a grant, the live grant balance minus
+// the unexpired holds bounds the headroom too, and the smaller bound is the
+// answer. It reports an error matching cost.ErrOverflow when that difference
+// leaves the int64 range.
 func (s *Store) Remaining(ctx context.Context) (cost.Price, error) {
 	state, err := s.loadGlobal(ctx, s.db.Reader(), s.now())
 	if err != nil {
@@ -366,7 +443,9 @@ func (s *Store) Remaining(ctx context.Context) (cost.Price, error) {
 // Reserve commits estimate against the durable budget and returns the hold. It
 // fails with an error matching cost.ErrOverBudget when the ceiling, the booked
 // spend and the unexpired holds leave less than estimate, and it commits
-// nothing then. A store with a period checks the ceiling against the current
+// nothing then. Once the pool holds a grant, the live grant balance minus the
+// unexpired holds bounds the reserve the same way, and the smaller bound
+// decides. A store with a period checks the ceiling against the current
 // window alone. The check and the insert share one transaction, so concurrent
 // callers never overspend. The hold expires after the configured TTL, so a
 // caller that dies still returns its budget. A cancelled context stops the
@@ -416,7 +495,9 @@ func (s *Store) Reserve(ctx context.Context, estimate cost.Price) (Reservation, 
 // Settle books the price a paid call actually cost and releases the hold. It
 // books actual even when the hold already expired, because the call happened
 // and the charge is a fact. The booking extends the settle history, so a
-// store with a period counts it in the current window. It reports an error
+// store with a period counts it in the current window. It draws actual from
+// the unexpired grants that expire soonest first, so a short grant is
+// consumed before a longer one. It reports an error
 // matching cost.ErrOverflow and commits nothing when actual would push the
 // booked spend past the int64 range. A cancelled context stops the settle,
 // so nothing is booked.
@@ -443,6 +524,9 @@ func (s *Store) Settle(ctx context.Context, r Reservation, actual cost.Price) er
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO cost_settle (owner, amount_nd, created_at) VALUES (?, ?, ?)`,
 		"", int64(actual), now.UnixMilli()); err != nil {
+		return fmt.Errorf("sqlitestore: settle: %w", err)
+	}
+	if err := drawGrants(ctx, tx, now, actual); err != nil {
 		return fmt.Errorf("sqlitestore: settle: %w", err)
 	}
 	if r.ID != "" {
@@ -479,12 +563,20 @@ type querier interface {
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 }
 
-// budgetState is the three numbers the budget arithmetic needs, read in one
-// place so a read and a reserve never disagree.
+// budgetState is the numbers the budget arithmetic needs, read in one
+// place so a read and a reserve never disagree. reserved counts the
+// unexpired holds of the current window, which the ceiling reads. holds
+// counts every unexpired hold, which the grant balance reads, because a
+// hold reserves real credit whatever window it was taken in. funded is the
+// live grant balance and granted says whether the pool was ever granted
+// credit, because a pool with no grant draws on its ceiling alone.
 type budgetState struct {
 	limit    cost.Price
 	spent    cost.Price
 	reserved cost.Price
+	holds    cost.Price
+	funded   cost.Price
+	granted  bool
 }
 
 // windowSince returns the created_at lower bound in millis for windowed
@@ -497,11 +589,13 @@ func (s *Store) windowSince(now time.Time) int64 {
 	return s.period.Start(now).UnixMilli()
 }
 
-// loadGlobal reads the global ceiling, the booked spend and the open holds.
-// A store with no period reads the lifetime booked spend. A store with a
-// period sums the settles booked since the current window began, so one
-// ceiling bounds each window in turn. Open holds count against the window
-// they were taken in, because the read bounds them by creation time.
+// loadGlobal reads the global ceiling, the booked spend, the open holds and
+// the grant pool. A store with no period reads the lifetime booked spend. A
+// store with a period sums the settles booked since the current window
+// began, so one ceiling bounds each window in turn. Open holds count
+// against the window they were taken in, because the read bounds them by
+// creation time. The grant balance counts against every window, because
+// lapsed or spent credit stays gone whatever the calendar says.
 func (s *Store) loadGlobal(ctx context.Context, q querier, now time.Time) (budgetState, error) {
 	var state budgetState
 	var limit, lifetime int64
@@ -520,13 +614,28 @@ func (s *Store) loadGlobal(ctx context.Context, q querier, now time.Time) (budge
 		}
 		state.spent = spent
 	}
-	var reserved int64
+	var holds, reserved int64
 	if err := q.QueryRowContext(ctx,
-		`SELECT COALESCE(SUM(amount_nd), 0) FROM cost_reservation WHERE expires_at > ? AND created_at >= ?`,
-		now.UnixMilli(), since).Scan(&reserved); err != nil {
+		`SELECT COALESCE(SUM(amount_nd), 0),
+			COALESCE(SUM(CASE WHEN created_at >= ? THEN amount_nd ELSE 0 END), 0)
+		FROM cost_reservation WHERE expires_at > ?`,
+		since, now.UnixMilli()).Scan(&holds, &reserved); err != nil {
 		return budgetState{}, fmt.Errorf("sqlitestore: read reservations: %w", err)
 	}
-	state.reserved = cost.Price(reserved)
+	state.reserved, state.holds = cost.Price(reserved), cost.Price(holds)
+	var granted int
+	if err := q.QueryRowContext(ctx,
+		`SELECT EXISTS (SELECT 1 FROM cost_grant)`).Scan(&granted); err != nil {
+		return budgetState{}, fmt.Errorf("sqlitestore: read grants: %w", err)
+	}
+	state.granted = granted != 0
+	if state.granted {
+		funded, err := grantBalance(ctx, q, now)
+		if err != nil {
+			return budgetState{}, err
+		}
+		state.funded = funded
+	}
 	return state, nil
 }
 
@@ -569,13 +678,29 @@ func sumSettles(ctx context.Context, q querier, owner string, sinceMillis int64)
 // remainingOf computes the headroom. It subtracts the holds first, because the
 // ceiling and the holds are both non-negative, so that difference cannot leave
 // the int64 range. Subtracting the booked spend last reports an overflow only
-// when the headroom itself is unrepresentable.
+// when the headroom itself is unrepresentable. When the pool was ever granted
+// credit, the live grant balance minus every unexpired hold bounds the
+// headroom too, and the smaller of the two bounds decides.
 func remainingOf(state budgetState) (cost.Price, error) {
 	left, err := subPrice(state.limit, state.reserved)
 	if err != nil {
 		return 0, err
 	}
-	return subPrice(left, state.spent)
+	left, err = subPrice(left, state.spent)
+	if err != nil {
+		return 0, err
+	}
+	if !state.granted {
+		return left, nil
+	}
+	funded, err := subPrice(state.funded, state.holds)
+	if err != nil {
+		return 0, err
+	}
+	if funded < left {
+		return funded, nil
+	}
+	return left, nil
 }
 
 // addPrice returns a plus b. It reports cost.ErrOverflow when the exact sum

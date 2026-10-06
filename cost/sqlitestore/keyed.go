@@ -12,12 +12,13 @@ import (
 )
 
 // KeyedBudget bounds the spend of several owners over one durable store. It
-// sits over the same tables, the same global ceiling and the same expiry the
-// store keeps, and adds a ceiling per owner. An owner that exhausts its
-// share never touches another owner's headroom, while the global ceiling
-// still bounds them all together. The empty owner key names the unkeyed
-// budget Store itself keeps, so a keyed budget refuses it. Create one with
-// NewKeyedBudget. A KeyedBudget is safe for concurrent use, as Store is.
+// sits over the same tables, the same global ceiling, the same grant pool and
+// the same expiry the store keeps, and adds a ceiling per owner. An owner
+// that exhausts its share never touches another owner's headroom, while the
+// global ceiling and the grant pool still bound them all together. The empty
+// owner key names the unkeyed budget Store itself keeps, so a keyed budget
+// refuses it. Create one with NewKeyedBudget. A KeyedBudget is safe for
+// concurrent use, as Store is.
 type KeyedBudget struct {
 	store *Store
 }
@@ -60,7 +61,9 @@ func (k *KeyedBudget) SetLimit(ctx context.Context, owner string, limit cost.Pri
 // empty and an error matching cost.ErrUnknownOwner when no ceiling was set
 // for owner. It reports an error matching cost.ErrOverBudget when either
 // bound would be passed, and commits nothing then. It reports an error
-// matching cost.ErrNegativeEstimate for a negative estimate. A store with a
+// matching cost.ErrNegativeEstimate for a negative estimate. Once the pool
+// holds a grant, the live grant balance minus the unexpired holds bounds the
+// reserve beside both ceilings, and the smaller bound decides. A store with a
 // period checks both ceilings against the current window alone. The checks and
 // the insert share one transaction, so concurrent callers never overspend
 // either bound. The hold expires after the configured TTL, as every hold on
@@ -129,7 +132,9 @@ func (k *KeyedBudget) Reserve(ctx context.Context, owner string, estimate cost.P
 // past the int64 range, and commits nothing then. The booking lands on the
 // global pool and on the owner's own account, because both ceilings read the
 // fact, and it extends the settle history under the owner's name, so a store
-// with a period counts it in the current window. A hold that already expired
+// with a period counts it in the current window. The actual price draws from
+// the unexpired grants that expire soonest first, exactly as the store's own
+// settle does. A hold that already expired
 // or belongs to another owner frees nothing, and that is not an error. A
 // cancelled context stops the settle, so nothing is booked.
 func (k *KeyedBudget) Settle(ctx context.Context, owner string, r Reservation, actual cost.Price) error {
@@ -173,6 +178,9 @@ func (k *KeyedBudget) Settle(ctx context.Context, owner string, r Reservation, a
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO cost_settle (owner, amount_nd, created_at) VALUES (?, ?, ?)`,
 		owner, int64(actual), now.UnixMilli()); err != nil {
+		return fmt.Errorf("sqlitestore: settle: %w", err)
+	}
+	if err := drawGrants(ctx, tx, now, actual); err != nil {
 		return fmt.Errorf("sqlitestore: settle: %w", err)
 	}
 	if r.ID != "" {
