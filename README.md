@@ -52,12 +52,14 @@ else is pure Go, and `CGO_ENABLED=0` builds the whole module.
 | `config` | TOML settings, and secret references that resolve from the environment, a file, a directory or a command, never holding a value in the file |
 | `config/source` | The five built-in secret sources that a `config.Registry` carries |
 | `fetch` | A user-supplied link fetched under an address policy enforced at dial time, with scheme, port, redirect, size, time and content type caps, and preview metadata read from the page |
+| `outbox` | Events written durably on this box first, replayed in insertion order to an app-supplied sink, with spent attempts counted and reported |
 
 The stores that need SQLite live one directory down, in `job/sqlitestore`,
-`mediastore/sqlitestore`, `cost/sqlitestore`, `flag/sqlitestore` and
-`lease/sqlitestore`. Only those packages import a SQLite driver, so an
-app that uses `gate` alone never compiles one. The TOML parser stays the same way behind `config`
-and `config/source`, so an app that uses `gate` alone never compiles it either. The PDF library stays behind `book` the same way.
+`mediastore/sqlitestore`, `cost/sqlitestore`, `flag/sqlitestore`,
+`lease/sqlitestore` and `outbox/sqlitestore`. Only those packages import a
+SQLite driver, so an app that uses `gate` alone never compiles one. The TOML
+parser stays the same way behind `config` and `config/source`, so an app that
+uses `gate` alone never compiles it either. The PDF library stays behind `book` the same way.
 
 ## Using it
 
@@ -380,6 +382,37 @@ truth and keeps both numbers on the record. A dead process leaves its lease behi
 call reclaims the slot once the cap has passed. `lease/sqlitestore` owns its namespaced
 migration, like every other store here. `lease/sqlitestore.Store.ForgetOwner` removes an
 owner's closed and expired leases after its live leases finish.
+
+### Ship events to a remote sink
+
+```go
+db, err := sqlite.Open(ctx, sqlite.Config{Path: "app.db"})
+store, err := outboxsql.Open(ctx, outboxsql.Config{DB: db})
+box, err := outbox.Open(ctx, outbox.Config{Store: store, Sink: sink})
+
+entry, err := box.Add(ctx, payload)
+go box.Loop(ctx)
+```
+
+`outbox` writes each event to SQLite before `Add` returns, so a crash between the write and the
+next delivery pass loses nothing. `Flush` hands the pending entries to the sink in insertion
+order, one batch at a time, and retires a batch only after `Deliver` returned nil for all of it.
+A batch the sink refuses ends the pass, so no later batch overtakes it, and each entry in it
+records one failure.
+
+Delivery is at-least-once from the outbox side. A crash after the sink accepted a batch but
+before it was retired replays that batch, and so does a retirement the store could not write. A
+sink that must not see a repeat checks `entry.ID`, which `Add` assigns and which never changes
+across replays, and drops an id it has served. At-most-once is a sink decision, and the stable
+id is everything the sink needs to make it.
+
+An entry that exhausts `MaxAttempts` attempts stays stored with its failure count, and
+`Exhausted` reports it, so a sink that never accepts one entry is visible instead of silent.
+Batch size, pass interval, attempt cap and the retry waits come from `Config`. The zero value
+works: a hundred-entry batch, a pass every second, ten attempts, and a retry wait that starts
+at five seconds and doubles up to a minute. `Loop` runs a pass on every interval until
+its context is done, and backs off on the same curve after a failed pass. `outbox/sqlitestore`
+owns its namespaced migration, like every other store here.
 
 ### Configure with a file that holds no secret value
 
