@@ -6,7 +6,9 @@
 // open changes nothing. A charge is written through as it arrives, because a
 // crash must not lose the record of a call that already spent money. The
 // shared handle commits with synchronous FULL, so a charge the store
-// acknowledged also survives an operating system or power failure. A budget
+// acknowledged also survives an operating system or power failure. The
+// sqlite package documents the one exception, the creation window of the
+// database file itself. A budget
 // reservation carries an expiry, so a process that dies mid call stops holding
 // budget when the expiry passes.
 //

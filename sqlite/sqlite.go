@@ -7,8 +7,12 @@
 // process. WAL mode keeps a crash mid-write from corrupting the last
 // committed transaction. Synchronous FULL fsyncs the write-ahead log on
 // every commit. A write the store acknowledged survives an operating system
-// or power failure. The cost is one fsync per commit, which every store in
-// the module carries so their durability promises hold together.
+// or power failure, with one boundary. Open creates the database file but
+// never syncs its parent directory entry, so a power cut inside the file's
+// creation window can take the whole file, at any synchronous level. Past
+// that window the promise holds. The cost is one fsync per commit, which
+// every store in the module carries so their durability promises hold
+// together.
 //
 // A handle holds two pools over the one file. The writer pool holds a single
 // connection, because SQLite admits one writer at a time and a second
