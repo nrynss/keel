@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -71,6 +72,12 @@ func TestDefaultClassifierRefusesInternalRanges(t *testing.T) {
 		{"metadata v6", "fd00:ec2::254"},
 		{"carrier nat low", "100.64.0.1"},
 		{"carrier nat high", "100.127.255.254"},
+		{"ietf protocol assignments", "192.0.0.1"},
+		{"ietf protocol assignments high", "192.0.0.255"},
+		{"benchmarking low", "198.18.0.1"},
+		{"benchmarking high", "198.19.255.254"},
+		{"reserved range low", "240.0.0.1"},
+		{"reserved range high", "240.255.255.254"},
 		{"multicast v4", "224.0.0.1"},
 		{"multicast v6", "ff02::1"},
 		{"unspecified v4", "0.0.0.0"},
@@ -107,6 +114,8 @@ func TestDefaultClassifierAllowsPublicAddresses(t *testing.T) {
 		{"public v6", "2606:2800:220:1:248:1893:25c8:1946"},
 		{"above carrier nat", "100.128.0.1"},
 		{"below carrier nat", "100.63.255.255"},
+		{"above ietf assignments", "192.0.1.1"},
+		{"above benchmarking", "198.20.0.1"},
 		{"nat64 public origin", "64:ff9b::5db8:d822"},
 		{"local use nat64 public origin", "64:ff9b:1::5db8:d822"},
 	}
@@ -294,6 +303,44 @@ func TestGetJudgesTheDialledAddressNotTheName(t *testing.T) {
 	codeOfFetch(t, err, fetch.CodeBlockedAddress)
 	if reached.Load() != 0 {
 		t.Fatal("the server was reached past a refused address")
+	}
+}
+
+// TestGetRefusesReservedRangesAtDialTime resolves a public-looking name,
+// through the injected resolver, to each range the refusal list gained. The
+// dialler hook must refuse the address before any packet is sent, so the
+// server is never reached.
+func TestGetRefusesReservedRangesAtDialTime(t *testing.T) {
+	cases := []struct {
+		name string
+		ip   string
+	}{
+		{"ietf protocol assignments", "192.0.0.1"},
+		{"benchmarking", "198.18.0.1"},
+		{"reserved", "240.0.0.1"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var reached atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				reached.Add(1)
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer srv.Close()
+
+			port := portOf(t, srv.URL)
+			target := fmt.Sprintf("http://public.example.test:%d/page", port)
+			cfg := fetch.Config{
+				AllowHTTP: true,
+				Ports:     []int{port},
+				Resolver:  fakeResolver(t, net.ParseIP(tc.ip), nil),
+			}
+			_, err := fetch.Get(context.Background(), target, cfg)
+			codeOfFetch(t, err, fetch.CodeBlockedAddress)
+			if reached.Load() != 0 {
+				t.Fatal("the server was reached past a refused address")
+			}
+		})
 	}
 }
 
@@ -640,5 +687,39 @@ func TestGetReturnsTheCallerCancellationUntouched(t *testing.T) {
 	var fetchErr *fetch.Error
 	if errors.As(err, &fetchErr) {
 		t.Fatal("a caller cancellation was coded as a fetch failure")
+	}
+}
+
+// TestGetReturnsTheCallerCancellationDuringTheBody cancels the caller's
+// context while the body is still arriving, after the server has flushed the
+// headers and the first chunk. The error is the context's own, not a coded
+// fetch failure.
+func TestGetReturnsTheCallerCancellationDuringTheBody(t *testing.T) {
+	release := make(chan struct{})
+	headersIn := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, strings.Repeat("0123456789", 60)) // 600 bytes, past the sniff window
+		w.(http.Flusher).Flush()
+		close(headersIn) // the headers and the first chunk are on the wire
+		<-release        // the body never finishes until the test is over
+	}))
+	defer func() { close(release); srv.Close() }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		<-headersIn
+		time.Sleep(10 * time.Millisecond) // let the client take the headers in first
+		cancel()                          // exit: one cancel, then the goroutine returns
+	}()
+
+	_, err := fetch.Get(ctx, srv.URL, serverConfig(t, srv.URL, nil))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want the context cancellation", err)
+	}
+	var fetchErr *fetch.Error
+	if errors.As(err, &fetchErr) {
+		t.Fatalf("a caller cancellation during the body was coded %q", fetchErr.Code)
 	}
 }
