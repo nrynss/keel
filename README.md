@@ -55,10 +55,12 @@ else is pure Go, and `CGO_ENABLED=0` builds the whole module.
 | `config/source` | The five built-in secret sources that a `config.Registry` carries |
 | `fetch` | A user-supplied link fetched under an address policy enforced at dial time, with scheme, port, redirect, size, time and content type caps, and preview metadata read from the page |
 | `outbox` | Events written durably on this box first, replayed in insertion order to an app-supplied sink, with spent attempts counted and reported |
+| `identity` | Guest sessions resolved from a signed cookie or a bearer token, sign-in by emailed code or an external provider, guest upgrade with a conflict rule, and account deletion as one resumable job |
 
 The stores that need SQLite live one directory down, in `cache/sqlitestore`,
 `job/sqlitestore`, `mediastore/sqlitestore`, `cost/sqlitestore`,
-`flag/sqlitestore`, `lease/sqlitestore` and `outbox/sqlitestore`. Only those
+`flag/sqlitestore`, `lease/sqlitestore`, `outbox/sqlitestore` and
+`identity/sqlitestore`. Only those
 packages import a SQLite driver, so an app that uses `gate` alone never
 compiles one. The TOML parser stays the same way behind `config` and
 `config/source`, so an app that uses `gate` alone never compiles it either.
@@ -371,6 +373,45 @@ what has not confirmed. A target that reports already gone counts as confirmed, 
 repeats safely. A target that fails forever leaves a stuck erasure, and `Report` names every
 target still owed a delete. The work runs as a `job` kind, so cancellation, limits and resumption
 come from there.
+
+### Sign guests in and delete accounts
+
+```go
+store, err := identitysql.Open(ctx, identitysql.Config{DB: db})
+svc, err := identity.New(identity.Config{
+	Store:      store,
+	SigningKey: key,
+	CodeKey:    codeKey,
+	Mail:       sender,
+	Eraser:     eraser,
+	Targets:    targetsForUser,
+})
+
+handler := svc.Middleware(app) // mints a guest on a first visit
+runner, err := job.Open(ctx, job.Config{Broker: broker, Store: jobStore, Kinds: svc.Kinds()})
+err = svc.BindRunner(runner)
+```
+
+A first visit creates a guest user row and a session row. The browser holds a signed cookie that
+carries only the session id, and a native client sends the same signed value as
+`Authorization: Bearer`. Every request resolves the token against the rows, so `Revoke` takes
+effect on the next request. The middleware puts the user into the request context, and `Owns`
+checks it against an owner name. `AuthorizeMedia` fits `mediastore.Config.Authorize`, so a
+private blob serves only to the session that owns it.
+
+Sign-in arrives by emailed code or through an external provider. The send ceilings refuse before
+anything is sent, and a known address and an unknown address get the same answer, so no screen
+ever learns who registered. The mail sender is an interface the app implements, and the provider
+client stays in the app too. The provider flow runs the authorization code protocol with state,
+nonce and PKCE, and keys the identity on the provider subject, never on an address. A sign-in on
+a fresh address attaches to the current guest, so the user id never changes and the guest's rows
+become the account's rows. An address that already belongs to another user moves the device to
+that user, or refuses with the guest data conflict code while the guest still owns app data.
+
+Deleting an account needs a code typed while it is still live, and the verification consumes the
+code it checked. The deletion runs as one `job` that fans the erasure out over the targets the
+app registers and removes the user row last, so a restart resumes what is left. Every answer
+travels the `wire` envelope with stable codes, so screens branch on codes and never on wording.
 
 ### Render a cut list into one audio file
 
