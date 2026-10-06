@@ -40,6 +40,7 @@ else is pure Go, and `CGO_ENABLED=0` builds the whole module.
 | `ffmpeg` | ffmpeg and ffprobe bound to a context, with a bounded wait on shutdown |
 | `duration` | WAV and MP3 length read from the bytes themselves, for a runtime that ships ffmpeg without ffprobe |
 | `cost` | Prices in the minor units of one denomination, USD nanodollars by default or a provider's credit, a ledger of charges that name their unit, budgets that refuse before a call, keyed budgets that divide one pool by owner, grants that lapse, and a meter that records each settle in an app-chosen charge sink |
+| `cache` | Content-addressed reuse of paid generations, keyed on a canonical hash of the request, with one make per key across concurrent callers, age expiry, and optional caching of permanent refusals |
 | `throttle` | Retry of a paid call that failed for a reason a wait can clear, with full-jitter backoff and an optional cap on how many calls run at once |
 | `flag` | Runtime flags an operator flips without a restart, read through to the store with a declared default for a missing row |
 | `caption` | Word timings to SRT and WebVTT subtitle files as a pure function, with cues grouped by line length and duration |
@@ -55,12 +56,13 @@ else is pure Go, and `CGO_ENABLED=0` builds the whole module.
 | `fetch` | A user-supplied link fetched under an address policy enforced at dial time, with scheme, port, redirect, size, time and content type caps, and preview metadata read from the page |
 | `outbox` | Events written durably on this box first, replayed in insertion order to an app-supplied sink, with spent attempts counted and reported |
 
-The stores that need SQLite live one directory down, in `job/sqlitestore`,
-`mediastore/sqlitestore`, `cost/sqlitestore`, `flag/sqlitestore`,
-`lease/sqlitestore` and `outbox/sqlitestore`. Only those packages import a
-SQLite driver, so an app that uses `gate` alone never compiles one. The TOML
-parser stays the same way behind `config` and `config/source`, so an app that
-uses `gate` alone never compiles it either. The PDF library stays behind `book` the same way.
+The stores that need SQLite live one directory down, in `cache/sqlitestore`,
+`job/sqlitestore`, `mediastore/sqlitestore`, `cost/sqlitestore`,
+`flag/sqlitestore`, `lease/sqlitestore` and `outbox/sqlitestore`. Only those
+packages import a SQLite driver, so an app that uses `gate` alone never
+compiles one. The TOML parser stays the same way behind `config` and
+`config/source`, so an app that uses `gate` alone never compiles it either.
+The PDF library stays behind `book` the same way.
 
 ## Using it
 
@@ -248,6 +250,82 @@ at once. The cap is held only while a call runs, and the backoff waits outside
 it. `cost.Meter` still reserves and settles. This package only paces the call.
 `throttle.Note` is how a caller marks an error that used up the attempts,
 with the same config the call used. One spent attempt reads "1 attempt".
+
+### Reuse a paid generation
+
+```go
+type speechKey struct {
+    Provider string
+    Model    string
+    Voice    string
+    Line     string
+    InputSHA string
+}
+
+key, err := cache.Key(speechKey{Provider: "speech", Model: m, Voice: v, Line: line, InputSHA: norm.SHA256})
+if err != nil {
+    return err
+}
+
+c, err := cache.New(cache.Config{
+    Store:      entryIndex,
+    MaxAge:     7 * 24 * time.Hour,
+    RefusalTTL: time.Hour,
+    Classifier: func(err error) bool { return errors.Is(err, speech.ErrNoFace) },
+})
+
+res, err := c.GetOrMake(ctx, key, func(ctx context.Context) (cache.Result, error) {
+    out, err := speech.Synthesize(ctx, req)
+    if err != nil {
+        return cache.Result{}, err
+    }
+    blobID, err := media.Persist(ctx, bytes.NewReader(out.Bytes), mediastore.Put{
+        ContentType: "audio/ogg",
+        Group:       "cache-speech",
+    })
+    if err != nil {
+        return cache.Result{}, err
+    }
+    doc, err := json.Marshal(cachedSpeech{Blob: blobID, ContentType: "audio/ogg"})
+    if err != nil {
+        return cache.Result{}, err
+    }
+    return cache.Result{Payload: doc, ContentType: "application/json", ChargeRef: chargeRef, BlobID: blobID}, nil
+})
+```
+
+`cache.Key` hashes a caller struct as canonical JSON, so a key is one struct
+away. Struct fields keep declaration order and map keys are sorted, so the
+same request hashes to the same key in every process. `photo.Normalize`
+returns the input digest in `Result.SHA256`, so the same pixels hash to one
+key whatever metadata each upload carried.
+
+`GetOrMake` returns a stored entry, or runs the maker once per key across
+concurrent callers. The callers that arrive while the maker runs wait for it
+and receive its result, so a double click pays once. Expiry is judged inside
+that flight, so callers who arrive together after expiry still trigger one
+make. A store read that fails for a reason other than a missing entry is
+returned, and no make runs, because a read nothing vouches for is not a
+miss.
+
+The payload is bytes plus a content type, so a structured result is as
+natural as a media one. A JSON verdict stores its own bytes. A media maker
+persists the bytes into a `mediastore` group first, because a provider
+result URL expires, and stores a small JSON document naming the blob. The
+maker must return bytes that outlive the call.
+
+A failed make is never cached. A failure the classifier marks permanent for
+its key is stored as a refusal and served for `RefusalTTL`, then it reads as
+a miss again. The package never decides permanence itself. Entries expire by
+age, and an expired entry behaves exactly like a miss.
+
+Eviction rides the mediastore group that holds the blobs. The entry carries
+the blob id its payload names, and `entryIndex.Sweep` deletes the rows whose
+blob a retention sweep dropped. Run that sweep beside the mediastore
+sweeper, with `Present` wired to the index, and rows past their age go in
+the same pass. Multiple cache levels are multiple `cache.Cache` instances
+with their own Config and key structs. Give each level its own key structs
+or its own store namespace, so two meanings never share rows.
 
 
 ### Flip a switch without a restart
