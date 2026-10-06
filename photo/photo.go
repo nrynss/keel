@@ -27,6 +27,8 @@
 //     ISO BMFF image before the rest of the input is read, so a large
 //     refusal never pays for its size.
 //   - The input byte cap bounds the whole read.
+//   - A magic byte check admits only the three documented formats, so the
+//     decode set is the package's own and never the process registry's.
 //   - The pixel cap reads the header alone and refuses before the full
 //     decode, which bounds what a decompression bomb can allocate.
 //   - The byte-cap ladder refuses only after the quality floor and the
@@ -323,6 +325,10 @@ func (c Config) resolve() (limits, error) {
 // judgement of the input. A non-nil Result comes back only with a nil
 // error.
 //
+// The decode set is the package's own. A magic byte check runs before the
+// decoders, so a format another binary has registered never widens what
+// Normalize accepts.
+//
 // Cancellation is checked between stages and between attempts of the
 // byte-cap ladder, not inside one decode or resize. The read itself is
 // bounded by MaxInputBytes, so a reader of unknown length cannot fill
@@ -341,6 +347,9 @@ func Normalize(ctx context.Context, r io.Reader, cfg Config) (Result, error) {
 	buf, err := readInput(r, l.maxInputBytes)
 	if err != nil {
 		return Result{}, err
+	}
+	if !documentedMagic(buf) {
+		return Result{}, refusal(codeUnsupportedFormat, fmt.Errorf("%w: the input opens like no format this package reads", ErrUnsupportedFormat))
 	}
 	header, _, err := image.DecodeConfig(bytes.NewReader(buf))
 	if err != nil {
@@ -393,6 +402,24 @@ func readInput(r io.Reader, max int) ([]byte, error) {
 		return nil, refusal(codeTooManyInputBytes, fmt.Errorf("%w: %d bytes read, limit %d", ErrTooManyInputBytes, len(head)+len(rest), max))
 	}
 	return append(head, rest...), nil
+}
+
+// jpegMagic is the SOI marker followed by the first marker byte, which
+// opens every JPEG.
+var jpegMagic = []byte{0xFF, 0xD8, 0xFF}
+
+// pngSignature opens every PNG.
+var pngSignature = []byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A}
+
+// documentedMagic reports whether b opens with the magic bytes of one of
+// the formats this package documents. The check runs before the
+// registry-backed decoders see the bytes, so the decode set is the
+// package's own, and a decoder another binary has linked never widens
+// what Normalize accepts.
+func documentedMagic(b []byte) bool {
+	return bytes.HasPrefix(b, jpegMagic) ||
+		bytes.HasPrefix(b, pngSignature) ||
+		(len(b) >= 12 && string(b[:4]) == "RIFF" && string(b[8:12]) == "WEBP")
 }
 
 // heifBrands are the ISO BMFF brands of the still image family this package

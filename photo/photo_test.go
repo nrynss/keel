@@ -8,6 +8,7 @@ import (
 	"hash/crc32"
 	"image"
 	"image/color"
+	"image/gif"
 	"image/jpeg"
 	"image/png"
 	"io"
@@ -452,10 +453,12 @@ func TestHEICRefusals(t *testing.T) {
 }
 
 func TestJPEGWithFtypPayloadIsNotJudgedAsHEIC(t *testing.T) {
-	// A JPEG whose early payload bytes spell ftyp is still a JPEG, so
-	// the sniff must leave it to the decoders instead of refusing the
-	// family.
-	input := append([]byte{0xFF, 0xD8, 'f', 't', 'y', 'p', 0x00, 0x00}, jpegEncode(t, distinctImage(16, 16), 90)[2:]...)
+	// A well-formed JPEG whose APP1 payload spells ftyp is a JPEG, so
+	// the sniff must leave it to the JPEG decoder instead of refusing
+	// the family.
+	base := jpegEncode(t, distinctImage(16, 16), 90)
+	payload := append([]byte("ftyp heic"), bytes.Repeat([]byte{0x00}, 8)...)
+	input := spliceSegment(base, 0xE1, payload)
 	res, err := photo.Normalize(context.Background(), bytes.NewReader(input), photo.Config{})
 	if err != nil {
 		t.Fatalf("jpeg with an ftyp payload was refused: %v", err)
@@ -696,5 +699,29 @@ func TestCancelledContext(t *testing.T) {
 func TestNilReader(t *testing.T) {
 	if _, err := photo.Normalize(context.Background(), nil, photo.Config{}); err == nil {
 		t.Fatal("nil reader was accepted")
+	}
+}
+
+func TestGIFRefusedWhenTheRegistryKnowsGIF(t *testing.T) {
+	// Encoding the GIF links image/gif into this binary, so the process
+	// wide registry knows the format. The package's own magic byte
+	// check must still refuse it, because the docs promise JPEG, PNG
+	// and WebP and nothing else.
+	var buf bytes.Buffer
+	if err := gif.Encode(&buf, distinctImage(4, 4), nil); err != nil {
+		t.Fatalf("encode gif: %v", err)
+	}
+	res, err := photo.Normalize(context.Background(), &buf, photo.Config{})
+	if err == nil {
+		t.Fatal("gif was accepted although the package does not read it")
+	}
+	if code := refusedCode(t, err); code != "unsupported_format" {
+		t.Fatalf("code is %s, want unsupported_format", code)
+	}
+	if !errors.Is(err, photo.ErrUnsupportedFormat) {
+		t.Fatalf("error does not match ErrUnsupportedFormat: %v", err)
+	}
+	if res.Bytes != nil {
+		t.Fatal("refusal returned bytes")
 	}
 }

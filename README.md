@@ -168,9 +168,10 @@ res, err := photo.Normalize(ctx, r, photo.Config{
 `photo` takes one uploaded image and returns the bytes a paid model or a store can accept. It
 decodes JPEG, PNG and WebP, applies the EXIF orientation to the pixels, resizes under the side
 limits without ever enlarging, and re-encodes from the decoded pixels. The re-encode is what
-strips metadata, so no EXIF, XMP or ICC block from the input survives. The result carries a
-SHA-256 of the normalised bytes, so the same pixels uploaded twice hash to one cache key, whatever
-metadata each upload carried.
+strips metadata, so no EXIF, XMP or ICC block from the input survives. The decode set is the
+package's own, so a binary that links other image decoders does not widen what an upload can
+be. The result carries a SHA-256 of the normalised bytes, so the same pixels uploaded twice
+hash to one cache key, whatever metadata each upload carried.
 
 Refusals are deterministic. Each is a `photo.Error` whose `Code` maps into the `wire` envelope,
 with a sentinel behind it for `errors.Is`. The codes are `unsupported_format`, `heic`,
