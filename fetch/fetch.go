@@ -88,7 +88,8 @@ type Config struct {
 	// ContentTypes is the allowlist the response must satisfy in its
 	// Content-Type header and in its sniffed bytes, each an exact
 	// type and subtype. An unset or empty list allows every type. With a
-	// list set, a missing or unparseable header refuses the fetch.
+	// list set, a missing or unparseable header refuses the fetch. A body
+	// with no bytes answers on its header alone.
 	ContentTypes []string
 	// Classifier decides which dialled addresses are allowed. Nil means
 	// DefaultClassifier. Replacing it relaxes the guard, so a caller does
@@ -172,8 +173,9 @@ func Get(ctx context.Context, rawURL string, cfg Config) (Response, error) {
 
 // readCapped reads the response body under the byte cap. It sniffs the first
 // bytes and refuses a type the allowlist does not hold before reading the
-// rest, so a refusal stops the download early. A body past the cap refuses
-// whole.
+// rest, so a refusal stops the download early. A body with no bytes answers
+// on its header alone, because an empty body sniffs as plain text and that
+// says nothing about the response. A body past the cap refuses whole.
 func readCapped(resp *http.Response, cfg Config) ([]byte, error) {
 	limited := io.LimitReader(resp.Body, cfg.maxBytes()+1)
 	head := make([]byte, sniffLen)
@@ -185,9 +187,14 @@ func readCapped(resp *http.Response, cfg Config) ([]byte, error) {
 		return nil, bodyReadError(err)
 	}
 	declared := mediaTypeOf(resp.Header.Get("Content-Type"))
-	sniffed := mediaTypeOf(http.DetectContentType(head))
-	if !cfg.typeAllowed(declared) || !cfg.typeAllowed(sniffed) {
+	if !cfg.typeAllowed(declared) {
 		return nil, refusal(CodeBadType, "the content type is not allowed")
+	}
+	if n > 0 {
+		sniffed := mediaTypeOf(http.DetectContentType(head))
+		if !cfg.typeAllowed(sniffed) {
+			return nil, refusal(CodeBadType, "the content type is not allowed")
+		}
 	}
 	rest, err := io.ReadAll(limited)
 	if err != nil {

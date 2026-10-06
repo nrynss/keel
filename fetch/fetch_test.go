@@ -475,6 +475,50 @@ func TestGetKeepsABodyAtTheCap(t *testing.T) {
 	}
 }
 
+func TestGetAnswersAnEmptyBodyOnItsHeaderAlone(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+	}{
+		{"an empty 200", http.StatusOK},
+		{"an empty 204", http.StatusNoContent},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tc.status)
+			}))
+			defer srv.Close()
+
+			cfg := serverConfig(t, srv.URL, func(c *fetch.Config) {
+				c.ContentTypes = []string{"application/json"}
+			})
+			resp, err := fetch.Get(context.Background(), srv.URL, cfg)
+			if err != nil {
+				t.Fatalf("an empty body was refused: %v", err)
+			}
+			if len(resp.Body) != 0 {
+				t.Fatalf("body = %q, want empty", resp.Body)
+			}
+		})
+	}
+}
+
+func TestGetStillJudgesTheHeaderOnAnEmptyBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	cfg := serverConfig(t, srv.URL, func(c *fetch.Config) {
+		c.ContentTypes = []string{"application/json"}
+	})
+	_, err := fetch.Get(context.Background(), srv.URL, cfg)
+	codeOfFetch(t, err, fetch.CodeBadType)
+}
+
 func TestGetRefusesADeclaredTypeTheSniffDisagreesWith(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "image/png")
