@@ -176,8 +176,8 @@ hash to one cache key, whatever metadata each upload carried.
 Refusals are deterministic. Each is a `photo.Error` whose `Code` maps into the `wire` envelope,
 with a sentinel behind it for `errors.Is`. The codes are `unsupported_format`, `heic`,
 `too_many_input_bytes`, `too_many_pixels` and `output_cannot_fit`. The HEIC refusal sniffs the
-ISO BMFF brands before the rest of a large upload is read, and the pixel cap reads the header
-alone before any full decode, which is what bounds a decompression bomb. When a byte cap is set
+ISO BMFF brands before the rest of a large upload is read. The pixel cap reads the header alone
+before any full decode, which is what bounds a decompression bomb. When a byte cap is set
 and the output is over it, the JPEG quality steps down to a floor, then the scale steps down, and
 the last floor refuses. Orientation is read only from a JPEG APP1 Exif segment, so a PNG or WebP
 input is trusted to be upright.

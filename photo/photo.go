@@ -2,12 +2,13 @@
 // API or a store.
 //
 // Phone photos arrive over every limit at once. They carry far more pixels
-// than a model accepts, they are rotated through EXIF orientation instead of
-// in the pixels, and they hold GPS coordinates and device metadata that must
-// never be stored or forwarded. Normalize decodes a JPEG, PNG or WebP upload,
-// applies the EXIF orientation to the pixels, resizes under the configured
-// limits, and re-encodes from the decoded pixels. The re-encode is what
-// strips metadata, so the output carries no EXIF, XMP or ICC data beyond
+// than a model accepts. Their rotation often lives in EXIF orientation
+// instead of in the pixels. Their EXIF also holds GPS coordinates and
+// device metadata that must never be stored or forwarded. Normalize decodes
+// a JPEG, PNG or WebP upload, applies the EXIF orientation to the pixels,
+// resizes under the configured limits, and re-encodes from the decoded
+// pixels. The re-encode is what strips metadata, so the output carries no
+// EXIF, XMP or ICC data beyond
 // what the encoder itself writes.
 //
 // The result carries a SHA-256 of the normalised bytes, so an application
@@ -24,8 +25,8 @@
 // Normalize refuses in a fixed order, cheapest check first:
 //
 //   - The HEIC family sniff reads the first few kilobytes and refuses an
-//     ISO BMFF image before the rest of the input is read, so a large
-//     refusal never pays for its size.
+//     ISO BMFF image before more input is read. A large refusal never
+//     pays for its own size.
 //   - The input byte cap bounds the whole read.
 //   - A magic byte check admits only the three documented formats, so the
 //     decode set is the package's own and never the process registry's.
@@ -77,7 +78,7 @@ const (
 )
 
 // Bounds of the byte-cap ladder. When an output stays over MaxBytes, the
-// ladder first steps the JPEG quality down to the floor, then scales the
+// ladder first steps the JPEG quality down to the floor. It then scales the
 // sides down by seven eighths at a time, until the long side reaches the
 // floor side. One step past both floors is a refusal.
 const (
@@ -315,9 +316,9 @@ func (c Config) resolve() (limits, error) {
 
 // Normalize reads one image from r and returns it normalised. It decodes
 // the JPEG, PNG and WebP formats, applies the EXIF orientation to the
-// pixels, resizes under the configured limits without ever enlarging, and
-// re-encodes from the decoded pixels, which strips every metadata block the
-// input carried.
+// pixels, and resizes under the configured limits without ever enlarging.
+// It re-encodes from the decoded pixels, which strips every metadata block
+// the input carried.
 //
 // An unusable Config returns an error wrapping ErrInvalidConfig. A refusal
 // of the input returns an Error, and Code maps it into a response envelope.
@@ -423,9 +424,9 @@ func documentedMagic(b []byte) bool {
 }
 
 // heifBrands are the ISO BMFF brands of the still image family this package
-// refuses. mif1 and msf1 are the generic multi-image brands, the heic and
-// heix brands name the still HEVC codings, and the heim, heis, hevm and
-// hevs brands name the layered and multi-image variants.
+// refuses. mif1 and msf1 are the generic multi-image brands. The heic and
+// heix brands name the still HEVC codings. The heim, heis, hevm and hevs
+// brands name the layered and multi-image variants.
 var heifBrands = map[string]bool{
 	"heic": true,
 	"heix": true,
