@@ -142,24 +142,6 @@ func (s *Store) RevokeSession(ctx context.Context, sessionID string) error {
 	return nil
 }
 
-// CreateIdentity attaches one sign-in identity to a user. The only
-// constraint the schema declares beyond the row shape is the provider
-// subject pair, so a refused insert is a taken subject and reports
-// identity.ErrIdentityTaken.
-func (s *Store) CreateIdentity(ctx context.Context, ident identity.Identity) error {
-	rowID, err := id.New()
-	if err != nil {
-		return fmt.Errorf("sqlitestore: create identity: %w", err)
-	}
-	_, err = s.db.Writer().ExecContext(ctx,
-		"INSERT INTO identities (id, user_id, provider, subject, created_at) VALUES (?, ?, ?, ?, ?)",
-		rowID, ident.UserID, ident.Provider, ident.Subject, ident.CreatedAt.Unix())
-	if err != nil {
-		return fmt.Errorf("sqlitestore: create identity: %w", identity.ErrIdentityTaken)
-	}
-	return nil
-}
-
 // IdentityHolder reads the user id one provider subject is attached to.
 // An unknown pair reports identity.ErrUnknownIdentity.
 func (s *Store) IdentityHolder(ctx context.Context, provider, subject string) (string, error) {
@@ -176,14 +158,29 @@ func (s *Store) IdentityHolder(ctx context.Context, provider, subject string) (s
 	return holder, nil
 }
 
-// PutCode retires every live code the address hash and session already
-// hold, then stores the fresh code row, in one transaction.
-func (s *Store) PutCode(ctx context.Context, code identity.SignInCode) error {
+// PutCode reserves one code send and stores the fresh code row in one
+// transaction. The reservation counts both durable windows inside the
+// transaction that inserts the row, so concurrent requests serialise on
+// the single writer and cannot oversend past the caps. A full window
+// reports identity.ErrSendLimited, and the transaction then inserts
+// nothing.
+func (s *Store) PutCode(ctx context.Context, code identity.SignInCode, caps identity.SendCaps) error {
 	tx, err := s.db.Writer().BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("sqlitestore: put code: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }() // a committed transaction rolls back to a no-op
+	var address, global int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT
+			(SELECT COUNT(*) FROM sign_in_codes WHERE address_hash = ? AND created_at > ?),
+			(SELECT COUNT(*) FROM sign_in_codes WHERE created_at > ?)`,
+		code.AddressHash, caps.Since.Unix(), caps.Since.Unix()).Scan(&address, &global); err != nil {
+		return fmt.Errorf("sqlitestore: put code: count windows: %w", err)
+	}
+	if address >= caps.Address || global >= caps.Global {
+		return fmt.Errorf("sqlitestore: put code: %w", identity.ErrSendLimited)
+	}
 	if _, err := tx.ExecContext(ctx,
 		"UPDATE sign_in_codes SET used_at = ? WHERE address_hash = ? AND requesting_session = ? AND used_at = 0",
 		code.CreatedAt.Unix(), code.AddressHash, code.RequestingSession); err != nil {
@@ -238,12 +235,17 @@ func (s *Store) DeleteCode(ctx context.Context, codeID string) error {
 	return nil
 }
 
-// CountCodeAttempt records one wrong try against one code row, as the
-// attempts value the caller read plus one.
-func (s *Store) CountCodeAttempt(ctx context.Context, codeID string, attempts int) error {
+// RecordCodeAttempt counts one wrong try with an atomic increment, and
+// retires the row inside the same write once the wrong tries reach the
+// cap, so concurrent guesses cannot collapse onto one count and reopen a
+// closed code.
+func (s *Store) RecordCodeAttempt(ctx context.Context, codeID string, wrongCap int, at time.Time) error {
 	if _, err := s.db.Writer().ExecContext(ctx,
-		"UPDATE sign_in_codes SET attempts = ? WHERE id = ?", attempts, codeID); err != nil {
-		return fmt.Errorf("sqlitestore: count attempt %s: %w", codeID, err)
+		`UPDATE sign_in_codes SET attempts = attempts + 1,
+			used_at = CASE WHEN attempts + 1 >= ? THEN ? ELSE used_at END
+			WHERE id = ?`,
+		wrongCap, at.Unix(), codeID); err != nil {
+		return fmt.Errorf("sqlitestore: record attempt %s: %w", codeID, err)
 	}
 	return nil
 }

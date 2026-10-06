@@ -568,6 +568,103 @@ func TestConcurrentFirstAttachSignsInBoth(t *testing.T) {
 	}
 }
 
+// TestConcurrentRequestsHitTheSendCap drives twelve concurrent code
+// requests from twelve client addresses at one address. The reservation
+// counts the durable windows inside the insert transaction, so exactly
+// the cap of mails goes out and the rest refuse with nothing sent.
+func TestConcurrentRequestsHitTheSendCap(t *testing.T) {
+	clock := &testClock{at: time.Unix(1758000000, 0)}
+	fx := openFixture(t, clock)
+	cookie, _ := fx.mint()
+	const requests = 12
+	recs := make([]*httptest.ResponseRecorder, requests)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < requests; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			rec := fx.callCode(cookie, "/api/sign-in/code",
+				`{"address":"raced@example.com"}`, fmt.Sprintf("203.0.113.%d:4000", 20+i))
+			recs[i] = rec
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	accepted, refused := 0, 0
+	for i, rec := range recs {
+		if rec == nil {
+			t.Fatalf("request %d recorded no response", i)
+		}
+		switch rec.Code {
+		case http.StatusAccepted:
+			accepted++
+		case http.StatusTooManyRequests:
+			refused++
+		default:
+			t.Fatalf("request %d = %d, want 202 or 429: %s", i, rec.Code, rec.Body.String())
+		}
+	}
+	if accepted != 5 || refused != requests-5 {
+		t.Fatalf("%d accepted and %d refused, want exactly 5 against the cap", accepted, refused)
+	}
+	if sent := len(fx.mail.sent()); sent != 5 {
+		t.Fatalf("%d mails sent, want exactly the cap of 5", sent)
+	}
+	var rows int
+	if err := fx.db.Reader().QueryRowContext(t.Context(),
+		"SELECT COUNT(*) FROM sign_in_codes WHERE address_hash = ?", addressHash("raced@example.com")).Scan(&rows); err != nil {
+		t.Fatalf("count code rows: %v", err)
+	}
+	if rows != 5 {
+		t.Fatalf("%d code rows stored, want exactly 5", rows)
+	}
+	// A failed send releases its slot, so the window counts mails that
+	// went out and nothing else.
+	clock.advance(24*time.Hour + time.Second)
+	fx.requestCode(cookie, "raced@example.com")
+	if sent := len(fx.mail.sent()); sent != 6 {
+		t.Fatalf("%d mails sent past the window, want 6", sent)
+	}
+}
+
+// TestConcurrentWrongTriesCloseTheCode drives twelve concurrent wrong
+// guesses at one live code. The increment and the close at the cap are
+// one write, so the code closes and the correct value never verifies.
+func TestConcurrentWrongTriesCloseTheCode(t *testing.T) {
+	clock := &testClock{at: time.Unix(1758000000, 0)}
+	fx := openFixture(t, clock)
+	cookie, _ := fx.mint()
+	fx.requestCode(cookie, "hammered@example.com")
+	code := fx.latestCode()
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 12; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			fx.verifyCode(cookie, "hammered@example.com", "000000", "")
+		}()
+	}
+	close(start)
+	wg.Wait()
+	if rec := fx.verifyCode(cookie, "hammered@example.com", code, ""); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("correct code after concurrent wrong tries = %d, want 401", rec.Code)
+	}
+	var attempts int
+	var used int64
+	if err := fx.db.Reader().QueryRowContext(t.Context(),
+		"SELECT attempts, used_at FROM sign_in_codes WHERE address_hash = ?",
+		addressHash("hammered@example.com")).Scan(&attempts, &used); err != nil {
+		t.Fatalf("read code row: %v", err)
+	}
+	if used == 0 || attempts < 6 {
+		t.Fatalf("attempts %d with used_at %d, want the code closed at the cap", attempts, used)
+	}
+}
+
 // TestSendFailureRemovesTheCode checks a refused send stores no dead
 // code and spends no ceiling budget.
 func TestSendFailureRemovesTheCode(t *testing.T) {

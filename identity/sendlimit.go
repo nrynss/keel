@@ -77,12 +77,15 @@ func newSendLimiter(store Store, now func() time.Time) (*sendLimiter, error) {
 	return &sendLimiter{store: store, now: now, probe: probe}, nil
 }
 
-// Allow reports whether one code mail may go out to addressHash. It
+// Allow is the fast pre-check for one code mail to addressHash. It
 // returns the wait until a retry may succeed and ok true when the send
 // may proceed. A refusal consumes no durable budget. The store windows
 // run first and the gate probe runs last, so a refused request spends no
-// client token either. A refused address, known or not, takes the same
-// shape, so the route answers both alike.
+// client token either. The pre-check reads without writing, so concurrent
+// requests can all pass it, and PutCode re-checks the same durable
+// windows inside the reservation transaction, which is where the caps
+// actually bind. A refused address, known or not, takes the same shape,
+// so the route answers both alike.
 func (l *sendLimiter) Allow(ctx context.Context, addressHash string, r *http.Request) (time.Duration, bool, error) {
 	if addressHash == "" {
 		return 0, false, fmt.Errorf("%w: send limiter needs an address hash", ErrInvalid)

@@ -94,6 +94,15 @@ func (s *Service) RequestSignInCode(ctx context.Context, sessionID, address stri
 		return fmt.Errorf("identity: mint code: %w", err)
 	}
 	now := s.now()
+	// The reservation claims one send slot inside the transaction that
+	// inserts the row, so concurrent requests cannot oversend the durable
+	// windows. A send that later fails releases the slot, so a refused
+	// send never eats the budget.
+	caps := SendCaps{
+		Address: sendAddressBurst,
+		Global:  sendGlobalBurst,
+		Since:   now.Add(-sendAddressWindow),
+	}
 	if err := s.store.PutCode(ctx, SignInCode{
 		ID:                codeID,
 		AddressHash:       s.hashValue(clean),
@@ -101,7 +110,10 @@ func (s *Service) RequestSignInCode(ctx context.Context, sessionID, address stri
 		RequestingSession: sessionID,
 		ExpiresAt:         now.Add(signInCodeExpiry),
 		CreatedAt:         now,
-	}); err != nil {
+	}, caps); err != nil {
+		if errors.Is(err, ErrSendLimited) {
+			return err
+		}
 		return fmt.Errorf("identity: store code: %w", err)
 	}
 	if err := s.mail.Send(ctx, clean, code); err != nil {
@@ -126,7 +138,7 @@ func (s *Service) checkCode(ctx context.Context, address, sessionID, code string
 	if err != nil {
 		return "", fmt.Errorf("identity: read code: %w", err)
 	}
-	if !row.ExpiresAt.After(s.now()) || row.Attempts >= signInCodeWrongCap {
+	if !row.ExpiresAt.After(s.now()) {
 		if err := s.store.CloseCode(ctx, row.ID, s.now()); err != nil {
 			return "", err
 		}
@@ -137,14 +149,12 @@ func (s *Service) checkCode(ctx context.Context, address, sessionID, code string
 		return "", fmt.Errorf("identity: decode code hash: %w", err)
 	}
 	mac := hmac.New(sha256.New, s.codeKey)
-	_, _ = mac.Write([]byte(strings.TrimSpace(code)))
+	_, _ = mac.Write([]byte(strings.TrimSpace(code))) // Hash.Write never returns an error
 	if !hmac.Equal(mac.Sum(nil), want) {
-		if row.Attempts+1 >= signInCodeWrongCap {
-			if err := s.store.CloseCode(ctx, row.ID, s.now()); err != nil {
-				return "", err
-			}
-		} else if err := s.store.CountCodeAttempt(ctx, row.ID, row.Attempts+1); err != nil {
-			return "", fmt.Errorf("identity: count attempt: %w", err)
+		// The increment and the close at the cap are one write, so
+		// concurrent wrong guesses cannot collapse onto one count.
+		if err := s.store.RecordCodeAttempt(ctx, row.ID, signInCodeWrongCap, s.now()); err != nil {
+			return "", fmt.Errorf("identity: record attempt: %w", err)
 		}
 		return "", ErrInvalidCode
 	}
@@ -336,12 +346,15 @@ func (s *Service) handleRequestCode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.RequestSignInCode(r.Context(), sessionID, body.Address); err != nil {
-		if errors.Is(err, ErrInvalid) {
-			_ = wire.WriteError(w, http.StatusBadRequest, wire.CodeInvalidRequest, "this request names no address", nil)
-			return
+		switch {
+		case errors.Is(err, ErrInvalid):
+			_ = wire.WriteError(w, http.StatusBadRequest, wire.CodeInvalidRequest, "this request names no address", nil) // a refusal is already the answer
+		case errors.Is(err, ErrSendLimited):
+			refuseSignInCode(w, 0) // the wait is unknown at the reservation, so the floor applies
+		default:
+			s.log.Warn("identity: request sign-in code", "error", err)
+			_ = wire.WriteError(w, http.StatusInternalServerError, wire.CodeInternal, "the sign-in code could not be sent", nil) // a refusal is already the answer
 		}
-		s.log.Warn("identity: request sign-in code", "error", err)
-		_ = wire.WriteError(w, http.StatusInternalServerError, wire.CodeInternal, "the sign-in code could not be sent", nil)
 		return
 	}
 	writeSignInJSON(w, http.StatusAccepted, signInOKJSON{OK: true})

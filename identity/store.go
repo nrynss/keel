@@ -27,18 +27,19 @@ type Store interface {
 	// error, because the session is already unusable.
 	RevokeSession(ctx context.Context, sessionID string) error
 
-	// CreateIdentity attaches one sign-in identity to a user. A provider
-	// subject that already names a row reports ErrIdentityTaken, and no
-	// row changes.
-	CreateIdentity(ctx context.Context, ident Identity) error
-
 	// IdentityHolder reads the user id one provider subject is attached
 	// to. An unknown pair reports ErrUnknownIdentity.
 	IdentityHolder(ctx context.Context, provider, subject string) (string, error)
 
-	// PutCode retires every live code the address hash and session
-	// already hold, then stores the fresh code row, in one transaction.
-	PutCode(ctx context.Context, code SignInCode) error
+	// PutCode reserves one code send and stores the fresh code row in one
+	// transaction. The reservation counts both durable send windows inside
+	// the transaction that inserts the row, so concurrent requests
+	// serialise on the writer and cannot oversend past the caps, and a
+	// full window refuses with ErrSendLimited. It retires every live code
+	// the address hash and session already hold before the insert. A
+	// caller whose send later fails removes the row with DeleteCode, so a
+	// refused send never eats the budget it reserved.
+	PutCode(ctx context.Context, code SignInCode, caps SendCaps) error
 
 	// LiveCode reads the newest live code one address hash and session
 	// hold. No live row reports ErrUnknownCode.
@@ -51,9 +52,11 @@ type Store interface {
 	// delivered, so its row leaves the send ceilings untouched.
 	DeleteCode(ctx context.Context, codeID string) error
 
-	// CountCodeAttempt records one wrong try against one code row, as the
-	// attempts value the caller read plus one.
-	CountCodeAttempt(ctx context.Context, codeID string, attempts int) error
+	// RecordCodeAttempt counts one wrong try against one code row with an
+	// atomic increment, and retires the row inside the same write once
+	// the wrong tries reach the cap, so concurrent guesses cannot
+	// undercount the tries a code has absorbed.
+	RecordCodeAttempt(ctx context.Context, codeID string, wrongCap int, at time.Time) error
 
 	// CodeSends counts the code rows one address hash holds since the
 	// cutoff, with the oldest row's creation time.
@@ -118,6 +121,19 @@ type SignInCode struct {
 	UsedAt time.Time
 	// CreatedAt is when the code was stored.
 	CreatedAt time.Time
+}
+
+// SendCaps carries the durable send ceilings one code reservation
+// honours.
+type SendCaps struct {
+	// Address is the most codes one address may hold in its window.
+	Address int
+	// Global is the most codes every address may hold in the global
+	// window.
+	Global int
+	// Since is the start of both sliding windows, cut from the caller's
+	// clock.
+	Since time.Time
 }
 
 // SendWindow is one sliding-window count of code sends, as the send

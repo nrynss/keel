@@ -109,26 +109,25 @@ func TestSessionReportsUnknown(t *testing.T) {
 	}
 }
 
-// TestIdentitySentinels checks the identity reads and writes match their
-// sentinels: a taken subject, an unknown holder.
-func TestIdentitySentinels(t *testing.T) {
+// TestIdentityReportsUnknownHolder checks the holder read matches its
+// sentinel, so the sign-in path reads an unknown subject as fresh.
+func TestIdentityReportsUnknownHolder(t *testing.T) {
 	fx := openFixture(t)
 	fx.guest("user-a", "session-a")
-	now := time.Unix(1758000000, 0)
-	err := fx.store.CreateIdentity(t.Context(), identity.Identity{
-		Provider: "email", Subject: "held@example.com", UserID: "user-a", CreatedAt: now,
-	})
-	if err != nil {
-		t.Fatalf("create identity: %v", err)
-	}
-	err = fx.store.CreateIdentity(t.Context(), identity.Identity{
-		Provider: "email", Subject: "held@example.com", UserID: "user-a", CreatedAt: now,
-	})
-	if !errors.Is(err, identity.ErrIdentityTaken) {
-		t.Fatalf("taken subject err = %v, want ErrIdentityTaken", err)
-	}
 	if _, err := fx.store.IdentityHolder(t.Context(), "email", "noone@example.com"); !errors.Is(err, identity.ErrUnknownIdentity) {
 		t.Fatalf("unknown holder err = %v, want ErrUnknownIdentity", err)
+	}
+}
+
+// seedIdentity writes one identity row directly, the way the tests name
+// a subject that already belongs to one user.
+func (fx *fixture) seedIdentity(provider, subject, userID string) {
+	fx.t.Helper()
+	_, err := fx.db.Writer().ExecContext(fx.t.Context(),
+		"INSERT INTO identities (id, user_id, provider, subject, created_at) VALUES (?, ?, ?, ?, ?)",
+		"ident-"+subject, userID, provider, subject, time.Unix(1758000000, 0).Unix())
+	if err != nil {
+		fx.t.Fatalf("seed identity: %v", err)
 	}
 }
 
@@ -141,7 +140,7 @@ func TestResolveSignInConsumesTheCodeOnce(t *testing.T) {
 	if err := fx.store.PutCode(t.Context(), identity.SignInCode{
 		ID: "code-a", AddressHash: "aa", CodeHash: "bb", RequestingSession: "session-a",
 		ExpiresAt: now.Add(time.Minute), CreatedAt: now,
-	}); err != nil {
+	}, identity.SendCaps{Address: 5, Global: 200, Since: now.Add(-24 * time.Hour)}); err != nil {
 		t.Fatalf("put code: %v", err)
 	}
 	target, err := fx.store.ResolveSignIn(t.Context(), identity.SignInResolution{
@@ -179,11 +178,7 @@ func TestResolveSignInJoinsTheHolder(t *testing.T) {
 	fx.guest("user-a", "session-a")
 	fx.guest("user-b", "session-b")
 	now := time.Unix(1758000000, 0)
-	if err := fx.store.CreateIdentity(t.Context(), identity.Identity{
-		Provider: "email", Subject: "held@example.com", UserID: "user-b", CreatedAt: now,
-	}); err != nil {
-		t.Fatalf("create identity: %v", err)
-	}
+	fx.seedIdentity("email", "held@example.com", "user-b")
 	target, err := fx.store.ResolveSignIn(t.Context(), identity.SignInResolution{
 		SessionID: "session-a", UserID: "user-a", NewSessionID: "session-a2",
 		Provider: "email", Subject: "held@example.com", At: now,
@@ -211,15 +206,11 @@ func TestDeleteUserRowsRemovesEverything(t *testing.T) {
 	fx := openFixture(t)
 	fx.guest("user-a", "session-a")
 	now := time.Unix(1758000000, 0)
-	if err := fx.store.CreateIdentity(t.Context(), identity.Identity{
-		Provider: "email", Subject: "doomed@example.com", UserID: "user-a", CreatedAt: now,
-	}); err != nil {
-		t.Fatalf("create identity: %v", err)
-	}
+	fx.seedIdentity("email", "doomed@example.com", "user-a")
 	if err := fx.store.PutCode(t.Context(), identity.SignInCode{
 		ID: "code-a", AddressHash: "aa", CodeHash: "bb", RequestingSession: "session-a",
 		ExpiresAt: now.Add(time.Minute), CreatedAt: now,
-	}); err != nil {
+	}, identity.SendCaps{Address: 5, Global: 200, Since: now.Add(-24 * time.Hour)}); err != nil {
 		t.Fatalf("put code: %v", err)
 	}
 	if err := fx.store.DeleteUserRows(t.Context(), "user-a"); err != nil {
@@ -267,12 +258,13 @@ func TestSendWindows(t *testing.T) {
 	fx.guest("user-a", "session-a")
 	fx.guest("user-b", "session-b")
 	now := time.Unix(1758000000, 0)
+	caps := identity.SendCaps{Address: 5, Global: 200, Since: now.Add(-24 * time.Hour)}
 	put := func(id, hash, session string, at time.Time) {
 		t.Helper()
 		if err := fx.store.PutCode(t.Context(), identity.SignInCode{
 			ID: id, AddressHash: hash, CodeHash: id, RequestingSession: session,
 			ExpiresAt: at.Add(time.Minute), CreatedAt: at,
-		}); err != nil {
+		}, caps); err != nil {
 			t.Fatalf("put code: %v", err)
 		}
 	}

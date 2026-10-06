@@ -80,10 +80,6 @@ var (
 	// with no row.
 	ErrUnknownIdentity = errors.New("identity: unknown identity")
 
-	// ErrIdentityTaken is the Store contract for a provider subject that
-	// already names an identity row.
-	ErrIdentityTaken = errors.New("identity: identity is already attached")
-
 	// ErrUnknownCode is the Store contract for a sign-in code with no
 	// live row.
 	ErrUnknownCode = errors.New("identity: unknown code")
