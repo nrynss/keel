@@ -4,7 +4,9 @@
 // The browser holds a signed cookie that carries only the session id, and
 // a native client sends the same signed value as a bearer token. Every
 // request resolves the token against the rows, so revoking a session takes
-// effect on the next request.
+// effect on the next request. Parallel first requests each mint their own
+// guest, the browser keeps one cookie, and an orphaned guest holds
+// nothing beyond its own rows, as the Middleware comment describes.
 //
 // Sign-in arrives by emailed code or through an external provider. A
 // sign-in attaches to the current guest when the address or the provider
@@ -338,6 +340,15 @@ func (s *Service) Resolve(r *http.Request) (User, Session, error) {
 // its cookie, so the response orients the next visit. A revoked token
 // never resolves again, so the request it rides on still fails every
 // ownership check. A database fault answers 500.
+//
+// A browser that fires several requests before any cookie lands mints
+// one guest per request, and the browser keeps one cookie. The sibling
+// guests are orphaned on purpose. The rows carry nothing but their own
+// ids and timestamps, so an orphan holds no data and leaks nothing. An
+// app that writes guest rows before a cookie lands collapses them with
+// a handoff of its own, or reclaims the rows under the cookie the
+// browser kept. The mints deliberately share no key, because collapsing
+// them would point requests from different browsers at one guest.
 func (s *Service) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		user, session, err := s.resolve(r)
@@ -347,13 +358,13 @@ func (s *Service) Middleware(next http.Handler) http.Handler {
 		}
 		if !errors.Is(err, ErrNoSession) {
 			s.log.Warn("identity: resolve session", "error", err)
-			_ = wire.WriteError(w, http.StatusInternalServerError, wire.CodeInternal, "the session could not be resolved", nil)
+			_ = wire.WriteError(w, http.StatusInternalServerError, wire.CodeInternal, "the session could not be resolved", nil) // a failed write cannot replace the refusal
 			return
 		}
 		user, session, err = s.mint(r.Context())
 		if err != nil {
 			s.log.Warn("identity: mint guest", "error", err)
-			_ = wire.WriteError(w, http.StatusInternalServerError, wire.CodeInternal, "the session could not be opened", nil)
+			_ = wire.WriteError(w, http.StatusInternalServerError, wire.CodeInternal, "the session could not be opened", nil) // a failed write cannot replace the refusal
 			return
 		}
 		s.setSessionCookie(w, session.ID)
@@ -521,7 +532,7 @@ func (s *Service) clearSessionCookie(w http.ResponseWriter) {
 // carries the id and its signature and nothing else.
 func signToken(sessionID string, key []byte) string {
 	mac := hmac.New(sha256.New, key)
-	_, _ = mac.Write([]byte(sessionID))
+	_, _ = mac.Write([]byte(sessionID)) // hash.Write never returns an error
 	return sessionID + "." + hex.EncodeToString(mac.Sum(nil))
 }
 
@@ -536,7 +547,7 @@ func verifyToken(value string, key []byte) (string, bool) {
 		return "", false
 	}
 	mac := hmac.New(sha256.New, key)
-	_, _ = mac.Write([]byte(sessionID))
+	_, _ = mac.Write([]byte(sessionID)) // hash.Write never returns an error
 	want, err := hex.DecodeString(sig)
 	if err != nil {
 		return "", false

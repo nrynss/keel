@@ -209,7 +209,7 @@ func fetchOIDCJSON(ctx context.Context, client *http.Client, location string, sh
 	if err != nil {
 		return fmt.Errorf("%w: fetch provider document: %v", ErrProviderToken, err)
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer func() { _ = resp.Body.Close() }() // the answer is already read or the exchange is done
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("%w: provider document refused", ErrProviderToken)
 	}
@@ -278,7 +278,7 @@ func (p *OIDCProvider) Exchange(ctx context.Context, callback CallbackChallenge)
 	if err != nil {
 		return "", fmt.Errorf("%w: exchange code: %v", ErrProviderToken, err)
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer func() { _ = resp.Body.Close() }() // the answer is already read or the exchange is done
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("%w: token endpoint refused", ErrProviderToken)
 	}

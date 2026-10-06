@@ -279,7 +279,7 @@ func (s *Service) handleProviderStart(w http.ResponseWriter, r *http.Request, p 
 	redirect, err := s.StartSignIn(r.Context(), p, sessionID, user.ID)
 	if err != nil {
 		s.log.Warn("identity: start provider sign-in", "error", err)
-		_ = wire.WriteError(w, http.StatusInternalServerError, wire.CodeInternal, "the provider sign-in is not ready", nil)
+		_ = wire.WriteError(w, http.StatusInternalServerError, wire.CodeInternal, "the provider sign-in is not ready", nil) // a failed write cannot replace the refusal
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
@@ -298,7 +298,7 @@ func (s *Service) handleProviderCallback(w http.ResponseWriter, r *http.Request,
 	}
 	query := r.URL.Query()
 	if query.Get("error") != "" {
-		_ = wire.WriteError(w, http.StatusUnauthorized, wire.CodeInvalidCode, "the provider sign-in was refused", nil)
+		_ = wire.WriteError(w, http.StatusUnauthorized, wire.CodeInvalidCode, "the provider sign-in was refused", nil) // a failed write cannot replace the refusal
 		return
 	}
 	outcome, err := s.CompleteSignIn(r.Context(), p, sessionID, user.ID,
@@ -306,12 +306,12 @@ func (s *Service) handleProviderCallback(w http.ResponseWriter, r *http.Request,
 	if err != nil {
 		switch {
 		case errors.Is(err, ErrGuestDataConflict):
-			_ = wire.WriteError(w, http.StatusConflict, wire.CodeGuestDataConflict, "this device holds guest data the account would leave behind", nil)
+			_ = wire.WriteError(w, http.StatusConflict, wire.CodeGuestDataConflict, "this device holds guest data the account would leave behind", nil) // a failed write cannot replace the refusal
 		case errors.Is(err, ErrInvalid):
-			_ = wire.WriteError(w, http.StatusBadRequest, wire.CodeInvalidRequest, "this callback carries no usable answer", nil)
+			_ = wire.WriteError(w, http.StatusBadRequest, wire.CodeInvalidRequest, "this callback carries no usable answer", nil) // a failed write cannot replace the refusal
 		default:
 			s.log.Warn("identity: complete provider sign-in", "error", err)
-			_ = wire.WriteError(w, http.StatusUnauthorized, wire.CodeInvalidCode, "the provider sign-in was refused", nil)
+			_ = wire.WriteError(w, http.StatusUnauthorized, wire.CodeInvalidCode, "the provider sign-in was refused", nil) // a failed write cannot replace the refusal
 		}
 		return
 	}

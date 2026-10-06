@@ -56,7 +56,7 @@ func normalizeAddress(address string) string {
 // A stolen database copy verifies nothing and reveals neither.
 func (s *Service) hashValue(value string) string {
 	mac := hmac.New(sha256.New, s.codeKey)
-	_, _ = mac.Write([]byte(value))
+	_, _ = mac.Write([]byte(value)) // hash.Write never returns an error
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
@@ -149,7 +149,7 @@ func (s *Service) checkCode(ctx context.Context, address, sessionID, code string
 		return "", fmt.Errorf("identity: decode code hash: %w", err)
 	}
 	mac := hmac.New(sha256.New, s.codeKey)
-	_, _ = mac.Write([]byte(strings.TrimSpace(code))) // Hash.Write never returns an error
+	_, _ = mac.Write([]byte(strings.TrimSpace(code))) // Hash.Write never returns an error // hash.Write never returns an error
 	if !hmac.Equal(mac.Sum(nil), want) {
 		// The increment and the close at the cap are one write, so
 		// concurrent wrong guesses cannot collapse onto one count.
@@ -268,7 +268,7 @@ type signInOKJSON struct {
 func decodeSignInBody(w http.ResponseWriter, r *http.Request, shape any) bool {
 	r.Body = http.MaxBytesReader(w, r.Body, signInMaxBody)
 	if err := json.NewDecoder(r.Body).Decode(shape); err != nil {
-		_ = wire.WriteError(w, http.StatusBadRequest, wire.CodeInvalidRequest, "this request carries no usable body", nil)
+		_ = wire.WriteError(w, http.StatusBadRequest, wire.CodeInvalidRequest, "this request carries no usable body", nil) // a failed write cannot replace the refusal
 		return false
 	}
 	return true
@@ -290,7 +290,7 @@ func signInSession(w http.ResponseWriter, r *http.Request) (User, string, bool) 
 	user, ok := UserFromContext(r.Context())
 	session, sok := SessionFromContext(r.Context())
 	if !ok || !sok || user.ID == "" || session.ID == "" {
-		_ = wire.WriteError(w, http.StatusInternalServerError, wire.CodeInternal, "the guest session is not wired", nil)
+		_ = wire.WriteError(w, http.StatusInternalServerError, wire.CodeInternal, "the guest session is not wired", nil) // a failed write cannot replace the refusal
 		return User{}, "", false
 	}
 	return user, session.ID, true
@@ -309,7 +309,7 @@ type signInRetryDetail struct {
 // shape, so neither learns who registered. A zero wait answers a one
 // second hint, so a limiter fault refuses without naming its half.
 func refuseSignInCode(w http.ResponseWriter, wait time.Duration) {
-	_ = wire.WriteError(w, http.StatusTooManyRequests, wire.CodeSendLimited,
+	_ = wire.WriteError(w, http.StatusTooManyRequests, wire.CodeSendLimited, // a failed write cannot replace the refusal
 		"too many codes were requested, retry after the wait",
 		signInRetryDetail{RetryAfterSeconds: wait.Seconds()})
 }
@@ -325,7 +325,7 @@ func (s *Service) handleRequestCode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.limiter == nil {
-		_ = wire.WriteError(w, http.StatusInternalServerError, wire.CodeInternal, "the sign-in code route is not wired", nil)
+		_ = wire.WriteError(w, http.StatusInternalServerError, wire.CodeInternal, "the sign-in code route is not wired", nil) // a failed write cannot replace the refusal
 		return
 	}
 	var body signInRequestJSON
@@ -334,7 +334,7 @@ func (s *Service) handleRequestCode(w http.ResponseWriter, r *http.Request) {
 	}
 	address := normalizeAddress(body.Address)
 	if address == "" {
-		_ = wire.WriteError(w, http.StatusBadRequest, wire.CodeInvalidRequest, "this request names no address", nil)
+		_ = wire.WriteError(w, http.StatusBadRequest, wire.CodeInvalidRequest, "this request names no address", nil) // a failed write cannot replace the refusal
 		return
 	}
 	wait, allow, err := s.limiter.Allow(r.Context(), s.hashValue(address), r)
@@ -348,12 +348,12 @@ func (s *Service) handleRequestCode(w http.ResponseWriter, r *http.Request) {
 	if err := s.RequestSignInCode(r.Context(), sessionID, body.Address); err != nil {
 		switch {
 		case errors.Is(err, ErrInvalid):
-			_ = wire.WriteError(w, http.StatusBadRequest, wire.CodeInvalidRequest, "this request names no address", nil) // a refusal is already the answer
+			_ = wire.WriteError(w, http.StatusBadRequest, wire.CodeInvalidRequest, "this request names no address", nil) // a refusal is already the answer // a failed write cannot replace the refusal
 		case errors.Is(err, ErrSendLimited):
 			refuseSignInCode(w, 0) // the wait is unknown at the reservation, so the floor applies
 		default:
 			s.log.Warn("identity: request sign-in code", "error", err)
-			_ = wire.WriteError(w, http.StatusInternalServerError, wire.CodeInternal, "the sign-in code could not be sent", nil) // a refusal is already the answer
+			_ = wire.WriteError(w, http.StatusInternalServerError, wire.CodeInternal, "the sign-in code could not be sent", nil) // a refusal is already the answer // a failed write cannot replace the refusal
 		}
 		return
 	}
@@ -376,14 +376,14 @@ func (s *Service) handleVerifyCode(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		switch {
 		case errors.Is(err, ErrInvalid):
-			_ = wire.WriteError(w, http.StatusBadRequest, wire.CodeInvalidRequest, "this request carries no usable code", nil)
+			_ = wire.WriteError(w, http.StatusBadRequest, wire.CodeInvalidRequest, "this request carries no usable code", nil) // a failed write cannot replace the refusal
 		case errors.Is(err, ErrInvalidCode):
-			_ = wire.WriteError(w, http.StatusUnauthorized, wire.CodeInvalidCode, "this code is expired, used, or never requested on this device", nil)
+			_ = wire.WriteError(w, http.StatusUnauthorized, wire.CodeInvalidCode, "this code is expired, used, or never requested on this device", nil) // a failed write cannot replace the refusal
 		case errors.Is(err, ErrGuestDataConflict):
-			_ = wire.WriteError(w, http.StatusConflict, wire.CodeGuestDataConflict, "this device holds guest data the account would leave behind", nil)
+			_ = wire.WriteError(w, http.StatusConflict, wire.CodeGuestDataConflict, "this device holds guest data the account would leave behind", nil) // a failed write cannot replace the refusal
 		default:
 			s.log.Warn("identity: verify sign-in code", "error", err)
-			_ = wire.WriteError(w, http.StatusInternalServerError, wire.CodeInternal, "the sign-in could not complete", nil)
+			_ = wire.WriteError(w, http.StatusInternalServerError, wire.CodeInternal, "the sign-in could not complete", nil) // a failed write cannot replace the refusal
 		}
 		return
 	}

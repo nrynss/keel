@@ -316,26 +316,26 @@ func (s *Service) handleDelete(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, deletionMaxBody)
 	var body deletionRequestJSON
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		_ = wire.WriteError(w, http.StatusBadRequest, wire.CodeInvalidRequest, "this request carries no usable code", nil)
+		_ = wire.WriteError(w, http.StatusBadRequest, wire.CodeInvalidRequest, "this request carries no usable code", nil) // a failed write cannot replace the refusal
 		return
 	}
 	if normalizeAddress(body.Address) == "" || body.Code == "" {
-		_ = wire.WriteError(w, http.StatusBadRequest, wire.CodeInvalidRequest, "this request carries no usable code", nil)
+		_ = wire.WriteError(w, http.StatusBadRequest, wire.CodeInvalidRequest, "this request carries no usable code", nil) // a failed write cannot replace the refusal
 		return
 	}
 	jobID, err := s.Delete(r.Context(), sessionID, user.ID, body.Address, body.Code)
 	if err != nil {
 		switch {
 		case errors.Is(err, ErrInvalidCode):
-			_ = wire.WriteError(w, http.StatusUnauthorized, wire.CodeInvalidCode, "this code is expired, used, or never requested on this device", nil)
+			_ = wire.WriteError(w, http.StatusUnauthorized, wire.CodeInvalidCode, "this code is expired, used, or never requested on this device", nil) // a failed write cannot replace the refusal
 		case errors.Is(err, ErrNotOwner):
-			_ = wire.WriteError(w, http.StatusNotFound, wire.CodeNotFound, "that account opens nothing", nil)
+			_ = wire.WriteError(w, http.StatusNotFound, wire.CodeNotFound, "that account opens nothing", nil) // a failed write cannot replace the refusal
 		case errors.Is(err, ErrNoRunner):
 			s.log.Warn("identity: delete account without a bound runner", "error", err)
-			_ = wire.WriteError(w, http.StatusInternalServerError, wire.CodeInternal, "the deletion is not wired", nil)
+			_ = wire.WriteError(w, http.StatusInternalServerError, wire.CodeInternal, "the deletion is not wired", nil) // a failed write cannot replace the refusal
 		default:
 			s.log.Warn("identity: delete account", "error", err)
-			_ = wire.WriteError(w, http.StatusInternalServerError, wire.CodeInternal, "that request could not finish", nil)
+			_ = wire.WriteError(w, http.StatusInternalServerError, wire.CodeInternal, "that request could not finish", nil) // a failed write cannot replace the refusal
 		}
 		return
 	}
