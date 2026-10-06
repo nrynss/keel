@@ -661,8 +661,8 @@ func readQuoteRow(ctx context.Context, q querier, quoteID string) (quoteRow, err
 // priceMoved reports whether current left the tolerance window around
 // quoted. The window reaches exactly to the tolerance, so a move of the
 // tolerance itself still proceeds. It reports cost.ErrOverflow when the
-// difference leaves the int64 range, which refuses the run as a move
-// would.
+// difference leaves the int64 range, and Run returns that error as a
+// plain failure, not as a refusal with a code and a fresh quote.
 func priceMoved(current, quoted, tolerance cost.Price) (bool, error) {
 	diff, err := subPrice(current, quoted)
 	if err != nil {
