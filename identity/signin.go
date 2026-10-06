@@ -149,7 +149,7 @@ func (s *Service) checkCode(ctx context.Context, address, sessionID, code string
 		return "", fmt.Errorf("identity: decode code hash: %w", err)
 	}
 	mac := hmac.New(sha256.New, s.codeKey)
-	_, _ = mac.Write([]byte(strings.TrimSpace(code))) // Hash.Write never returns an error // hash.Write never returns an error
+	_, _ = mac.Write([]byte(strings.TrimSpace(code))) // hash.Write never returns an error
 	if !hmac.Equal(mac.Sum(nil), want) {
 		// The increment and the close at the cap are one write, so
 		// concurrent wrong guesses cannot collapse onto one count.
@@ -348,12 +348,12 @@ func (s *Service) handleRequestCode(w http.ResponseWriter, r *http.Request) {
 	if err := s.RequestSignInCode(r.Context(), sessionID, body.Address); err != nil {
 		switch {
 		case errors.Is(err, ErrInvalid):
-			_ = wire.WriteError(w, http.StatusBadRequest, wire.CodeInvalidRequest, "this request names no address", nil) // a refusal is already the answer // a failed write cannot replace the refusal
+			_ = wire.WriteError(w, http.StatusBadRequest, wire.CodeInvalidRequest, "this request names no address", nil) // a failed write cannot replace the refusal
 		case errors.Is(err, ErrSendLimited):
 			refuseSignInCode(w, 0) // the wait is unknown at the reservation, so the floor applies
 		default:
 			s.log.Warn("identity: request sign-in code", "error", err)
-			_ = wire.WriteError(w, http.StatusInternalServerError, wire.CodeInternal, "the sign-in code could not be sent", nil) // a refusal is already the answer // a failed write cannot replace the refusal
+			_ = wire.WriteError(w, http.StatusInternalServerError, wire.CodeInternal, "the sign-in code could not be sent", nil) // a failed write cannot replace the refusal
 		}
 		return
 	}
