@@ -408,9 +408,9 @@ id is everything the sink needs to make it.
 
 An entry that exhausts `MaxAttempts` attempts stays stored with its failure count, and
 `Exhausted` reports it, so a sink that never accepts one entry is visible instead of silent.
-Batch size, pass interval, attempt cap and the retry waits come from `Config`, and the zero
-value works: a hundred-entry batch, a pass every second, ten attempts, and a retry wait that
-starts at five seconds and doubles up to a minute. `Loop` runs a pass on every interval until
+Batch size, pass interval, attempt cap and the retry waits come from `Config`. The zero value
+works: a hundred-entry batch, a pass every second, ten attempts, and a retry wait that starts
+at five seconds and doubles up to a minute. `Loop` runs a pass on every interval until
 its context is done, and backs off on the same curve after a failed pass. `outbox/sqlitestore`
 owns its namespaced migration, like every other store here.
 

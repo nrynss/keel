@@ -295,8 +295,8 @@ func (o *Outbox) Add(ctx context.Context, payload []byte) (Entry, error) {
 }
 
 // Flush runs one delivery pass and reports what it did. The pass reads the
-// pending entries whose failures are below the attempt cap, hands them to
-// the sink in insertion order, one batch at a time, and retires a batch
+// pending entries whose failures sit below the attempt cap and hands them
+// to the sink in insertion order, one batch at a time. A batch is retired
 // only after Deliver returned nil for it. An entry whose failures reached
 // the cap is skipped, so it cannot block the entries behind it.
 //
@@ -381,9 +381,9 @@ func (o *Outbox) Exhausted(ctx context.Context) ([]Entry, error) {
 
 // Loop runs delivery passes until ctx is done. One pass runs on every
 // Interval. A failed pass holds RetryWait before the next one, and each
-// further consecutive failure doubles that wait up to RetryMax, so a sink
-// that is down is retried on a slowing curve instead of a spin. A wait is
-// never shorter than Interval.
+// further consecutive failure doubles that wait up to RetryMax. A sink
+// that is down is therefore retried on a slowing curve instead of a spin.
+// A wait is never shorter than Interval.
 //
 // Loop is the body of the goroutine a caller starts, and it is also that
 // goroutine's named exit path. It starts no goroutine of its own and

@@ -367,8 +367,8 @@ func TestCrashHelperProcess(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "ids.txt"), []byte(strings.Join(ids, "\n")+"\n"), 0o644); err != nil {
 		t.Fatalf("child record ids: %v", err)
 	}
-	// The exit path: this process dies here with its handles open, so no
-	// close runs, no checkpoint runs, and the WAL keeps the committed
+	// The exit path: this process dies here with its handles open. No
+	// close runs and no checkpoint runs, so the WAL keeps the committed
 	// frames for the parent's reopen to recover.
 	os.Exit(3)
 }
@@ -407,7 +407,7 @@ func TestEntriesSurviveAKilledProcess(t *testing.T) {
 		t.Fatalf("child hung. Output:\n%s", childLog.String())
 	}
 
-	// The WAL is the crash residue: a process that closed politely would
+	// The WAL is the crash residue. A process that closed politely would
 	// have checkpointed it away, and a journal that never leaves a WAL
 	// behind cannot hold this package's durability promise.
 	wal, err := os.Stat(dbPath + "-wal")
