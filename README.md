@@ -325,8 +325,7 @@ blob a retention sweep dropped. Run that sweep beside the mediastore
 sweeper, with `Present` wired to the index, and rows past their age go in
 the same pass. Multiple cache levels are multiple `cache.Cache` instances
 with their own Config and key structs. Give each level its own key structs
-or its own store namespace, so two meanings never share rows.
-
+or its own store namespace, which owns its own table.
 
 ### Flip a switch without a restart
 

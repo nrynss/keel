@@ -1,4 +1,6 @@
-CREATE TABLE cache_entry (
+-- The table token below is rewritten to the namespace-qualified table name
+-- at open time, so each namespace owns its own table.
+CREATE TABLE {{table}} (
     key          TEXT    PRIMARY KEY,
     payload      BLOB    NOT NULL,
     content_type TEXT    NOT NULL,

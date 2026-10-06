@@ -4,9 +4,11 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"log/slog"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -462,6 +464,174 @@ func TestSweepRefusesNegativeAges(t *testing.T) {
 	}
 	if _, err := store.Sweep(t.Context(), sqlitestore.SweepConfig{RefusalTTL: -time.Minute}); !errors.Is(err, sqlitestore.ErrInvalid) {
 		t.Errorf("RefusalTTL -time.Minute: err = %v, want errors.Is(.., ErrInvalid)", err)
+	}
+}
+
+// TestTwoNamespacesOwnTwoTables: two cache levels share one database file as
+// two isolated tables, which is the promise Config.Namespace makes. Each
+// namespace owns its ledger, its table and its sweeps.
+func TestTwoNamespacesOwnTwoTables(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cache.db")
+	shared := openDB(t, path)
+	ctx := t.Context()
+
+	defaults, err := sqlitestore.Open(ctx, sqlitestore.Config{DB: shared})
+	if err != nil {
+		t.Fatalf("open the default namespace: %v", err)
+	}
+	verdicts, err := sqlitestore.Open(ctx, sqlitestore.Config{DB: shared, Namespace: "verdicts"})
+	if err != nil {
+		t.Fatalf("open a second namespace on the same file: %v", err)
+	}
+
+	first := cache.Entry{Payload: []byte("first"), ContentType: "application/json", CreatedAt: base}
+	if err := defaults.Put(ctx, "key-level", first); err != nil {
+		t.Fatalf("Put through the default namespace: %v", err)
+	}
+	second := cache.Entry{Payload: []byte("second"), ContentType: "application/json", ChargeRef: "charge-11", CreatedAt: base.Add(time.Minute)}
+	if err := verdicts.Put(ctx, "key-level", second); err != nil {
+		t.Fatalf("Put through the second namespace: %v", err)
+	}
+
+	gotFirst, err := defaults.Get(ctx, "key-level")
+	if err != nil {
+		t.Fatalf("Get through the default namespace: %v", err)
+	}
+	if string(gotFirst.Payload) != "first" {
+		t.Errorf("default namespace payload %q, want first", gotFirst.Payload)
+	}
+	gotSecond, err := verdicts.Get(ctx, "key-level")
+	if err != nil {
+		t.Fatalf("Get through the second namespace: %v", err)
+	}
+	if string(gotSecond.Payload) != "second" || gotSecond.ChargeRef != "charge-11" {
+		t.Errorf("second namespace Get = %+v, want its own row", gotSecond)
+	}
+
+	// Each namespace owns its ledger and its table.
+	fresh := openFresh(t, path)
+	var applied int
+	if err := fresh.QueryRow("SELECT COUNT(*) FROM cache_schema_migrations").Scan(&applied); err != nil {
+		t.Fatalf("count the default ledger rows: %v", err)
+	}
+	if applied != 1 {
+		t.Errorf("default ledger holds %d rows, want 1", applied)
+	}
+	if err := fresh.QueryRow("SELECT COUNT(*) FROM verdicts_schema_migrations").Scan(&applied); err != nil {
+		t.Fatalf("count the second ledger rows: %v", err)
+	}
+	if applied != 1 {
+		t.Errorf("second ledger holds %d rows, want 1", applied)
+	}
+	var payload string
+	if err := fresh.QueryRow("SELECT payload FROM cache_entry WHERE key = ?", "key-level").Scan(&payload); err != nil {
+		t.Fatalf("read the default table: %v", err)
+	}
+	if payload != "first" {
+		t.Errorf("default table payload %q, want first", payload)
+	}
+	if err := fresh.QueryRow("SELECT payload FROM verdicts_entry WHERE key = ?", "key-level").Scan(&payload); err != nil {
+		t.Fatalf("read the second table: %v", err)
+	}
+	if payload != "second" {
+		t.Errorf("second table payload %q, want second", payload)
+	}
+
+	// A sweep in one namespace leaves the other alone. The second store
+	// runs on the real clock, so its old row is past any age.
+	result, err := verdicts.Sweep(ctx, sqlitestore.SweepConfig{MaxAge: time.Hour, RefusalTTL: time.Hour})
+	if err != nil {
+		t.Fatalf("Sweep through the second namespace: %v", err)
+	}
+	if result.ExpiredDeleted != 1 {
+		t.Errorf("the second namespace sweep deleted %d rows, want its own 1", result.ExpiredDeleted)
+	}
+	if _, err := defaults.Get(ctx, "key-level"); err != nil {
+		t.Errorf("the second namespace sweep touched the default table: %v", err)
+	}
+}
+
+// TestOrphanSweepSparesAFreshEntry: an entry a concurrent make stores while
+// the sweep holds its snapshot survives the pass, and the next caller is
+// served instead of paying again.
+func TestOrphanSweepSparesAFreshEntry(t *testing.T) {
+	clk := newClock(base)
+	store := openStoreAt(t, filepath.Join(t.TempDir(), "cache.db"), clk.Now)
+	ctx := t.Context()
+
+	key := "key-race"
+	// The candidate the sweep snapshots names a blob the retention sweep
+	// has already dropped.
+	stale := cache.Entry{
+		Payload:     []byte("stale"),
+		ContentType: "application/json",
+		BlobID:      "blob-old",
+		CreatedAt:   base,
+	}
+	if err := store.Put(ctx, key, stale); err != nil {
+		t.Fatalf("seed Put: %v", err)
+	}
+
+	c, err := cache.New(cache.Config{Store: store, MaxAge: time.Hour, Now: clk.Now})
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+	var makes atomic.Int64
+	maker := func(ctx context.Context) (cache.Result, error) {
+		makes.Add(1)
+		return cache.Result{Payload: []byte("fresh"), ContentType: "application/json", ChargeRef: "charge-12", BlobID: "blob-fresh"}, nil
+	}
+
+	// Present runs while the pass holds its snapshot. The make it runs
+	// stores a fresh row for the same key before the pass reaches its
+	// delete, which is exactly the window the pin covers.
+	present := func(ctx context.Context, blobID string) (bool, error) {
+		if blobID != "blob-old" {
+			return false, fmt.Errorf("present saw unexpected blob %s", blobID)
+		}
+		clk.Advance(2 * time.Hour) // past MaxAge, so the make runs
+		if _, err := c.GetOrMake(ctx, key, maker); err != nil {
+			return false, fmt.Errorf("the concurrent make failed: %w", err)
+		}
+		return false, nil // the old blob is gone
+	}
+
+	type swept struct {
+		result sqlitestore.SweepResult
+		err    error
+	}
+	done := make(chan swept, 1)
+	go func() {
+		result, err := store.Sweep(ctx, sqlitestore.SweepConfig{Present: present})
+		done <- swept{result: result, err: err}
+	}()
+	out := <-done
+	if out.err != nil {
+		t.Fatalf("Sweep: %v", out.err)
+	}
+	if out.result.OrphansDeleted != 0 {
+		t.Errorf("the sweep deleted %d rows, want 0, because the snapshotted row was already replaced", out.result.OrphansDeleted)
+	}
+
+	// The fresh entry survived the pass.
+	got, err := store.Get(ctx, key)
+	if err != nil {
+		t.Fatalf("the fresh entry did not survive the sweep: %v", err)
+	}
+	if string(got.Payload) != "fresh" || got.BlobID != "blob-fresh" || got.ChargeRef != "charge-12" {
+		t.Errorf("Get = %+v, want the fresh entry", got)
+	}
+
+	// The next caller is served, not charged again.
+	again, err := c.GetOrMake(ctx, key, maker)
+	if err != nil {
+		t.Fatalf("GetOrMake after the sweep: %v", err)
+	}
+	if string(again.Payload) != "fresh" {
+		t.Errorf("payload %q, want the stored fresh entry", again.Payload)
+	}
+	if makes.Load() != 1 {
+		t.Errorf("maker ran %d times, want 1, so the sweep cost no second make", makes.Load())
 	}
 }
 

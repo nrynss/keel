@@ -11,11 +11,15 @@
 // of the one it replaces. The commit lands before Put returns, so a process
 // that dies right after a make keeps the entry it paid for.
 //
+// Each namespace owns its ledger and its entry table. Two stores with
+// different namespaces therefore share one database file as two isolated
+// tables, which is how two cache levels stay apart.
+//
 // Sweep deletes the rows time has expired and the rows whose mediastore
 // blob a retention sweep has dropped. Run it on the same ticker as the
-// mediastore sweeper, with Present wired to that index, so an entry and the
-// blob its payload names leave together and the window where a hit names a
-// dropped blob stays as short as the sweep interval.
+// mediastore sweeper, with Present wired to that index. An entry and the
+// blob its payload names then leave together. The window where a hit names
+// a dropped blob stays as short as the sweep interval.
 //
 // This package is one of the few allowed to import the SQLite driver. The
 // expiry, the refusal policy and the single flight stay in the cache
@@ -23,6 +27,7 @@
 package sqlitestore
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"embed"
@@ -30,6 +35,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"sort"
 	"time"
 
 	"github.com/nrynss/keel/cache"
@@ -38,8 +44,13 @@ import (
 
 // schemaNamespace is the migration ledger namespace this package owns. It
 // shares the database file with every other namespace without colliding,
-// because each namespace keeps its own ledger.
+// because each namespace keeps its own ledger and its own entry table.
 const schemaNamespace = "cache"
+
+// schemaTable is the token every migration file carries where the
+// namespace-qualified table name belongs. qualifiedSchema refuses a file
+// without it, so a later migration cannot apply to the wrong table.
+const schemaTable = "{{table}}"
 
 //go:embed migrations/*.sql
 var migrations embed.FS
@@ -54,9 +65,10 @@ type Config struct {
 	// nil, and this package never closes it.
 	DB *sqlite.DB
 
-	// Namespace overrides the migration ledger namespace. Empty means
-	// the one this package owns, which lets two cache levels share one
-	// file without sharing rows.
+	// Namespace names the ledger and the entry table this store owns.
+	// Empty means the one this package owns. Two stores with different
+	// namespaces share one database file as two isolated tables, which
+	// is how two cache levels stay apart.
 	Namespace string
 
 	// Now supplies the clock a row with no stored time is stamped with
@@ -71,14 +83,15 @@ type Config struct {
 // the zero value has no database. Store is safe for concurrent use, and
 // satisfies cache.Store.
 type Store struct {
-	db  *sqlite.DB
-	now func() time.Time
-	log *slog.Logger
+	db    *sqlite.DB
+	table string
+	now   func() time.Time
+	log   *slog.Logger
 }
 
 // Open applies the cache schema to cfg.DB and returns the store. The schema
-// arrives as ordered SQL files, so the migration runner owns what ran and
-// records each file once.
+// arrives as ordered SQL files with the store's table name in them, so the
+// migration runner owns what ran and records each file once.
 func Open(ctx context.Context, cfg Config) (*Store, error) {
 	if cfg.DB == nil {
 		return nil, fmt.Errorf("sqlitestore: open: %w: nil db", ErrInvalid)
@@ -87,9 +100,14 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 	if namespace == "" {
 		namespace = schemaNamespace
 	}
-	schema, err := fs.Sub(migrations, "migrations")
+	table := namespace + "_entry"
+	embedded, err := fs.Sub(migrations, "migrations")
 	if err != nil {
 		return nil, fmt.Errorf("sqlitestore: open: %w", err)
+	}
+	schema, err := qualifiedSchema(embedded, table)
+	if err != nil {
+		return nil, err
 	}
 	if err := sqlite.Migrate(ctx, cfg.DB, namespace, schema); err != nil {
 		return nil, fmt.Errorf("sqlitestore: open: %w", err)
@@ -102,9 +120,125 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	logger.InfoContext(ctx, "sqlitestore: opened cache entries", "namespace", namespace)
-	return &Store{db: cfg.DB, now: now, log: logger}, nil
+	logger.InfoContext(ctx, "sqlitestore: opened cache entries", "namespace", namespace, "table", table)
+	return &Store{db: cfg.DB, table: table, now: now, log: logger}, nil
 }
+
+// qualifiedSchema rewrites the table token in every migration file to the
+// namespace-qualified table name and serves the result as a small in-memory
+// tree. The migration runner sees the original file names, so the ledger
+// records them unchanged.
+func qualifiedSchema(source fs.FS, table string) (fs.FS, error) {
+	names, err := fs.Glob(source, "*.sql")
+	if err != nil {
+		return nil, fmt.Errorf("sqlitestore: open: %w", err)
+	}
+	files := make(map[string][]byte, len(names))
+	for _, name := range names {
+		body, err := fs.ReadFile(source, name)
+		if err != nil {
+			return nil, fmt.Errorf("sqlitestore: open: %w", err)
+		}
+		if !bytes.Contains(body, []byte(schemaTable)) {
+			return nil, fmt.Errorf("sqlitestore: open: %s carries no %s token", name, schemaTable)
+		}
+		files[name] = bytes.ReplaceAll(body, []byte(schemaTable), []byte(table))
+	}
+	if len(files) == 0 {
+		return nil, fmt.Errorf("sqlitestore: open: %w: no migration files", ErrInvalid)
+	}
+	return schemaTree{files: files}, nil
+}
+
+// schemaTree is an fs.FS over rewritten migration files. It serves the
+// shapes the migration runner reads: one directory listing, and one file
+// read per file.
+type schemaTree struct {
+	files map[string][]byte
+}
+
+// Open returns one migration file of the tree as an fs.File.
+func (t schemaTree) Open(name string) (fs.File, error) {
+	body, ok := t.files[name]
+	if !ok || !fs.ValidPath(name) {
+		return nil, &fs.PathError{Op: "open", Path: name, Err: fs.ErrNotExist}
+	}
+	return &schemaFile{
+		Reader: bytes.NewReader(body),
+		entry:  schemaEntry{name: name, size: int64(len(body))},
+	}, nil
+}
+
+// ReadFile returns the rewritten body of one migration file.
+func (t schemaTree) ReadFile(name string) ([]byte, error) {
+	body, ok := t.files[name]
+	if !ok || !fs.ValidPath(name) {
+		return nil, &fs.PathError{Op: "read", Path: name, Err: fs.ErrNotExist}
+	}
+	return bytes.Clone(body), nil
+}
+
+// ReadDir lists the migration files in filename order, which is the order
+// the runner applies them in.
+func (t schemaTree) ReadDir(name string) ([]fs.DirEntry, error) {
+	if name != "." {
+		return nil, &fs.PathError{Op: "readdir", Path: name, Err: fs.ErrNotExist}
+	}
+	names := make([]string, 0, len(t.files))
+	for name := range t.files {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	entries := make([]fs.DirEntry, 0, len(names))
+	for _, name := range names {
+		entries = append(entries, schemaEntry{name: name, size: int64(len(t.files[name]))})
+	}
+	return entries, nil
+}
+
+// schemaFile is one open migration file of a schemaTree.
+type schemaFile struct {
+	*bytes.Reader
+	entry schemaEntry
+}
+
+// Stat returns the file's name and size.
+func (f *schemaFile) Stat() (fs.FileInfo, error) { return f.entry, nil }
+
+// Close releases the reader. The body lives in memory, so this is a no-op.
+func (f *schemaFile) Close() error { return nil }
+
+// schemaEntry names one file of a schemaTree. It is both the fs.FileInfo a
+// Stat returns and the fs.DirEntry a listing carries, which is every shape
+// the migration runner reads.
+type schemaEntry struct {
+	name string
+	size int64
+}
+
+// Name returns the file's name.
+func (e schemaEntry) Name() string { return e.name }
+
+// Size returns the file's size in bytes.
+func (e schemaEntry) Size() int64 { return e.size }
+
+// Mode reports a read-only regular file.
+func (e schemaEntry) Mode() fs.FileMode { return 0o444 }
+
+// ModTime returns the zero time, because a rewritten body has none.
+func (e schemaEntry) ModTime() time.Time { return time.Time{} }
+
+// IsDir reports false, because every entry is a file.
+func (e schemaEntry) IsDir() bool { return false }
+
+// Sys returns nil, because the tree holds nothing behind the bytes.
+func (e schemaEntry) Sys() any { return nil }
+
+// Type reports the mode's type bits, which name a regular file.
+func (e schemaEntry) Type() fs.FileMode { return e.Mode().Type() }
+
+// Info returns the entry as its own file info.
+func (e schemaEntry) Info() (fs.FileInfo, error) { return e, nil }
 
 // Get returns the entry stored under key, or an error matching
 // cache.ErrNotFound when the key has no row.
@@ -116,7 +250,7 @@ func (s *Store) Get(ctx context.Context, key string) (cache.Entry, error) {
 	)
 	err := s.db.Reader().QueryRowContext(ctx,
 		`SELECT payload, content_type, charge_ref, blob_id, refusal, created_at
-		 FROM cache_entry WHERE key = ?`, key,
+		 FROM `+s.table+` WHERE key = ?`, key,
 	).Scan(&entry.Payload, &entry.ContentType, &entry.ChargeRef, &entry.BlobID, &refusal, &createdAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return cache.Entry{}, fmt.Errorf("sqlitestore: get %s: %w", key, cache.ErrNotFound)
@@ -146,7 +280,7 @@ func (s *Store) Put(ctx context.Context, key string, entry cache.Entry) error {
 		refusal = 1
 	}
 	_, err := s.db.Writer().ExecContext(ctx,
-		`INSERT INTO cache_entry (key, payload, content_type, charge_ref, blob_id, refusal, created_at)
+		`INSERT INTO `+s.table+` (key, payload, content_type, charge_ref, blob_id, refusal, created_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(key) DO UPDATE SET payload = excluded.payload,
 			content_type = excluded.content_type,
@@ -228,7 +362,7 @@ func (s *Store) Sweep(ctx context.Context, cfg SweepConfig) (SweepResult, error)
 // argument and counts them. The clause is one of this file's own constants,
 // never caller text.
 func (s *Store) deleteWhere(ctx context.Context, where string, cutoff int64) (int, error) {
-	res, err := s.db.Writer().ExecContext(ctx, `DELETE FROM cache_entry WHERE `+where, cutoff)
+	res, err := s.db.Writer().ExecContext(ctx, `DELETE FROM `+s.table+` WHERE `+where, cutoff)
 	if err != nil {
 		return 0, fmt.Errorf("sqlitestore: sweep: %w", err)
 	}
@@ -239,18 +373,24 @@ func (s *Store) deleteWhere(ctx context.Context, where string, cutoff int64) (in
 	return int(n), nil
 }
 
-// blobRow is one entry that names a blob, read for the orphan pass.
+// blobRow is one entry that names a blob, read for the orphan pass. It
+// carries the stamp the row had when the pass saw it.
 type blobRow struct {
-	key    string
-	blobID string
+	key       string
+	blobID    string
+	createdAt int64
 }
 
 // deleteOrphans reads every row that names a blob and deletes the ones
-// whose blob no longer resolves. The read and the deletes do not share one
+// whose blob no longer resolves. A delete only lands on the row the pass
+// snapshotted, because a fresh entry a concurrent make stores during the
+// pass carries a different stamp, and the next caller must be served
+// instead of paying again. The read and the deletes do not share one
 // transaction, because a row removed under this pass deletes nothing the
 // second time.
 func (s *Store) deleteOrphans(ctx context.Context, present func(context.Context, string) (bool, error)) (int, error) {
-	rows, err := s.db.Reader().QueryContext(ctx, `SELECT key, blob_id FROM cache_entry WHERE blob_id != ''`)
+	rows, err := s.db.Reader().QueryContext(ctx,
+		`SELECT key, blob_id, created_at FROM `+s.table+` WHERE blob_id != ''`)
 	if err != nil {
 		return 0, fmt.Errorf("sqlitestore: sweep: list blob rows: %w", err)
 	}
@@ -258,7 +398,7 @@ func (s *Store) deleteOrphans(ctx context.Context, present func(context.Context,
 	var candidates []blobRow
 	for rows.Next() {
 		var row blobRow
-		if err := rows.Scan(&row.key, &row.blobID); err != nil {
+		if err := rows.Scan(&row.key, &row.blobID, &row.createdAt); err != nil {
 			return 0, fmt.Errorf("sqlitestore: sweep: %w", err)
 		}
 		candidates = append(candidates, row)
@@ -275,10 +415,17 @@ func (s *Store) deleteOrphans(ctx context.Context, present func(context.Context,
 		if kept {
 			continue
 		}
-		if _, err := s.db.Writer().ExecContext(ctx, `DELETE FROM cache_entry WHERE key = ?`, row.key); err != nil {
+		res, err := s.db.Writer().ExecContext(ctx,
+			`DELETE FROM `+s.table+` WHERE key = ? AND blob_id = ? AND created_at = ?`,
+			row.key, row.blobID, row.createdAt)
+		if err != nil {
 			return deleted, fmt.Errorf("sqlitestore: sweep: delete orphan %s: %w", row.key, err)
 		}
-		deleted++
+		n, err := res.RowsAffected()
+		if err != nil {
+			return deleted, fmt.Errorf("sqlitestore: sweep: delete orphan %s: %w", row.key, err)
+		}
+		deleted += int(n)
 	}
 	return deleted, nil
 }

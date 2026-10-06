@@ -37,7 +37,7 @@
 //
 // Multiple cache levels are multiple Cache instances, each with its own
 // Config and its own key structs. There is no multi-level API. Two levels
-// that share one entry index need distinct key structs or distinct
+// that share one database file need distinct key structs or distinct store
 // namespaces, so their rows never collide.
 //
 // Config carries everything the package would otherwise read from the
@@ -278,8 +278,8 @@ func Key(v any) (string, error) {
 // receives the maker's own error.
 //
 // A store read that fails for a reason other than a missing entry is
-// returned, and no make runs, because a read the store cannot vouch for is
-// not a miss. A store write that fails after a successful make is logged
+// returned, and no make runs. A read the store cannot vouch for is not a
+// miss. A store write that fails after a successful make is logged
 // and dropped, because the caller has already paid for the result and must
 // receive it.
 //
