@@ -36,7 +36,7 @@ else is pure Go, and `CGO_ENABLED=0` builds the whole module.
 | `mediastore` | Blobs on disk under unguessable ids, served with Range support, with retention sweeps and a snapshot that restores the same ids |
 | `upload` | Resumable chunked uploads that land in `mediastore`, resumable by id after a dropped connection |
 | `photo` | Normalises an uploaded photo: EXIF orientation applied to the pixels, metadata stripped, resized under side and pixel caps, re-encoded under a byte cap |
-| `sqlite` | One SQLite file with WAL, a writer handle, a read-only reader pool, namespaced migrations and online backup |
+| `sqlite` | One SQLite file with WAL and synchronous FULL, so a write the store acknowledged survives a power cut, plus a writer handle, a read-only reader pool, namespaced migrations and online backup |
 | `ffmpeg` | ffmpeg and ffprobe bound to a context, with a bounded wait on shutdown |
 | `duration` | WAV and MP3 length read from the bytes themselves, for a runtime that ships ffmpeg without ffprobe |
 | `cost` | Prices in the minor units of one denomination, USD nanodollars by default or a provider's credit, a ledger of charges that name their unit, budgets that refuse before a call, keyed budgets that divide one pool by owner, grants that lapse, and a meter that records each settle in an app-chosen charge sink |

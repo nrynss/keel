@@ -110,6 +110,38 @@ func TestReaderCannotWrite(t *testing.T) {
 	}
 }
 
+// TestOpenSetsDurabilityPragmas pins the pragma pair every store's durability
+// promise rests on. The values are read back over the opened pools, so a
+// driver that dropped one from the DSN fails here rather than at a consumer.
+func TestOpenSetsDurabilityPragmas(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db := openTestDB(t, Config{Path: filepath.Join(t.TempDir(), "keel.db")})
+	pools := []struct {
+		name string
+		pool *sql.DB
+	}{
+		{"writer", db.Writer()},
+		{"reader", db.Reader()},
+	}
+	for _, p := range pools {
+		var mode string
+		if err := p.pool.QueryRowContext(ctx, "PRAGMA journal_mode").Scan(&mode); err != nil {
+			t.Fatalf("journal_mode on %s: %v", p.name, err)
+		}
+		if mode != "wal" {
+			t.Fatalf("journal_mode on %s = %q, want wal", p.name, mode)
+		}
+		var sync int
+		if err := p.pool.QueryRowContext(ctx, "PRAGMA synchronous").Scan(&sync); err != nil {
+			t.Fatalf("synchronous on %s: %v", p.name, err)
+		}
+		if sync != 2 {
+			t.Fatalf("synchronous on %s = %d, want 2 (FULL)", p.name, sync)
+		}
+	}
+}
+
 func TestCloseReleasesBothPools(t *testing.T) {
 	t.Parallel()
 	db := openTestDB(t, Config{Path: filepath.Join(t.TempDir(), "keel.db")})

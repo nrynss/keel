@@ -5,7 +5,10 @@
 // every handle carries the same pragmas. Foreign keys are on, so a delete
 // cascades to its children. The busy timeout rides out a lock held by another
 // process. WAL mode keeps a crash mid-write from corrupting the last
-// committed transaction, and synchronous NORMAL is safe under WAL.
+// committed transaction. Synchronous FULL fsyncs the write-ahead log on
+// every commit. A write the store acknowledged survives an operating system
+// or power failure. The cost is one fsync per commit, which every store in
+// the module carries so their durability promises hold together.
 //
 // A handle holds two pools over the one file. The writer pool holds a single
 // connection, because SQLite admits one writer at a time and a second
@@ -179,7 +182,7 @@ func dsn(abs string, timeout time.Duration, readOnly bool) string {
 	q := url.Values{}
 	q.Set("_foreign_keys", "on")
 	q.Set("_journal_mode", "WAL")
-	q.Set("_synchronous", "NORMAL")
+	q.Set("_synchronous", "FULL")
 	q.Set("_busy_timeout", strconv.FormatInt(ms, 10))
 	if readOnly {
 		q.Set("_query_only", "on")

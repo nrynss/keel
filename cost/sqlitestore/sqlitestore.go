@@ -4,7 +4,9 @@
 // The package owns one schema, applied through the sqlite package's migration
 // runner under its own namespace, so the ledger records what ran and a second
 // open changes nothing. A charge is written through as it arrives, because a
-// crash must not lose the record of a call that already spent money. A budget
+// crash must not lose the record of a call that already spent money. The
+// shared handle commits with synchronous FULL, so a charge the store
+// acknowledged also survives an operating system or power failure. A budget
 // reservation carries an expiry, so a process that dies mid call stops holding
 // budget when the expiry passes.
 //
