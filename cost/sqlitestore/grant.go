@@ -26,7 +26,7 @@ var ErrGrantRepeated = errors.New("sqlitestore: grant key already posted")
 // time, so a restart cannot resurrect lapsed credit.
 //
 // key makes the grant idempotent. A non-empty key posts once: a second call
-// with the same key reports ErrGrantRepeated and changes nothing, so an
+// with the same key reports ErrGrantRepeated and changes nothing. An
 // application that refills an allowance every window keys the grant by the
 // window's start, and a restart or a double post cannot fund a window twice.
 // A unique index over the key holds the guarantee in the schema, so it

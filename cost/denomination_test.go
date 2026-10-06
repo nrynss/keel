@@ -63,8 +63,8 @@ func TestNewBudgetInCarriesTheDenomination(t *testing.T) {
 }
 
 // TestBudgetInSpendsInItsOwnUnit runs a reserve and a settle against a credit
-// budget and pins the exact unit arithmetic, so a credit pool is bounded by
-// its own count and never by a dollar figure.
+// budget and pins the exact unit arithmetic. A credit pool is bounded by its
+// own count and never by a dollar figure.
 func TestBudgetInSpendsInItsOwnUnit(t *testing.T) {
 	budget, err := NewBudgetIn(credit, 1000)
 	if err != nil {
@@ -124,8 +124,9 @@ func TestMeterStampsChargesWithTheAccountDenomination(t *testing.T) {
 
 // TestLedgerTotalRefusesMixedDenominations pins that a total whose matched
 // charges name different denominations reports ErrMixedDenomination instead
-// of an invented figure, and that a total whose matched charges all name one
-// denomination still sums on a ledger that holds other denominations too.
+// of an invented figure. A total whose matched charges all name one
+// denomination still sums, even on a ledger that holds other denominations
+// too.
 func TestLedgerTotalRefusesMixedDenominations(t *testing.T) {
 	l := NewLedger()
 	addCharge(t, l, Charge{Kind: "gen", Units: 1, UnitPrice: Dollar, Ref: "r"})

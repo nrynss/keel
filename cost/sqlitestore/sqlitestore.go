@@ -127,8 +127,8 @@ type Config struct {
 
 	// Denomination names the unit every price in this store counts. The
 	// zero value keeps the USD nanodollar behaviour every store has. A
-	// store speaks one denomination for its whole life, and Open refuses
-	// a file whose stored denomination differs from the configured one,
+	// store speaks one denomination for its whole life. Open refuses a
+	// file whose stored denomination differs from the configured one,
 	// because a reopen under another name would silently reprice every
 	// recorded amount.
 	Denomination cost.Denomination
@@ -293,8 +293,8 @@ func (s *Store) purgeExpired(ctx context.Context, now time.Time) (int, error) {
 // Add records c in the ledger. It writes the row before it returns, so a charge
 // for a call that already happened survives a crash. A charge that names a
 // denomination the store does not speak is refused with an error matching
-// cost.ErrDenominationMismatch, and no path converts it, so a credit charge
-// never lands in a dollar ledger or the other way round. A cancelled context
+// cost.ErrDenominationMismatch, and no path converts it. A credit charge never
+// lands in a dollar ledger, or the other way round. A cancelled context
 // stops the write, so no charge is recorded.
 func (s *Store) Add(ctx context.Context, c cost.Charge) error {
 	if c.Denomination.Name != s.denom.Name {
@@ -495,8 +495,8 @@ func (s *Store) Reserve(ctx context.Context, estimate cost.Price) (Reservation, 
 // Settle books the price a paid call actually cost and releases the hold. It
 // books actual even when the hold already expired, because the call happened
 // and the charge is a fact. The booking extends the settle history, so a
-// store with a period counts it in the current window, and it draws actual
-// from the unexpired grants that expire soonest first, so a short grant is
+// store with a period counts it in the current window. It draws actual from
+// the unexpired grants that expire soonest first, so a short grant is
 // consumed before a longer one. It reports an error
 // matching cost.ErrOverflow and commits nothing when actual would push the
 // booked spend past the int64 range. A cancelled context stops the settle,

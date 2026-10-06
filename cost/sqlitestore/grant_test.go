@@ -127,8 +127,8 @@ func TestGrantFundsThePoolAndLapsesAtReadAndSpendTime(t *testing.T) {
 }
 
 // TestLapsedCreditCannotSurviveARestart closes the file, moves the clock past
-// the expiry, and reopens, so the balance a fresh store reports is computed
-// from the stored expiry and not from anything the dead process remembered.
+// the expiry, and reopens. The balance a fresh store reports is computed from
+// the stored expiry, not from anything the dead process remembered.
 func TestLapsedCreditCannotSurviveARestart(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "cost.db")
 	clock := &testClock{at: base}
