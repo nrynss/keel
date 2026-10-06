@@ -13,10 +13,11 @@
 //
 // Configuration arrives through Config, and the package reads no
 // environment. Errors are sentinels matched with errors.Is. Every
-// Persist that returns without error survives a process restart,
-// because the bytes are fsynced before the row is written. A Persist
-// that fails removes only the file it created, so bytes already stored
-// under an id are never truncated or removed.
+// Persist that returns without error survives an operating system or
+// power failure, because the bytes and their directory entry are
+// fsynced before the row is written. A Persist that fails removes only
+// the file it created, so bytes already stored under an id are never
+// truncated or removed.
 //
 // Snapshot writes a manifest and one file per blob, and Restore recreates
 // those blobs under their original ids. A restored row is an ordinary row
@@ -220,6 +221,12 @@ type Store struct {
 	// sync and close failure branches, which no real disk produces on
 	// demand.
 	newBlob func(id string) (blobFile, error)
+	// syncDir flushes the blob directory itself, so the directory entry
+	// of a file this store just created reaches stable storage. A file's
+	// own fsync does not persist its entry on every filesystem. Open
+	// binds it to the root handle. A test substitutes a counting or
+	// failing function to pin the call on every create path.
+	syncDir func() error
 }
 
 // Open creates the blob directory when it is absent, resolves the
@@ -267,6 +274,17 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 		// call leaves the existing bytes alone.
 		return s.root.OpenFile(blobID, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o666)
 	}
+	s.syncDir = func() error {
+		// The name "." is the directory the root handle confines every
+		// blob open to. Syncing that handle is the fsync that persists
+		// the entry of a file created inside it.
+		d, err := s.root.Open(".")
+		if err != nil {
+			return err
+		}
+		defer d.Close()
+		return d.Sync()
+	}
 	return s, nil
 }
 
@@ -301,9 +319,10 @@ func bareType(contentType string) string {
 // The content type must be one of the store's accepted types.
 // Anything else, including empty, is ErrInvalidContentType. A type with
 // parameters such as "image/png; charset=binary" is accepted and stored
-// as its bare media type. The blob is fsynced before the metadata row
-// is inserted, so a Persist that returns without error survives a
-// process restart. The copy reads only from src, and ctx bounds the
+// as its bare media type. The blob's bytes and its directory entry are
+// fsynced before the metadata row is inserted, so a Persist that
+// returns without error survives an operating system or power failure
+// on every filesystem. The copy reads only from src, and ctx bounds the
 // metadata write.
 func (s *Store) Persist(ctx context.Context, src io.Reader, p Put) (string, error) {
 	ct, ok := s.normalizeContentType(p.ContentType)
@@ -399,13 +418,14 @@ type blobFile interface {
 	Sync() error
 }
 
-// writeBlob copies src into a file created exclusively for id and
-// fsyncs before close, so the bytes are on disk when Persist returns.
-// The exclusive create never opens an existing file for truncation, so
-// a name already on disk reports fs.ErrExist and this call writes
-// nothing. Every failure after the create removes the file this call
-// owns, because a blob that was never inserted must not leak disk
-// space.
+// writeBlob copies src into a file created exclusively for id, fsyncs
+// the file, then fsyncs the blob directory, and closes, so the bytes
+// and the directory entry that names them are on disk when Persist
+// returns. The exclusive create never opens an existing file for
+// truncation, so a name already on disk reports fs.ErrExist and this
+// call writes nothing. Every failure after the create removes the file
+// this call owns, because a blob that was never inserted must not leak
+// disk space.
 func (s *Store) writeBlob(blobID string, src io.Reader) (int64, error) {
 	f, err := s.newBlob(blobID)
 	if err != nil {
@@ -431,6 +451,14 @@ func (s *Store) writeBlob(blobID string, src io.Reader) (int64, error) {
 	}
 	if err := f.Sync(); err != nil {
 		return fail("sync", err)
+	}
+	// A file's own fsync does not persist its directory entry on every
+	// filesystem. XFS is the documented case. One directory sync per
+	// created blob, not per chunk, is what makes the create itself
+	// survive a power cut, so the row written after this call never
+	// names a file a restart cannot find.
+	if err := s.syncDir(); err != nil {
+		return fail("sync dir", err)
 	}
 	if err := f.Close(); err != nil {
 		return fail("close", err)
