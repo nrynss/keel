@@ -5,6 +5,7 @@ go 1.27.1
 require (
 	github.com/go-pdf/fpdf v0.9.0
 	github.com/pelletier/go-toml/v2 v2.4.3
+	golang.org/x/net v0.58.0
 	golang.org/x/sync v0.22.0
 	modernc.org/sqlite v1.58.0
 )
