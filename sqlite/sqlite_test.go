@@ -330,6 +330,216 @@ func TestMigrateClassifiesApplyError(t *testing.T) {
 	}
 }
 
+// concurrentApplyRecord is the log message the runner writes when it skips a
+// file another open has just applied.
+const concurrentApplyRecord = "sqlite: migration applied by a concurrent open"
+
+// recordingHandler collects log record messages, so a test can tell whether
+// the runner took its concurrent-open path.
+type recordingHandler struct {
+	mu       sync.Mutex
+	messages []string
+}
+
+func (h *recordingHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *recordingHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.messages = append(h.messages, r.Message)
+	return nil
+}
+
+func (h *recordingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+
+func (h *recordingHandler) WithGroup(string) slog.Handler { return h }
+
+func (h *recordingHandler) count(message string) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	n := 0
+	for _, m := range h.messages {
+		if m == message {
+			n++
+		}
+	}
+	return n
+}
+
+// raceTwoMigrates runs Migrate twice over one namespace from two goroutines
+// released at one barrier, and returns the two errors in goroutine order.
+func raceTwoMigrates(ctx context.Context, a, b *DB, namespace string, migrations fstest.MapFS) [2]error {
+	var (
+		errs  [2]error
+		wg    sync.WaitGroup
+		start = make(chan struct{})
+	)
+	dbs := [2]*DB{a, b}
+	wg.Add(2)
+	for j := range 2 {
+		go func(j int) {
+			defer wg.Done()
+			<-start
+			errs[j] = Migrate(ctx, dbs[j], namespace, migrations)
+		}(j)
+	}
+	close(start)
+	wg.Wait()
+	return errs
+}
+
+// racingMigrations builds the two files a racing pair applies.
+func racingMigrations() fstest.MapFS {
+	return fstest.MapFS{
+		"0001_widgets.sql": {Data: []byte("CREATE TABLE widgets (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")},
+		"0002_gadgets.sql": {Data: []byte("CREATE TABLE gadgets (id INTEGER PRIMARY KEY, widget_id INTEGER NOT NULL)")},
+	}
+}
+
+// TestMigrateRacingFirstOpensConverge pins the first-open race inside one
+// handle. Two concurrent first migrations of one virgin file must both
+// succeed, leave exactly one schema behind, and never leak a driver error.
+// The runs also pin the retry path as live code, because a pass with no
+// recorded collision would prove nothing.
+func TestMigrateRacingFirstOpensConverge(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	migrations := racingMigrations()
+	handler := &recordingHandler{}
+
+	const runs = 50
+	for i := range runs {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "keel.db")
+		db, err := Open(ctx, Config{Path: path, Logger: slog.New(handler)})
+		if err != nil {
+			t.Fatalf("run %d: Open: %v", i, err)
+		}
+		errs := raceTwoMigrates(ctx, db, db, "widgets", migrations)
+		for j, err := range errs {
+			if err != nil {
+				t.Fatalf("run %d open %d: Migrate: %v", i, j, err)
+			}
+		}
+		rows := ledgerRows(t, path, "widgets_schema_migrations")
+		if len(rows) != 2 {
+			t.Fatalf("run %d: ledger = %v, want one row per file", i, rows)
+		}
+		if err := db.Close(); err != nil {
+			t.Fatalf("run %d: Close: %v", i, err)
+		}
+	}
+	if handler.count(concurrentApplyRecord) == 0 {
+		t.Fatal("no run recorded a concurrent apply, so the racing pair never collided")
+	}
+}
+
+// TestMigrateRacingFirstOpensAcrossHandlesConverge pins the first-open race
+// across two handles, the shape a restart overlapping a health check meets.
+// Both migrations must succeed and the file must hold exactly one schema.
+func TestMigrateRacingFirstOpensAcrossHandlesConverge(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	migrations := racingMigrations()
+
+	const runs = 25
+	for i := range runs {
+		path := filepath.Join(t.TempDir(), "keel.db")
+		first := openTestDB(t, Config{Path: path})
+		second := openTestDB(t, Config{Path: path})
+		errs := raceTwoMigrates(ctx, first, second, "widgets", migrations)
+		for j, err := range errs {
+			if err != nil {
+				t.Fatalf("run %d open %d: Migrate: %v", i, j, err)
+			}
+		}
+		rows := ledgerRows(t, path, "widgets_schema_migrations")
+		if len(rows) != 2 {
+			t.Fatalf("run %d: ledger = %v, want one row per file", i, rows)
+		}
+		fresh := openFresh(t, path)
+		var tables int
+		if err := fresh.QueryRow("SELECT count(*) FROM sqlite_master WHERE name IN ('widgets', 'gadgets')").Scan(&tables); err != nil {
+			t.Fatalf("run %d: inspect schema: %v", i, err)
+		}
+		if tables != 2 {
+			t.Fatalf("run %d: schema tables = %d, want 2", i, tables)
+		}
+	}
+}
+
+// TestMigrateRacingIncompatibleNamespacesFailLoudly pins the honest refusal.
+// Two namespaces that migrate genuinely incompatible schemas into one file
+// must end with exactly one classified failure, and the loser's own ledger
+// must stay empty, because no applied file vouches for the collision.
+func TestMigrateRacingIncompatibleNamespacesFailLoudly(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "keel.db")
+	first := openTestDB(t, Config{Path: path})
+	second := openTestDB(t, Config{Path: path})
+	namespaces := [2]string{"left", "right"}
+	schemas := [2]fstest.MapFS{
+		{"0001_shared.sql": {Data: []byte("CREATE TABLE shared (a INTEGER PRIMARY KEY)")}},
+		{"0001_shared.sql": {Data: []byte("CREATE TABLE shared (b TEXT PRIMARY KEY)")}},
+	}
+
+	handles := [2]*DB{first, second}
+	var (
+		errs  [2]error
+		wg    sync.WaitGroup
+		start = make(chan struct{})
+	)
+	wg.Add(2)
+	for j := range 2 {
+		go func(j int) {
+			defer wg.Done()
+			<-start
+			errs[j] = Migrate(ctx, handles[j], namespaces[j], schemas[j])
+		}(j)
+	}
+	close(start)
+	wg.Wait()
+
+	failures := 0
+	for j, err := range errs {
+		ledger := namespaces[j] + "_schema_migrations"
+		if err == nil {
+			if rows := ledgerRows(t, path, ledger); len(rows) != 1 {
+				t.Fatalf("winner %s: ledger = %v, want one row", namespaces[j], rows)
+			}
+			continue
+		}
+		failures++
+		if !errors.Is(err, ErrMigration) {
+			t.Fatalf("loser %s: Migrate error = %v, want ErrMigration", namespaces[j], err)
+		}
+		if rows := ledgerRows(t, path, ledger); len(rows) != 0 {
+			t.Fatalf("loser %s: ledger = %v, want no recorded file", namespaces[j], rows)
+		}
+	}
+	if failures != 1 {
+		t.Fatalf("incompatible schemas produced %d failures, want exactly one", failures)
+	}
+}
+
+// TestMigrateConflictWithoutLedgerRowStillFails pins the loud side of the
+// retry rule with no race involved. A migration that collides with a table
+// nobody recorded must fail, because no ledger row vouches for the file.
+func TestMigrateConflictWithoutLedgerRowStillFails(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db := openTestDB(t, Config{Path: filepath.Join(t.TempDir(), "keel.db")})
+	mustExec(t, db.Writer(), "CREATE TABLE widget (id INTEGER PRIMARY KEY)")
+	migrations := fstest.MapFS{
+		"0001_widget.sql": {Data: []byte("CREATE TABLE widget (id INTEGER PRIMARY KEY)")},
+	}
+	err := Migrate(ctx, db, "keel", migrations)
+	if !errors.Is(err, ErrMigration) {
+		t.Fatalf("unrecorded conflict error = %v, want ErrMigration", err)
+	}
+}
+
 func TestBackupClassifiesDestinationError(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
