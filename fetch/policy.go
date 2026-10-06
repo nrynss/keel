@@ -26,9 +26,7 @@ var (
 // transitionRanges are the deprecated IPv6 transition prefixes whose
 // addresses carry an IPv4 destination inside them. The address that leaves
 // the box is IPv6, while the place it really lands is an IPv4 this policy
-// never judged, so both ranges are refused. The NAT64 prefix is absent on
-// purpose, because a resolver on an IPv6-only network synthesizes it for
-// ordinary public origins, and refusing it would refuse those origins too.
+// never judged, so both ranges are refused outright.
 var transitionRanges = []struct {
 	prefix [16]byte
 	bytes  int
@@ -39,31 +37,76 @@ var transitionRanges = []struct {
 
 // DefaultClassifier refuses every address that is not clearly public. It
 // refuses loopback, private, link-local and unique-local ranges, the carrier
-// NAT range, multicast, and the unspecified and broadcast addresses. It
-// refuses the cloud metadata addresses and the deprecated transition ranges
-// that carry an IPv4 destination inside an IPv6 address. It allows every
-// other address. A deployment that knows its own network's map wraps this
-// one rather than replacing it.
+// NAT range, multicast, the unspecified and broadcast addresses, and the
+// whole self range of zero addresses. It refuses the cloud metadata
+// addresses and the deprecated transition ranges that carry an IPv4
+// destination inside an IPv6 address. A NAT64 address carries its IPv4
+// destination in its last four bytes, judged by the IPv4 rules, so a
+// synthesised public origin still passes. It allows every other address. A
+// deployment that knows its own network's map wraps this one rather than
+// replacing it.
 func DefaultClassifier(ip net.IP) bool {
 	if ip == nil {
 		return false
 	}
+	if v4 := ip.To4(); v4 != nil {
+		// A plain or IPv4-mapped address is judged as itself.
+		return !ipv4Refused(v4)
+	}
+	return ipv6Allowed(ip)
+}
+
+// ipv4Refused reports whether one IPv4 address falls in a range the policy
+// refuses. It takes the address in IPv4 form, plain, mapped, or read out of
+// an embedding, and judges it by every IPv4 rule. An address that does not
+// reduce to IPv4 form is refused.
+func ipv4Refused(v4 net.IP) bool {
+	v4 = v4.To4()
+	if v4 == nil {
+		return true
+	}
+	if v4[0] == 0 {
+		// 0.0.0.0/8, the self range. Nothing to dial.
+		return true
+	}
+	if v4.IsLoopback() || v4.IsPrivate() || v4.IsLinkLocalUnicast() || v4.IsMulticast() {
+		return true
+	}
+	if v4.Equal(net.IPv4bcast) || v4.Equal(metadataIPv4) {
+		return true
+	}
+	// 100.64.0.0/10, the carrier NAT range. The mask keeps the check on
+	// the top two bits of the second octet, which span 64 to 127.
+	return v4[0] == 100 && v4[1]&0xc0 == 64
+}
+
+// ipv6Allowed judges a native IPv6 address by the IPv6 rules. An address
+// under a transition prefix is refused outright. An address under a NAT64
+// prefix is judged on the IPv4 address it carries, because a gateway
+// translates that address on the way out.
+func ipv6Allowed(ip net.IP) bool {
 	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
 		ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() {
 		return false
 	}
-	if ip.Equal(net.IPv4bcast) || ip.Equal(metadataIPv4) || ip.Equal(metadataIPv6) {
+	if ip.Equal(metadataIPv6) {
 		return false
 	}
-	if v4 := ip.To4(); v4 != nil {
-		// 100.64.0.0/10, the carrier NAT range. The mask keeps the check
-		// on the top two bits of the second octet, which span 64 to 127.
-		if v4[0] == 100 && v4[1]&0xc0 == 64 {
-			return false
-		}
-		return true
+	if inTransition(ip) {
+		return false
 	}
-	return !inTransition(ip)
+	if nat64(ip) {
+		return !ipv4Refused(net.IPv4(ip[12], ip[13], ip[14], ip[15]))
+	}
+	return true
+}
+
+// nat64 reports whether ip carries an IPv4 address in its last four bytes
+// under one of the NAT64 prefixes. Both allocated prefixes start with the
+// same four bytes, and no global unicast address does, so the marker alone
+// decides the question.
+func nat64(ip net.IP) bool {
+	return len(ip) == 16 && ip[0] == 0x00 && ip[1] == 0x64 && ip[2] == 0xff && ip[3] == 0x9b
 }
 
 // inTransition reports whether ip falls in one of the deprecated transition

@@ -79,6 +79,11 @@ func TestDefaultClassifierRefusesInternalRanges(t *testing.T) {
 		{"six to four hides loopback", "2002:7f00:1::"},
 		{"six to four hides metadata", "2002:a9fe:a9fe::"},
 		{"ipv4 compatible hides loopback", "::127.0.0.1"},
+		{"nat64 hides loopback", "64:ff9b::7f00:1"},
+		{"nat64 hides metadata", "64:ff9b::a9fe:a9fe"},
+		{"nat64 hides private ten", "64:ff9b::a00:1"},
+		{"nat64 hides private 192", "64:ff9b::c0a8:101"},
+		{"local use nat64 hides loopback", "64:ff9b:1::7f00:1"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -101,6 +106,7 @@ func TestDefaultClassifierAllowsPublicAddresses(t *testing.T) {
 		{"above carrier nat", "100.128.0.1"},
 		{"below carrier nat", "100.63.255.255"},
 		{"nat64 public origin", "64:ff9b::5db8:d822"},
+		{"local use nat64 public origin", "64:ff9b:1::5db8:d822"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
