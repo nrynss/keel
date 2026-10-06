@@ -37,9 +37,10 @@ var transitionRanges = []struct {
 
 // DefaultClassifier refuses every address that is not clearly public. It
 // refuses loopback, private, link-local and unique-local ranges, the carrier
-// NAT range, multicast, the unspecified and broadcast addresses, and the
-// whole self range of zero addresses. It refuses the cloud metadata
-// addresses and the deprecated transition ranges that carry an IPv4
+// NAT range, the IETF protocol assignments range, and the benchmarking
+// range. It refuses multicast, the reserved range with the broadcast address
+// in it, and the whole self range of zero addresses. It refuses the cloud
+// metadata addresses and the deprecated transition ranges that carry an IPv4
 // destination inside an IPv6 address. A NAT64 address carries its IPv4
 // destination in its last four bytes, judged by the IPv4 rules, so a
 // synthesised public origin still passes. It allows every other address. A
@@ -72,12 +73,26 @@ func ipv4Refused(v4 net.IP) bool {
 	if v4.IsLoopback() || v4.IsPrivate() || v4.IsLinkLocalUnicast() || v4.IsMulticast() {
 		return true
 	}
-	if v4.Equal(net.IPv4bcast) || v4.Equal(metadataIPv4) {
+	if v4.Equal(metadataIPv4) {
 		return true
 	}
 	// 100.64.0.0/10, the carrier NAT range. The mask keeps the check on
 	// the top two bits of the second octet, which span 64 to 127.
-	return v4[0] == 100 && v4[1]&0xc0 == 64
+	if v4[0] == 100 && v4[1]&0xc0 == 64 {
+		return true
+	}
+	// 192.0.0.0/24, the IETF protocol assignments range.
+	if v4[0] == 192 && v4[1] == 0 && v4[2] == 0 {
+		return true
+	}
+	// 198.18.0.0/15, the benchmarking range. The mask spans both values
+	// the second octet takes in the range, 18 and 19.
+	if v4[0] == 198 && v4[1]&0xfe == 18 {
+		return true
+	}
+	// 240.0.0.0/4, the reserved range, the broadcast address at its end
+	// included.
+	return v4[0]&0xf0 == 240
 }
 
 // ipv6Allowed judges a native IPv6 address by the IPv6 rules. An address

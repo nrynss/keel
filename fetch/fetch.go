@@ -265,9 +265,13 @@ func mapClientError(err error) error {
 }
 
 // bodyReadError maps a failure that happened while the body was arriving. A
-// deadline maps to the timeout code, everything else to the unreachable
-// code.
+// fetch the caller cancelled returns the context's own error, the same
+// promise the client mapping keeps. A deadline maps to the timeout code, and
+// everything else to the unreachable code.
 func bodyReadError(err error) error {
+	if errors.Is(err, context.Canceled) {
+		return err
+	}
 	if isDeadline(err) {
 		return failure(CodeTimeout, "the fetch outlived its time limit", err)
 	}
