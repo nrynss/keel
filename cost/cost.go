@@ -6,8 +6,10 @@
 // a total that would mix denominations. A ChargeSink is where a settled
 // charge lands, and the Ledger is the in-memory one. A Budget bounds the
 // spend of a sequence of calls, and a KeyedBudget gives each of several
-// owners a share of one pool under a global ceiling. Rate cards stay in each
-// application.
+// owners a share of one pool under a global ceiling. A Quote names the
+// price of one action a person confirms, and a QuoteRefusal carries the
+// stable wire code and the fresh quote a refusal hands back. Rate cards
+// stay in each application.
 package cost
 
 import (

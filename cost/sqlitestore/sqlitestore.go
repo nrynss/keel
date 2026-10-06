@@ -56,6 +56,19 @@
 // reservations beside the ceiling, and the smaller bound decides. A pool
 // with no grant draws on its ceiling alone, exactly as before.
 //
+// Quote states a price for one action, and Run carries it out once on
+// confirmation. Quote holds no budget. Run claims the quote and takes the
+// owner's reservation in one transaction, so a crash or a retry between
+// claim and work can never charge twice. The claim lives exactly as long
+// as a reservation hold, so a runner that vanishes stops holding the
+// quote when the hold lapses. A finished run records its outcome on the
+// quote row, so every later Run of the same id returns that outcome and
+// charges nothing. Run re-checks the price against the configured Reprice
+// callback before it claims, and refuses with a fresh quote when the
+// price moved past the tolerance. An expired quote refuses the same way.
+// Expired quotes are swept beside the expired reservations, at open and
+// inside every write a quote drives.
+//
 // This package is one of the few allowed to import the SQLite driver. The
 // ledger arithmetic itself stays in the cost package, and every total is
 // summed through a cost.Ledger so the overflow rule never drifts. The Store
@@ -71,6 +84,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/nrynss/keel/cost"
@@ -134,8 +148,24 @@ type Config struct {
 	Denomination cost.Denomination
 
 	// ReservationTTL is how long a reservation holds budget before the
-	// store treats it as expired. Zero means ten minutes.
+	// store treats it as expired. Zero means ten minutes. A quote claim
+	// lives exactly as long as one of these holds, so a runner that
+	// vanishes stops holding its quote when the TTL passes.
 	ReservationTTL time.Duration
+
+	// Reprice reports the current price of one quoted action for owner.
+	// Run calls it before it claims a live quote, so a price that moved
+	// re-confirms before any spend. The price it reports counts minor
+	// units of the store's denomination, and a negative one is refused.
+	// Nil means the quoted price never moves and no check runs.
+	Reprice func(ctx context.Context, owner string) (cost.Price, error)
+
+	// QuoteTolerance is how far the price Reprice reports may move from
+	// the quoted price before Run refuses with a fresh quote. It counts
+	// minor units of the store's denomination, in both directions. Zero
+	// requires an exact match when Reprice is set. A negative tolerance
+	// is refused at open.
+	QuoteTolerance cost.Price
 
 	// Now supplies the clock that stamps charges and judges expiry. Nil
 	// means time.Now.
@@ -155,6 +185,15 @@ type Store struct {
 	reservationTTL time.Duration
 	period         cost.Period
 	denom          cost.Denomination
+	quoteTolerance cost.Price
+	reprice        func(ctx context.Context, owner string) (cost.Price, error)
+
+	// flightMu guards flights, the in-process single-flight table for
+	// quote runs. One quote runs one work body at a time in this
+	// process, and a second caller waits on the leader's outcome. The
+	// durable claim covers every other process.
+	flightMu sync.Mutex
+	flights  map[string]*quoteFlight
 }
 
 // A Store satisfies cost.ChargeSink, so a meter can take it as the sink that
@@ -206,6 +245,9 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 	if err := sqlite.Migrate(ctx, cfg.DB, namespace, schema); err != nil {
 		return nil, fmt.Errorf("sqlitestore: open: %w", err)
 	}
+	if cfg.QuoteTolerance < 0 {
+		return nil, fmt.Errorf("sqlitestore: open: quote tolerance %d: %w", cfg.QuoteTolerance, ErrInvalid)
+	}
 	now := cfg.Now
 	if now == nil {
 		now = time.Now
@@ -218,7 +260,17 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 	if ttl <= 0 {
 		ttl = defaultReservationTTL
 	}
-	store := &Store{db: cfg.DB, now: now, log: logger, reservationTTL: ttl, period: cfg.Period, denom: cfg.Denomination}
+	store := &Store{
+		db:             cfg.DB,
+		now:            now,
+		log:            logger,
+		reservationTTL: ttl,
+		period:         cfg.Period,
+		denom:          cfg.Denomination,
+		quoteTolerance: cfg.QuoteTolerance,
+		reprice:        cfg.Reprice,
+		flights:        make(map[string]*quoteFlight),
+	}
 	if err := store.checkDenomination(ctx); err != nil {
 		return nil, fmt.Errorf("sqlitestore: open: %w", err)
 	}
@@ -229,7 +281,11 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("sqlitestore: open: %w", err)
 	}
-	logger.InfoContext(ctx, "sqlitestore: opened", "limit", int64(cfg.Limit), "denomination", cfg.Denomination.Name, "expired_reservations", purged)
+	swept, err := store.sweepQuotesAtOpen(ctx, now())
+	if err != nil {
+		return nil, fmt.Errorf("sqlitestore: open: %w", err)
+	}
+	logger.InfoContext(ctx, "sqlitestore: opened", "limit", int64(cfg.Limit), "denomination", cfg.Denomination.Name, "expired_reservations", purged, "expired_quotes", swept)
 	return store, nil
 }
 

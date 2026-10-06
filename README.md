@@ -229,6 +229,23 @@ one-method sink itself. A charge the sink cannot record is the one failure past 
 store backs is never shown as booked. `KeyedBudget.ForgetOwner`
 removes an owner's budget, reservations and settle history after its live reservations finish.
 
+`cost/sqlitestore` also quotes a paid action, then runs it once on confirm. `Store.Quote`
+returns a quote id and the price in the account's denomination, and holds no budget. The
+handler shows the price, and `Store.Run` carries the quote out on confirmation. Run claims
+the quote and takes the owner's reservation in one transaction, so the claim is durable
+before the work runs. A crash or a retry between claim and work can never charge twice. A
+second Run of the same id returns the first outcome and charges nothing. A concurrent Run
+in the same process waits for the one that claimed and shares its outcome, and a Run from
+another process is refused with the `quote_pending` code. The settled charge lands in the
+ledger under the quote's id, so a report can split quoted spend by action. Before it claims,
+Run re-checks the price through the configured `Reprice` callback. A move past
+`QuoteTolerance` refuses with the `quote_price_moved` code and carries a fresh quote at the
+current price, so the client re-confirms before anything spends. An expired quote refuses
+with `quote_expired` and a fresh quote the same way. Every refusal is a `cost.QuoteRefusal`
+whose `Code` is one of the stable `cost.CodeQuote` constants, ready for the `wire` envelope.
+Expired quotes are swept at open and inside every write a quote drives, so no scheduler is
+needed.
+
 ### Retry a paid call that a wait can clear
 
 ```go

@@ -588,8 +588,8 @@ func TestOpenMigratesAStoreFromThePreviousSchema(t *testing.T) {
 	if err := store.Add(ctx, cost.Charge{Kind: "gen", Units: 1, UnitPrice: 5, Ref: "job-2"}); err != nil {
 		t.Fatalf("add a charge after the upgrade: %v", err)
 	}
-	if n := freshCount(t, path, "cost_schema_migrations"); n != 4 {
-		t.Fatalf("migration ledger rows = %d, want 4", n)
+	if n := freshCount(t, path, "cost_schema_migrations"); n != 5 {
+		t.Fatalf("migration ledger rows = %d, want 5", n)
 	}
 	if n := freshCount(t, path, "cost_grant"); n != 0 {
 		t.Fatalf("grant rows = %d, want an empty grant table", n)
