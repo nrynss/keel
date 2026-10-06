@@ -51,6 +51,7 @@ else is pure Go, and `CGO_ENABLED=0` builds the whole module.
 | `lease` | Paid sessions with a time cap, a quota, a caller supplied kill switch, settle at close, provider reconciliation, and reclaim of abandoned rows |
 | `config` | TOML settings, and secret references that resolve from the environment, a file, a directory or a command, never holding a value in the file |
 | `config/source` | The five built-in secret sources that a `config.Registry` carries |
+| `fetch` | A user-supplied link fetched under an address policy enforced at dial time, with scheme, port, redirect, size, time and content type caps, and preview metadata read from the page |
 
 The stores that need SQLite live one directory down, in `job/sqlitestore`,
 `mediastore/sqlitestore`, `cost/sqlitestore`, `flag/sqlitestore` and
@@ -431,6 +432,42 @@ explicit flags. `Reveal` returns the value for one secret. `read = "at_boot"` re
 load, and `read = "at_use"` resolves on each call so a rotated key takes effect with no restart.
 The plan prints one line per key with its source and locator. No line carries a value. A secrets
 file that group or other can read stops the load and names its path and mode.
+
+### Fetch a link a user supplied
+
+```go
+resp, err := fetch.Get(ctx, link, fetch.Config{ContentTypes: []string{"text/html"}})
+if err != nil {
+	var fetchErr *fetch.Error
+	if errors.As(err, &fetchErr) {
+		wire.WriteError(w, http.StatusBadRequest, fetchErr.Code, fetchErr.Message, nil)
+	}
+	return err
+}
+title, image := fetch.Meta(resp)
+```
+
+`fetch.Get` judges a link on the address it dials, not on the name it carries. The dialler
+resolves the name, and the control hook refuses loopback, private, link-local and unique-local
+ranges, the carrier NAT range, multicast, and the cloud metadata addresses before a packet
+leaves. A link whose name looks public but resolves inside is refused, which is what a DNS
+rebinding attack cannot get past. Every redirect hop dials again, so every hop is judged again.
+
+Schemes are https, or http beside it when `Config.AllowHTTP` says so. Ports are 80 and 443
+unless `Config.Ports` names others. `Config.MaxRedirects` caps the hops at 5. `Config.MaxBytes`
+caps the body at 10 MiB and refuses the whole fetch rather than truncating it. `Config.Timeout`
+and `Config.HeaderTimeout` cap the total time and one hop's wait for headers.
+`Config.ContentTypes` is an allowlist checked against the Content-Type header and against the
+sniffed bytes, so a page that lies about its type is refused.
+
+Every refusal carries a stable code on `*fetch.Error`, such as `fetch_blocked_address`,
+`fetch_too_large` and `fetch_bad_type`, ready to be copied into the `wire` envelope.
+`fetch.Meta` reads the open graph title and image, falling back to the twitter card image. A
+relative image address resolves against the page's final URL, so the image is fetched back
+through `Get` and meets the same policy. `Config.Classifier` replaces the address policy where a
+caller has judged its own addresses, which is also how tests reach a server on loopback. The
+package keeps no cookies and retries nothing, so a caller who wants a wait between attempts wraps
+`Get` in `throttle`.
 
 ### One error shape, everywhere
 
