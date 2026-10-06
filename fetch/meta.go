@@ -17,7 +17,7 @@ import (
 // so the caller can fetch the image back through Get and it meets the same
 // address policy. An image address that does not resolve is skipped, and a
 // page that declares nothing returns empty strings.
-func Meta(resp Response) (title, image string) {
+func Meta(resp Response) (string, string) {
 	base, err := url.Parse(resp.URL)
 	if err != nil {
 		return "", ""
@@ -54,7 +54,7 @@ func Meta(resp Response) (title, image string) {
 			}
 		}
 	}
-	image = resolve(base, ogImage)
+	image := resolve(base, ogImage)
 	if image == "" {
 		image = resolve(base, twImage)
 	}
