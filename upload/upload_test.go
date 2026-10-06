@@ -438,12 +438,15 @@ func TestUploadReportsEveryGapInAnUndeclaredUpload(t *testing.T) {
 }
 
 // TestUploadStateRenderCostStaysProportionalToStoredChunks pins that
-// rendering an upload's state costs time in proportion to the chunks it
-// reports rather than to their square. A render that rescanned the whole
-// index for every stored index would make a fourfold chunk count about
-// sixteen times the work, so the fourfold count must stay under eightfold.
+// rendering an upload's state examines indices in proportion to the chunks
+// it reports rather than to their square. The work is counted through the
+// render's visit hook rather than timed, so a loaded workstation cannot
+// trip the bound. A render that rescanned the whole index for every stored
+// index would make a fourfold chunk count about sixteen times the work.
+// The fourfold count must stay under eightfold, which leaves an honest
+// render room for one extra pass and keeps the square two times over.
 func TestUploadStateRenderCostStaysProportionalToStoredChunks(t *testing.T) {
-	render := func(n int) float64 {
+	visits := func(n, gap int) int {
 		up := &upload{
 			id:          "id",
 			owner:       "owner",
@@ -453,18 +456,22 @@ func TestUploadStateRenderCostStaysProportionalToStoredChunks(t *testing.T) {
 			chunks:      make(map[int64]chunk, n),
 		}
 		for i := 0; i < n; i++ {
-			up.chunks[int64(i)] = chunk{sizeBytes: 1}
-		}
-		result := testing.Benchmark(func(b *testing.B) {
-			for i := 0; i < b.N; i++ {
-				_ = up.snapshot()
+			if i != gap {
+				up.chunks[int64(i)] = chunk{sizeBytes: 1}
 			}
-		})
-		return float64(result.NsPerOp())
+		}
+		count := 0
+		up.onVisit = func() { count++ }
+		up.snapshot()
+		return count
 	}
 	const small, large = 1000, 4000
-	smallCost, largeCost := render(small), render(large)
-	if largeCost > 8*smallCost {
-		t.Fatalf("rendering %d stored chunks cost %.0f ns/op and %d cost %.0f ns/op, want the fourfold count under eightfold the cost", small, smallCost, large, largeCost)
+	wholeSmall, wholeLarge := visits(small, -1), visits(large, -1)
+	if wholeLarge > 8*wholeSmall {
+		t.Fatalf("a contiguous run of %d stored chunks examined indices %d times and %d examined %d times, want the fourfold count under eightfold the visits", small, wholeSmall, large, wholeLarge)
+	}
+	gapSmall, gapLarge := visits(small, small/2), visits(large, large/2)
+	if gapLarge > 8*gapSmall {
+		t.Fatalf("a span with one gap over %d stored chunks examined indices %d times and %d examined %d times, want the fourfold count under eightfold the visits", small, gapSmall, large, gapLarge)
 	}
 }
