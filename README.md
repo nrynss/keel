@@ -970,11 +970,11 @@ route of its own, after its own authorizer has passed. Nothing in Keel issues on
 store handler streams through the backend and the resumable upload handler stays behind its own
 checks, so a deployment that never calls the issuer never has the path.
 
-`PresignPut` takes the blob id, the content type, the exact size the client declared, and an
-optional digest of the client's bytes. The declared size and type sign as request headers, so the
+`PresignPut` takes the blob id, the content type, the exact size the client declared, and the
+digest of the client's bytes. The declared size and type sign as request headers, so the
 bucket itself refuses a PUT of any other length or shape, and a route applies its own byte cap to
-the declared size before it calls. The digest, when given, signs as the dialect's checksum
-header, so a service that validates checksums refuses bytes of any other shape before they land:
+the declared size before it calls. The digest signs as the dialect's checksum
+header, so the service refuses bytes of any other shape before they land:
 
 ```go
 put, err := backend.PresignPut(ctx, s3.PresignPutInput{
@@ -988,8 +988,10 @@ put, err := backend.PresignPut(ctx, s3.PresignPutInput{
 ```
 
 The client sends the returned headers verbatim and the URL carries the signature, so the app
-process never touches the bytes. Completion runs through `Store.Adopt`, which never trusts the
-bucket's own accounting: it streams the stored object once, checks the size and the digest
+process never touches the bytes. The pinned digest holds for the URL's whole life, so a URL that
+outlives its completion can put the verified bytes again and no others. The bucket refuses a
+same-size body of any other shape as a bad digest, so the store never serves bytes completion did
+not verify. Completion runs through `Store.Adopt`, which never trusts the bucket's own accounting: it streams the stored object once, checks the size and the digest
 against what the upload declared, and writes the metadata row only after both pass. A completion
 that arrives before the bytes refuses, a completion that fails a check refuses and records
 nothing, and an id the index already holds refuses, so nothing is reachable until completion

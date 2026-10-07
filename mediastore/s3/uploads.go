@@ -95,23 +95,26 @@ type PresignPutInput struct {
 	// to this declared size before it calls, because a presigned URL
 	// skips every check the proxied path passes through.
 	SizeBytes int64
-	// SHA256, when set, is the digest of the client's bytes as 64 hex
-	// characters. It signs as the dialect's checksum header, so a
-	// service that validates checksums refuses bytes of any other
-	// shape before they land. A service that ignores the header is
-	// caught at completion, which never trusts the bucket's own
-	// accounting.
+	// SHA256 is the digest of the client's bytes as 64 hex characters.
+	// It signs as the dialect's checksum header, so the service refuses
+	// bytes of any other shape before they land, and a URL that
+	// outlives its completion can put the verified bytes again but
+	// never any others. A service that ignores the header is caught at
+	// completion, which never trusts the bucket's own accounting.
 	SHA256 string
 }
 
 // PresignPut returns a URL the client puts its bytes through, the
 // headers the request must carry, and the moment the service closes it.
-// The declared size and the content type sign as headers, so the bucket
-// itself refuses anything else, and the declared digest rides the
-// checksum header when it is given. Presigning talks to no service, so
-// it works against a dead one and the URL reads as a missing object
-// until the bytes arrive. The secret signs the URL and appears in no
-// part of it.
+// The declared size and the content type sign as headers, and the
+// declared digest signs as the dialect's checksum header, so the bucket
+// itself refuses a PUT of any other length, type or shape for as long
+// as the URL lives. A completion that verified the object therefore
+// leaves the URL nothing to substitute: the store can only ever serve
+// bytes that hash to the digest. Presigning talks to no service, so it
+// works against a dead one and the URL reads as a missing object until
+// the bytes arrive. The secret signs the URL and appears in no part of
+// it.
 func (b *Backend) PresignPut(ctx context.Context, in PresignPutInput) (Presigned, error) {
 	if !validKey(in.BlobID) {
 		return Presigned{}, notFound(in.BlobID, errors.New("malformed id"))
@@ -121,6 +124,12 @@ func (b *Backend) PresignPut(ctx context.Context, in PresignPutInput) (Presigned
 	}
 	if in.SizeBytes < 0 {
 		return Presigned{}, fmt.Errorf("%w: SizeBytes must not be negative", ErrInvalid)
+	}
+	if in.SHA256 == "" {
+		return Presigned{}, fmt.Errorf("%w: SHA256 is required", ErrInvalid)
+	}
+	if !validDigest(in.SHA256) {
+		return Presigned{}, fmt.Errorf("%w: SHA256 must be 64 hex characters", ErrInvalid)
 	}
 	put := &s3sdk.PutObjectInput{
 		Bucket:        aws.String(b.bucket),
@@ -132,14 +141,9 @@ func (b *Backend) PresignPut(ctx context.Context, in PresignPutInput) (Presigned
 		"Content-Type":   in.ContentType,
 		"Content-Length": strconv.FormatInt(in.SizeBytes, 10),
 	}
-	if in.SHA256 != "" {
-		if !validDigest(in.SHA256) {
-			return Presigned{}, fmt.Errorf("%w: SHA256 must be 64 hex characters", ErrInvalid)
-		}
-		sum := checksumHeader(in.SHA256)
-		put.ChecksumSHA256 = aws.String(sum)
-		headers["x-amz-checksum-sha256"] = sum
-	}
+	sum := checksumHeader(in.SHA256)
+	put.ChecksumSHA256 = aws.String(sum)
+	headers["x-amz-checksum-sha256"] = sum
 	req, err := b.presign.PresignPutObject(ctx, put, s3sdk.WithPresignExpires(b.expiry))
 	if err != nil {
 		return Presigned{}, fmt.Errorf("s3: presign put %s: %w", in.BlobID, err)

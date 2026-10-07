@@ -52,9 +52,9 @@ func statusOf(resp *http.Response, err error) (int, error) {
 }
 
 // TestPresignedPutRoundTripThroughCompletion pins the whole single PUT
-// flow. The issuer returns a URL bound to the declared size and type,
-// the bucket accepts exactly those bytes, and completion verifies the
-// stored object and makes it servable.
+// flow. The issuer returns a URL bound to the declared size, type and
+// digest, the bucket accepts exactly those bytes, and completion
+// verifies the stored object and makes it servable.
 func TestPresignedPutRoundTripThroughCompletion(t *testing.T) {
 	f, endpoint, client := newFakeS3(t, func() time.Time { return base })
 	b := openBackend(t, endpoint, client)
@@ -67,6 +67,7 @@ func TestPresignedPutRoundTripThroughCompletion(t *testing.T) {
 		BlobID:      blobID,
 		ContentType: "video/mp4",
 		SizeBytes:   int64(len(data)),
+		SHA256:      digestHex(data),
 	})
 	if err != nil {
 		t.Fatalf("presign put: %v", err)
@@ -144,6 +145,7 @@ func TestPresignedPutRefusesWrongSizeOrType(t *testing.T) {
 		BlobID:      blobID,
 		ContentType: "image/png",
 		SizeBytes:   int64(len(data)),
+		SHA256:      digestHex(data),
 	})
 	if err != nil {
 		t.Fatalf("presign put: %v", err)
@@ -244,6 +246,70 @@ func TestPresignedPutPinnedDigestIsEnforcedAtTheBucket(t *testing.T) {
 	}
 }
 
+// TestCompletedPutURLCannotSubstituteBytes pins the closure the pinned
+// digest gives a completed upload. The URL lives until its expiry, but
+// the checksum it signs leaves it nothing to substitute: a same-size
+// body of any other shape is refused at the bucket, and the bytes the
+// store serves keep matching the row completion wrote.
+func TestCompletedPutURLCannotSubstituteBytes(t *testing.T) {
+	f, endpoint, client := newFakeS3(t, func() time.Time { return base })
+	b := openBackend(t, endpoint, client)
+	s := openStore(t, b, newMemIndex())
+	data := deterministic(1024)
+	other := bytes.Repeat([]byte{0x42}, len(data))
+	blobID := strings.Repeat("f", 32)
+
+	signed, err := b.PresignPut(t.Context(), PresignPutInput{
+		BlobID:      blobID,
+		ContentType: "image/png",
+		SizeBytes:   int64(len(data)),
+		SHA256:      digestHex(data),
+	})
+	if err != nil {
+		t.Fatalf("presign put: %v", err)
+	}
+	code, err := statusOf(sendPut(client, signed, data, "", ""))
+	if err != nil || code != http.StatusOK {
+		t.Fatalf("client put = %d, %v, want 200", code, err)
+	}
+	if err := s.Adopt(t.Context(), blobID, mediastore.Adoption{
+		SizeBytes: int64(len(data)),
+		SHA256:    digestHex(data),
+	}, mediastore.Put{ContentType: "image/png", Visibility: mediastore.Public}); err != nil {
+		t.Fatalf("adopt: %v", err)
+	}
+
+	// A same-size substitute is refused before a byte is stored.
+	code, err = statusOf(sendPut(client, signed, other, "", ""))
+	if err != nil {
+		t.Fatalf("substitute put: %v", err)
+	}
+	if code != http.StatusBadRequest {
+		t.Fatalf("substitute put = %d, want 400", code)
+	}
+
+	// The verified bytes themselves may land again, and change nothing.
+	code, err = statusOf(sendPut(client, signed, data, "", ""))
+	if err != nil || code != http.StatusOK {
+		t.Fatalf("repeat put = %d, %v, want 200", code, err)
+	}
+	if got := f.bodyOf(blobID); !bytes.Equal(got, data) {
+		t.Fatalf("the bucket holds %d bytes, want the %d completion verified", len(got), len(data))
+	}
+	r, row, err := s.Open(t.Context(), blobID)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	got, readErr := io.ReadAll(r)
+	r.Close()
+	if readErr != nil {
+		t.Fatalf("read: %v", readErr)
+	}
+	if !bytes.Equal(got, data) || row.SizeBytes != int64(len(data)) {
+		t.Fatalf("the store serves bytes completion never verified")
+	}
+}
+
 // TestFailedCompletionLeavesNothingReachable pins the verification at
 // completion. A completion whose size or digest disagrees with the
 // stored object refuses, and no row lands either way, so the store
@@ -260,6 +326,7 @@ func TestFailedCompletionLeavesNothingReachable(t *testing.T) {
 		BlobID:      blobID,
 		ContentType: "image/png",
 		SizeBytes:   int64(len(data)),
+		SHA256:      digestHex(data),
 	})
 	if err != nil {
 		t.Fatalf("presign put: %v", err)
@@ -302,6 +369,9 @@ func TestPresignedPutValidatesInput(t *testing.T) {
 	}
 	if _, err := b.PresignPut(t.Context(), PresignPutInput{BlobID: good, ContentType: "image/png", SizeBytes: -1}); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("issuer with a negative size = %v, want ErrInvalid", err)
+	}
+	if _, err := b.PresignPut(t.Context(), PresignPutInput{BlobID: good, ContentType: "image/png", SizeBytes: 1}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("issuer with no digest = %v, want ErrInvalid", err)
 	}
 	if _, err := b.PresignPut(t.Context(), PresignPutInput{BlobID: good, ContentType: "image/png", SizeBytes: 1, SHA256: "zz"}); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("issuer with a malformed digest = %v, want ErrInvalid", err)
@@ -543,6 +613,7 @@ func TestDirectUploadFaultsNeverSpellTheCredential(t *testing.T) {
 		BlobID:      blobID,
 		ContentType: "image/png",
 		SizeBytes:   8,
+		SHA256:      digestHex(deterministic(8)),
 	})
 	if err != nil {
 		t.Fatalf("presign over a dead endpoint = %v, want a local success", err)
