@@ -35,7 +35,9 @@
 // attempt started has no provider error to carry and returns the context
 // error alone.
 //
-// A Gate holds the concurrency cap only while a call runs. The backoff waits
+// A Gate holds the concurrency cap while a call runs. A paced call also holds
+// it while its first attempt queues for a rate slot. A slot handed out before
+// the cap freed would space the queue and not the starts. The backoff waits
 // outside the slot, so a retry does not keep a place another call could use.
 package throttle
 
@@ -230,15 +232,15 @@ func New(limit int) *Gate {
 // Retry is Retry with this gate's concurrency cap held only for the duration
 // of each call. A nil gate imposes no cap.
 //
-// When cfg paces the call, the pacer is waited on once, before the first
-// attempt and outside the concurrency cap. A call therefore never holds a
-// place another call could use while it queues for a rate slot. The retries
-// inside the loop wait on their own backoff and hint, which is the backstop
-// for refusals the pacing could not see coming.
+// When cfg paces the call, the gate is taken first and the rate slot is
+// waited for inside it, once, before the first attempt. A slot is then handed
+// out at the moment the caller can really start, instead of arriving while
+// the caller still sits in the gate queue and spacing nothing. The price is
+// a held place, so a first attempt keeps its concurrency place while it
+// queues. The retries inside the loop wait on their own backoff and hint,
+// which is the backstop for refusals the pacing could not see coming.
 func (g *Gate) Retry(ctx context.Context, cfg Config, retryable Retryable, call Call) error {
-	if err := pacerFor(cfg).Wait(ctx); err != nil {
-		return err
-	}
+	pacer := pacerFor(cfg)
 	attempts := cfg.attempts()
 	backoff := cfg.backoff()
 	ceiling := cfg.max()
@@ -251,12 +253,22 @@ func (g *Gate) Retry(ctx context.Context, cfg Config, retryable Retryable, call 
 	}
 	var err error
 	var waited time.Duration
+	var limitedTries, transientTries int
 	for attempt := 1; ; attempt++ {
 		if acquireErr := g.acquire(ctx); acquireErr != nil {
 			if err != nil {
 				return interrupted(acquireErr, err)
 			}
 			return acquireErr
+		}
+		if attempt == 1 {
+			// The rate slot is taken inside the cap, so it is handed
+			// out when the caller can really start. A first attempt
+			// whose context ends in the queue gives the place back.
+			if perr := pacer.Wait(ctx); perr != nil {
+				g.release()
+				return perr
+			}
 		}
 		err = call()
 		g.release()
@@ -269,12 +281,16 @@ func (g *Gate) Retry(ctx context.Context, cfg Config, retryable Retryable, call 
 		if cerr := ctx.Err(); cerr != nil {
 			return interrupted(cerr, err)
 		}
-		limit := attempts
 		if cfg.Transient != nil && cfg.Transient(err) {
-			limit = cfg.transientAttempts()
-		}
-		if attempt >= limit {
-			return err
+			transientTries++
+			if transientTries >= cfg.transientAttempts() {
+				return err
+			}
+		} else {
+			limitedTries++
+			if limitedTries >= attempts {
+				return err
+			}
 		}
 		waitFor := jitterAt(draw, backoff)
 		if d, ok := hintWait(hint, draw, err, ceiling); ok {
