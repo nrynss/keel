@@ -151,6 +151,8 @@ func TestCreateValidatesItsSession(t *testing.T) {
 		{"no content type", func(s sqlitestore.Session) sqlitestore.Session { s.ContentType = ""; return s }},
 		{"negative size", func(s sqlitestore.Session) sqlitestore.Session { s.SizeBytes = -1; return s }},
 		{"no digest", func(s sqlitestore.Session) sqlitestore.Session { s.SHA256 = ""; return s }},
+		{"digest not hex", func(s sqlitestore.Session) sqlitestore.Session { s.SHA256 = "not-a-digest"; return s }},
+		{"digest short", func(s sqlitestore.Session) sqlitestore.Session { s.SHA256 = strings.Repeat("a", 63); return s }},
 		{"empty part", func(s sqlitestore.Session) sqlitestore.Session { s.PartSize = 0; return s }},
 		{"no parts", func(s sqlitestore.Session) sqlitestore.Session { s.PartCount = 0; return s }},
 		{"past the part bound", func(s sqlitestore.Session) sqlitestore.Session { s.PartCount = s3.MaxParts + 1; return s }},

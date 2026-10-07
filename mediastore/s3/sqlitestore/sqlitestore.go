@@ -30,12 +30,15 @@ package sqlitestore
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"embed"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/nrynss/keel/mediastore"
@@ -182,6 +185,9 @@ func (s *Store) Create(ctx context.Context, sess Session) error {
 	if sess.SHA256 == "" {
 		return fmt.Errorf("sqlitestore: create %q: %w: the digest is required", sess.BlobID, ErrInvalid)
 	}
+	if !validDigest(sess.SHA256) {
+		return fmt.Errorf("sqlitestore: create %q: %w: the digest is not 64 hex characters", sess.BlobID, ErrInvalid)
+	}
 	if sess.PartSize < 1 {
 		return fmt.Errorf("sqlitestore: create %q: %w: a part carries at least one byte", sess.BlobID, ErrInvalid)
 	}
@@ -311,6 +317,17 @@ func (s *Store) Sweep(ctx context.Context, a Aborter, olderThan time.Duration) (
 // one decode serves the single-row and the listing read.
 type rowScanner interface {
 	Scan(dest ...any) error
+}
+
+// validDigest reports whether s is a SHA-256 digest as 64 hex
+// characters, in either case, because completion reads the digest both
+// ways.
+func validDigest(s string) bool {
+	if len(s) != 2*sha256.Size {
+		return false
+	}
+	_, err := hex.DecodeString(strings.ToLower(s))
+	return err == nil
 }
 
 // scanSession decodes one session row. This package wrote every
