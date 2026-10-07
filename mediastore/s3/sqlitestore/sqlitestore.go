@@ -276,8 +276,10 @@ func (s *Store) Expired(ctx context.Context, before time.Time) ([]Session, error
 // abort cannot discard is logged and left for the next pass, because
 // removing the row would orphan parts the bucket still bills storage
 // for. An upload the service no longer holds aborts as done, which is
-// what a session a completion left behind reads as. A nil aborter is
-// refused with an error matching ErrInvalid.
+// what a session a completion left behind reads as. A row a concurrent
+// completion or sweep removed while the pass ran is already gone, which
+// is the outcome the sweep wanted, so it reads as done and not as a
+// fault. A nil aborter is refused with an error matching ErrInvalid.
 func (s *Store) Sweep(ctx context.Context, a Aborter, olderThan time.Duration) (int, error) {
 	if a == nil {
 		return 0, fmt.Errorf("sqlitestore: sweep: %w: no aborter", ErrInvalid)
@@ -293,7 +295,12 @@ func (s *Store) Sweep(ctx context.Context, a Aborter, olderThan time.Duration) (
 			continue
 		}
 		if err := s.Delete(ctx, sess.BlobID); err != nil {
-			return removed, fmt.Errorf("sqlitestore: sweep: %w", err)
+			if !errors.Is(err, ErrNotFound) {
+				return removed, fmt.Errorf("sqlitestore: sweep: %w", err)
+			}
+			// The row went away between the listing and the
+			// delete, so nothing is left to remove.
+			continue
 		}
 		removed++
 	}

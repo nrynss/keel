@@ -323,6 +323,42 @@ func TestSweepKeepsARowItsAbortFailed(t *testing.T) {
 	}
 }
 
+// finishingAborter stands in for a completion that wins the race. Its
+// abort is the no-op an upload the service no longer holds reads as,
+// and it runs the completion path's own row delete before it answers.
+type finishingAborter struct {
+	store *sqlitestore.Store
+}
+
+func (a finishingAborter) AbortUpload(ctx context.Context, blobID, _ string) error {
+	return a.store.Delete(ctx, blobID)
+}
+
+// TestSweepReadsARemovedRowAsDone pins the race with a completion. A
+// row the completion deleted between the sweep's listing and its delete
+// is already gone, which is the outcome the sweep wanted, so the pass
+// ends clean and counts none of it.
+func TestSweepReadsARemovedRowAsDone(t *testing.T) {
+	path := t.TempDir() + "/sessions.db"
+	store := openStore(t, path)
+	sess := session(strings.Repeat("5", 32), "upload-1")
+	sess.CreatedAt = base.Add(-time.Hour)
+	if err := store.Create(t.Context(), sess); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	removed, err := store.Sweep(t.Context(), finishingAborter{store: store}, time.Minute)
+	if err != nil {
+		t.Fatalf("sweep over a removed row = %v, want a clean pass", err)
+	}
+	if removed != 0 {
+		t.Fatalf("sweep counted %d rows, want none of a row the completion took", removed)
+	}
+	if _, err := store.Get(t.Context(), sess.BlobID); !errors.Is(err, sqlitestore.ErrNotFound) {
+		t.Fatalf("get = %v, want ErrNotFound", err)
+	}
+}
+
 // TestSweepNeedsAnAborter pins the nil refusal.
 func TestSweepNeedsAnAborter(t *testing.T) {
 	store := openStore(t, t.TempDir()+"/sessions.db")
