@@ -100,7 +100,9 @@ type Session struct {
 	// characters. Completion checks the assembled object against it.
 	SHA256 string
 	// PartSize is the size every part carries except the last, which
-	// carries whatever the whole-file size leaves over.
+	// carries whatever the whole-file size leaves over. A plan of more
+	// than one part keeps PartSize at or above s3.MinPartSize, which
+	// the service checks when the parts assemble.
 	PartSize int64
 	// PartCount is the number of parts the plan divides the file into.
 	PartCount int
@@ -166,9 +168,11 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 
 // Create records a session. An id the table already holds is refused
 // with an error matching ErrAlreadyExists, and a session this package
-// cannot store is refused with one matching ErrInvalid. A zero
-// CreatedAt is stamped with the store clock, the way a mediastore row
-// is stamped.
+// cannot store is refused with one matching ErrInvalid. A plan of more
+// than one part whose parts before the last sit under s3.MinPartSize is
+// refused the same way, because the service would refuse its assembly.
+// A zero CreatedAt is stamped with the store clock, the way a
+// mediastore row is stamped.
 func (s *Store) Create(ctx context.Context, sess Session) error {
 	if sess.CreatedAt.IsZero() {
 		sess.CreatedAt = s.now()
@@ -193,6 +197,9 @@ func (s *Store) Create(ctx context.Context, sess Session) error {
 	}
 	if sess.PartCount < 1 || sess.PartCount > s3.MaxParts {
 		return fmt.Errorf("sqlitestore: create %q: %w: %d parts is outside 1 to %d", sess.BlobID, ErrInvalid, sess.PartCount, s3.MaxParts)
+	}
+	if sess.PartCount > 1 && sess.PartSize < s3.MinPartSize {
+		return fmt.Errorf("sqlitestore: create %q: %w: a part before the last carries at least %d bytes", sess.BlobID, ErrInvalid, s3.MinPartSize)
 	}
 	// ON CONFLICT DO NOTHING keeps the duplicate an ordinary outcome
 	// rather than a driver error to classify. No rows changed is the

@@ -64,8 +64,8 @@ func openFresh(t *testing.T, path string) *sql.DB {
 	return db
 }
 
-// session returns a valid session for a blob id, with the parts a
-// two-part plan over 1500 bytes produces.
+// session returns a valid session for a blob id, with a two-part plan
+// at the dialect's minimum part size.
 func session(blobID, uploadID string) sqlitestore.Session {
 	return sqlitestore.Session{
 		BlobID:      blobID,
@@ -76,7 +76,7 @@ func session(blobID, uploadID string) sqlitestore.Session {
 		ContentType: "video/mp4",
 		SizeBytes:   1500,
 		SHA256:      strings.Repeat("a", 64),
-		PartSize:    1024,
+		PartSize:    s3.MinPartSize,
 		PartCount:   2,
 		CreatedAt:   base,
 	}
@@ -154,6 +154,7 @@ func TestCreateValidatesItsSession(t *testing.T) {
 		{"digest not hex", func(s sqlitestore.Session) sqlitestore.Session { s.SHA256 = "not-a-digest"; return s }},
 		{"digest short", func(s sqlitestore.Session) sqlitestore.Session { s.SHA256 = strings.Repeat("a", 63); return s }},
 		{"empty part", func(s sqlitestore.Session) sqlitestore.Session { s.PartSize = 0; return s }},
+		{"part under the floor", func(s sqlitestore.Session) sqlitestore.Session { s.PartSize = s3.MinPartSize - 1; return s }},
 		{"no parts", func(s sqlitestore.Session) sqlitestore.Session { s.PartCount = 0; return s }},
 		{"past the part bound", func(s sqlitestore.Session) sqlitestore.Session { s.PartCount = s3.MaxParts + 1; return s }},
 	}
@@ -163,6 +164,15 @@ func TestCreateValidatesItsSession(t *testing.T) {
 				t.Fatalf("create = %v, want ErrInvalid", err)
 			}
 		})
+	}
+
+	// A lone part is the last part, so the dialect lets it sit under
+	// the floor, and the plan records.
+	lone := session(strings.Repeat("6", 32), "upload-1")
+	lone.PartSize = s3.MinPartSize - 1
+	lone.PartCount = 1
+	if err := store.Create(t.Context(), lone); err != nil {
+		t.Fatalf("create a one-part plan under the floor: %v", err)
 	}
 }
 

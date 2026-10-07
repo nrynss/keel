@@ -1006,6 +1006,8 @@ session in its own database, and drives four calls:
 - `StartUpload` opens the upload in the bucket and returns the service's upload id.
 - `PresignPart` returns a URL for one part, with that part's length signed into it. The part
 number and the upload id travel inside the URL, so a URL moved to another part reads as tampered.
+Every part before the last carries at least the dialect's minimum, `s3.MinPartSize`, which the
+service checks when the parts assemble, so a plan under the floor refuses at completion.
 - `CompleteUpload` assembles the planned parts from the service's own listing and refuses with
 `s3.ErrIncomplete` while a part is still missing. A completion that already ran through reports
 `s3.ErrNoSuchUpload`, and the caller's next stop is recording the object.

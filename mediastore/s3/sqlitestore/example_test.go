@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/nrynss/keel/mediastore/s3"
 	"github.com/nrynss/keel/mediastore/s3/sqlitestore"
 	"github.com/nrynss/keel/sqlite"
 )
@@ -50,7 +51,9 @@ func Example() {
 
 	// The app opened the multipart upload in the bucket and holds the
 	// upload id the service returned. The record lands before the first
-	// part URL is issued, so a restart finds the plan.
+	// part URL is issued, so a restart finds the plan. The part size
+	// carries the dialect's minimum, which the service checks when the
+	// parts assemble.
 	createdAt := time.Now().Add(-48 * time.Hour)
 	err = store.Create(ctx, sqlitestore.Session{
 		BlobID:      "0f4a2c9e6b1d4a7f8c3e2b5d6a9f0e1c",
@@ -58,7 +61,7 @@ func Example() {
 		ContentType: "video/mp4",
 		SizeBytes:   1500,
 		SHA256:      "6a4f2c9e6b1d4a7f8c3e2b5d6a9f0e1c6a4f2c9e6b1d4a7f8c3e2b5d6a9f0e1c",
-		PartSize:    1024,
+		PartSize:    s3.MinPartSize,
 		PartCount:   2,
 		CreatedAt:   createdAt,
 	})

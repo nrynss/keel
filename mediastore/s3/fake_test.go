@@ -42,8 +42,10 @@ const (
 // body the way a service that honours checksums does. It runs multipart
 // uploads: create, part put, part listing, complete and abort, with the
 // parts held beside the object namespace and an assembled upload
-// discarding its parts. It is deterministic and reaches no network
-// beyond the httptest server that carries it.
+// discarding its parts. An assembly that holds a part before the last
+// under the dialect's minimum size is refused, the way a service
+// refuses an undersized plan. It is deterministic and reaches no
+// network beyond the httptest server that carries it.
 type fakeS3 struct {
 	mu        sync.Mutex
 	objects   map[string][]byte
@@ -414,8 +416,10 @@ type completeManifest struct {
 
 // completeUpload assembles the listed parts into the object under key.
 // Every listed part must exist under the ETag the manifest names, the
-// way a service validates the manifest before it assembles, and the
-// upload is discarded once the object stands.
+// way a service validates the manifest before it assembles. Every part
+// before the last must carry the dialect's minimum size, which is the
+// floor a service checks at assembly. The upload is discarded once the
+// object stands.
 func (f *fakeS3) completeUpload(w http.ResponseWriter, r *http.Request, key string) {
 	uploadID := r.URL.Query().Get("uploadId")
 	upload := f.uploads[uploadID]
@@ -429,10 +433,14 @@ func (f *fakeS3) completeUpload(w http.ResponseWriter, r *http.Request, key stri
 		return
 	}
 	var body []byte
-	for _, part := range manifest.Parts {
+	for i, part := range manifest.Parts {
 		stored, ok := upload.parts[int(part.PartNumber)]
 		if !ok || etagFor(stored) != part.ETag {
 			serveXMLError(w, http.StatusBadRequest, "InvalidPart", "a listed part is not held under the etag given")
+			return
+		}
+		if i < len(manifest.Parts)-1 && len(stored) < MinPartSize {
+			serveXMLError(w, http.StatusBadRequest, "EntityTooSmall", "every part before the last must carry at least the minimum size")
 			return
 		}
 		body = append(body, stored...)

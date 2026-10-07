@@ -22,6 +22,13 @@ import (
 // can open but can never complete.
 const MaxParts = 10000
 
+// MinPartSize is the size in bytes every part of a multipart upload
+// carries except the last, which carries whatever the declared
+// whole-file size leaves over. The service refuses an assembly that
+// holds an earlier part under this size, so a plan keeps every part
+// before the last at or above it.
+const MinPartSize = 5 << 20
+
 // ErrIncomplete is returned by CompleteUpload when the service holds
 // fewer parts than the session planned. The upload keeps its parts and
 // the object does not exist yet.
@@ -156,7 +163,12 @@ func (b *Backend) PresignPut(ctx context.Context, in PresignPutInput) (Presigned
 // URL, so the signature binds them and a URL moved to another part or
 // another upload reads as tampered. The part size signs as a header,
 // the same way a whole PUT pins its length, and the last part carries
-// whatever the declared whole-file size leaves over.
+// whatever the declared whole-file size leaves over. PresignPart
+// accepts any positive size, because the caller knows which part is
+// last and the dialect lets that one sit under the floor. Every part
+// before the last carries at least MinPartSize, which the service
+// checks when the parts assemble, so a plan under the floor refuses at
+// completion and not at issue.
 func (b *Backend) PresignPart(ctx context.Context, blobID, uploadID string, partNumber, sizeBytes int64) (Presigned, error) {
 	if !validKey(blobID) {
 		return Presigned{}, notFound(blobID, errors.New("malformed id"))

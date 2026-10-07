@@ -381,14 +381,15 @@ func TestPresignedPutValidatesInput(t *testing.T) {
 // TestMultipartHappyPath pins the multipart flow. The session opens in
 // the bucket, every part presigns with its own length bound, completion
 // assembles from the service's own listing, and the assembled object
-// verifies and records like any other blob.
+// verifies and records like any other blob. The first part carries the
+// dialect's minimum, and the last carries what is left under it.
 func TestMultipartHappyPath(t *testing.T) {
 	f, endpoint, client := newFakeS3(t, func() time.Time { return base })
 	b := openBackend(t, endpoint, client)
 	index := newMemIndex()
 	s := openStore(t, b, index)
 	blobID := strings.Repeat("3", 32)
-	part1 := deterministic(256 << 10)
+	part1 := deterministic(MinPartSize)
 	part2 := deterministic(128 << 10)
 	whole := append(append([]byte{}, part1...), part2...)
 
@@ -484,6 +485,45 @@ func TestMultipartPartPinsItsLength(t *testing.T) {
 	}
 	if code != http.StatusForbidden {
 		t.Fatalf("put part of the wrong size = %d, want 403", code)
+	}
+}
+
+// TestAssemblyRefusesPartsUnderTheFloor pins the dialect's minimum part
+// size. A plan whose parts before the last sit under MinPartSize uploads
+// cleanly but assembles nothing, and the service answers with the
+// refusal the dialect spells for an undersized plan. The upload and its
+// parts survive for a plan that respects the floor.
+func TestAssemblyRefusesPartsUnderTheFloor(t *testing.T) {
+	f, endpoint, client := newFakeS3(t, func() time.Time { return base })
+	b := openBackend(t, endpoint, client)
+	blobID := strings.Repeat("1", 32)
+	small := deterministic(64 << 10)
+
+	uploadID, err := b.StartUpload(t.Context(), blobID, "video/mp4")
+	if err != nil {
+		t.Fatalf("start upload: %v", err)
+	}
+	for n := int64(1); n <= 2; n++ {
+		signed, err := b.PresignPart(t.Context(), blobID, uploadID, n, int64(len(small)))
+		if err != nil {
+			t.Fatalf("presign part %d: %v", n, err)
+		}
+		code, err := statusOf(sendPut(client, signed, small, "", ""))
+		if err != nil || code != http.StatusOK {
+			t.Fatalf("put part %d = %d, %v, want 200", n, code, err)
+		}
+	}
+
+	err = b.CompleteUpload(t.Context(), blobID, uploadID, 2)
+	var coded interface{ ErrorCode() string }
+	if !errors.As(err, &coded) || coded.ErrorCode() != "EntityTooSmall" {
+		t.Fatalf("complete under the floor = %v, want the dialect's too-small refusal", err)
+	}
+	if f.holds(blobID) {
+		t.Fatal("an undersized plan assembled an object")
+	}
+	if !f.uploadHeld(uploadID) {
+		t.Fatal("the refused assembly discarded the upload")
 	}
 }
 
