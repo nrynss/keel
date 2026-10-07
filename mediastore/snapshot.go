@@ -174,7 +174,7 @@ func (s *Store) writeSnapshot(ctx context.Context, dir string, blobs []Blob) err
 		if err := ctx.Err(); err != nil {
 			return fail(err)
 		}
-		entry, err := s.captureBlob(root, b)
+		entry, err := s.captureBlob(ctx, root, b)
 		if err != nil {
 			return fail(err)
 		}
@@ -310,12 +310,12 @@ func (s *Store) selectBlobs(ctx context.Context, sel Selection) ([]Blob, error) 
 	return out, nil
 }
 
-// captureBlob copies one blob into the snapshot directory and returns its
-// manifest entry. The digest is of the bytes just written. The bytes come
-// from openBlob, so a storage backend replaces that read without this
-// function learning where they live. The snapshot directory stays local.
-func (s *Store) captureBlob(root *os.Root, b Blob) (ManifestBlob, error) {
-	src, err := s.openBlob(b.ID)
+// captureBlob copies one blob into the snapshot directory and returns
+// its manifest entry. The digest is of the bytes just written. The
+// bytes come from the backend, so the capture never learns where they
+// live. The snapshot directory stays local.
+func (s *Store) captureBlob(ctx context.Context, root *os.Root, b Blob) (ManifestBlob, error) {
+	src, err := s.backend.Open(ctx, b.ID)
 	if err != nil {
 		return ManifestBlob{}, fmt.Errorf("mediastore: snapshot %s: %w", b.ID, err)
 	}
@@ -348,14 +348,6 @@ func (s *Store) captureBlob(root *os.Root, b Blob) (ManifestBlob, error) {
 		SHA256:      sum,
 		CreatedAt:   b.CreatedAt.UTC(),
 	}, nil
-}
-
-// openBlob returns a reader for the stored bytes of id. Snapshot is the
-// caller. A storage backend replaces this function. The snapshot
-// directory, a manifest plus files, is a local fixture and is not read
-// through here.
-func (s *Store) openBlob(id string) (io.ReadCloser, error) {
-	return s.root.Open(id)
 }
 
 // Restore recreates every blob in the snapshot at dir. Each blob keeps

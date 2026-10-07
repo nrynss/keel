@@ -33,7 +33,7 @@ else is pure Go, and `CGO_ENABLED=0` builds the whole module.
 | `gate` | Per-client and global token buckets, plus an optional passcode, in front of the routes that spend money |
 | `stream` | Topic broker and server-sent events, with heartbeats, a non-blocking slow-subscriber policy, and best-effort replay after Last-Event-ID |
 | `job` | Long work started by a short request, observed over `stream`, durable across restarts |
-| `mediastore` | Blobs on disk under unguessable ids, served with Range support, with retention sweeps and a snapshot that restores the same ids |
+| `mediastore` | Blobs under unguessable ids on a storage backend, with the disk store built in, a read path for local tools, Range serving, retention sweeps and a snapshot that restores the same ids |
 | `upload` | Resumable chunked uploads that land in `mediastore`, resumable by id after a dropped connection |
 | `photo` | Normalises an uploaded photo: EXIF orientation applied to the pixels, metadata stripped, resized under side and pixel caps, re-encoded under a byte cap |
 | `sqlite` | One SQLite file with WAL and synchronous FULL, so an acknowledged write survives a power cut once the file's creation window has passed, plus a writer handle, a read-only reader pool, namespaced migrations and online backup |
@@ -858,8 +858,9 @@ terminal chains older than a supplied time and leaves active chains alone.
 
 ### Private and public media with mediastore
 
-Entry points: `mediastore.Open`, `Store.Persist`, `Store.PersistWithID`, `Store.Delete`,
-`Store.ServeHTTP`, `Store.NewSweeper`, `Store.Snapshot`, `Store.Restore`.
+Entry points: `mediastore.Open`, `Store.Persist`, `Store.PersistWithID`, `Store.Open`,
+`Store.TempCopy`, `Store.Delete`, `Store.ServeHTTP`, `Store.NewSweeper`, `Store.Snapshot`,
+`Store.Restore`.
 
 `Store` is the handler. The app registers it at one route:
 
@@ -878,6 +879,21 @@ when `Config.Authorize` allows the live request. A refusal answers 404, the same
 unknown or malformed id, so the response never confirms a private blob exists. A metadata row
 whose file has vanished also answers 404 while the server logs the fault. A lookup that fails for
 another reason answers 500. These answers use plain `http.NotFound` and `http.Error` bodies, never the `wire` envelope.
+
+The blob bytes sit behind the `mediastore.Backend` interface, with open, write, delete and list
+operations. The interface carries no directory and no rename, and a backend ages its objects by
+its own modification time. The disk store is the built-in implementation. It fsyncs each blob and
+its directory entry before the metadata row is written, so the acknowledged bytes survive a power
+cut. Every backend owns the durability of the bytes it accepts, and the store always writes the
+row after the backend returns. A backend that needs a client library lives in its own subpackage,
+so an app that keeps blobs on disk never compiles that client.
+
+`Store.Open` returns a stored blob's bytes and its row to a caller that holds the store as a
+library. It checks neither visibility nor an authorizer, because that caller is inside the
+process and owns the decision. The reader it returns supports `Seek`, and the caller closes it.
+`Store.TempCopy` copies a stored blob into a fresh temporary file and returns a remove function
+the caller must call. The ffmpeg based packages take file paths, so stored media reaches them
+through this helper.
 
 ### Resumable uploads with upload
 
