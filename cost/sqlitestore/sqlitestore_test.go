@@ -264,8 +264,8 @@ func TestOpenAppliesMigrationsOnce(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "cost.db")
 	openStore(t, path)
 	openStore(t, path)
-	if n := freshCount(t, path, "cost_schema_migrations"); n != 4 {
-		t.Fatalf("migration ledger rows = %d, want 4", n)
+	if n := freshCount(t, path, "cost_schema_migrations"); n != 5 {
+		t.Fatalf("migration ledger rows = %d, want 5", n)
 	}
 }
 
