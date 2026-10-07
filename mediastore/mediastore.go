@@ -15,9 +15,13 @@
 // environment. Errors are sentinels matched with errors.Is. Every
 // Persist that returns without error survives an operating system or
 // power failure, because the bytes and their directory entry are
-// fsynced before the row is written. A Persist that fails removes only
-// the file it created, so bytes already stored under an id are never
-// truncated or removed.
+// fsynced before the row is written. The promise carries one boundary.
+// Open creates the store directory when it is absent but never syncs
+// its parent directory entry, so a power cut inside the directory's
+// creation window can take the whole directory, every file with the
+// row that names it. Past that window the promise holds. A Persist
+// that fails removes only the file it created, so bytes already stored
+// under an id are never truncated or removed.
 //
 // Snapshot writes a manifest and one file per blob, and Restore recreates
 // those blobs under their original ids. A restored row is an ordinary row
@@ -321,9 +325,12 @@ func bareType(contentType string) string {
 // parameters such as "image/png; charset=binary" is accepted and stored
 // as its bare media type. The blob's bytes and its directory entry are
 // fsynced before the metadata row is inserted, so a Persist that
-// returns without error survives an operating system or power failure
-// on every filesystem. The copy reads only from src, and ctx bounds the
-// metadata write.
+// returns without error survives an operating system or power failure.
+// The promise carries one boundary. Open creates the store directory
+// when it is absent but never syncs its parent directory entry, so a
+// power cut inside the directory's creation window can take the whole
+// directory. Past that window the promise holds. The copy reads only
+// from src, and ctx bounds the metadata write.
 func (s *Store) Persist(ctx context.Context, src io.Reader, p Put) (string, error) {
 	ct, ok := s.normalizeContentType(p.ContentType)
 	if !ok {
