@@ -1037,3 +1037,134 @@ func TestRerunInsideThePreviousWindowQueuesBehindIt(t *testing.T) {
 		}
 	}
 }
+
+// TestRetryThroughAGateKeepsTheCap runs the schedule through a one-place
+// Gate: one call renders for 100 virtual seconds while three more queue at
+// the gate. Every first attempt draws its rate slot after the gate frees, so
+// the starts stay spread and the sliding window refuses nothing. A flow that
+// took the slot before the gate handed out slots at 31.5s, 63s and 94.5s to
+// callers that could only start at 100s and later, and the three starts
+// landed back-to-back.
+func TestRetryThroughAGateKeepsTheCap(t *testing.T) {
+	clk := &vclock{now: time.Unix(2_000_000, 0)}
+	stop := make(chan struct{})
+	defer close(stop) // the driver's exit
+	go clk.drive(stop)
+
+	var submissions atomic.Int64
+	win := &window{clk: clk, limit: 2, latency: func() time.Duration {
+		if submissions.Add(1) == 1 {
+			return 100 * time.Second // the long render that holds the gate
+		}
+		return 5 * time.Second
+	}}
+	cfg := Config{
+		PerMinute:  2,
+		Name:       "gate-order",
+		Attempts:   2,
+		Backoff:    10 * time.Second,
+		Max:        45 * time.Second,
+		RetryAfter: hintOf,
+		Now:        clk.Now,
+		Sleep:      clk.Sleep,
+		randN:      zero,
+		registry:   &pacerRegistry{},
+	}
+	gate := New(1)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	errs := make([]error, 4)
+	var wg sync.WaitGroup
+	for i := range errs {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs[i] = gate.Retry(ctx, cfg, limitErr, func() error {
+				return win.submit(ctx)
+			})
+		}()
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("call %d: %v", i, err)
+		}
+	}
+	refused, accepted := win.counts()
+	if refused != 0 {
+		t.Errorf("%d submissions were refused, want none, since the gate holds the starts behind the rate slots", refused)
+	}
+	if accepted != 4 {
+		t.Errorf("accepted = %d, want 4", accepted)
+	}
+	win.mu.Lock()
+	defer win.mu.Unlock()
+	if win.maxIn > 2 {
+		t.Errorf("%d accepted submissions sat inside one minute, want at most 2", win.maxIn)
+	}
+}
+
+// TestRetryGivesTheGateBackWhenThePacerWaitEnds pins the release on the new
+// path. A first attempt holds a gate place while it queues for a rate slot,
+// and a context that ends in that queue must return the place, so the next
+// caller gets in.
+func TestRetryGivesTheGateBackWhenThePacerWaitEnds(t *testing.T) {
+	clk := &fixedClock{t: time.Unix(1_000_000, 0)}
+	g := &gateSleep{}
+	g.block.Store(true)
+	reg := &pacerRegistry{}
+	cfg := Config{PerMinute: 2, Name: "gate-back", Now: clk.now, Sleep: g.sleep, registry: reg}
+	gate := New(2)
+
+	started := make(chan struct{})
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	defer cancel1()
+	done1 := make(chan error, 1)
+	go func() {
+		done1 <- gate.Retry(ctx1, cfg, limitErr, func() error {
+			close(started) // holds one gate place for the whole test
+			<-ctx1.Done()
+			return ctx1.Err()
+		})
+	}()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the first caller never reached its call")
+	}
+
+	// The second caller takes the last place and parks on a future slot.
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	done2 := make(chan error, 1)
+	go func() { done2 <- gate.Retry(ctx2, cfg, limitErr, func() error { return nil }) }()
+	p := pacerFor(cfg)
+	deadline := time.Now().Add(5 * time.Second)
+	for p.slotCount() < 2 {
+		if time.Now().After(deadline) {
+			t.Fatal("the second caller never took a rate slot")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel2()
+	select {
+	case err := <-done2:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("second caller err = %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a cancelled queued first attempt did not return")
+	}
+
+	// The place is back, so a third caller gets in at once.
+	g.block.Store(false)
+	done3 := make(chan error, 1)
+	go func() { done3 <- gate.Retry(context.Background(), cfg, limitErr, func() error { return nil }) }()
+	select {
+	case err := <-done3:
+		if err != nil {
+			t.Fatalf("third caller: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the gate place was not returned when the queued first attempt ended")
+	}
+}

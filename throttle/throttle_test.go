@@ -312,15 +312,65 @@ func TestRetryTransientClassifierNilKeepsOneBudget(t *testing.T) {
 	}
 }
 
+// TestRetryMixedSequenceSpendsBudgetsSeparately pins the promise the
+// single-class tests cannot: tries of one class do not spend the other's
+// budget. A shared counter would compare the attempt number against the
+// current error's budget and cut the weaker class short.
+func TestRetryMixedSequenceSpendsBudgetsSeparately(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		fails     []error // each attempt's error, in order; the last is nil
+		wantCalls int
+	}{
+		{
+			name:      "a transient after one refusal still retries on its own budget",
+			fails:     []error{errLimited, errTransient, nil},
+			wantCalls: 3,
+		},
+		{
+			name:      "a transient after five refusals still retries on its own budget",
+			fails:     []error{errLimited, errLimited, errLimited, errLimited, errLimited, errTransient, nil},
+			wantCalls: 7,
+		},
+		{
+			name:      "a refusal after a transient keeps the long budget",
+			fails:     []error{errTransient, errLimited, nil},
+			wantCalls: 3,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			cfg := Config{
+				Attempts:          9,
+				TransientAttempts: 2,
+				Transient:         func(err error) bool { return errors.Is(err, errTransient) },
+				Backoff:           time.Microsecond,
+				Max:               time.Millisecond,
+			}
+			err := Retry(context.Background(), cfg, retryable, func() error {
+				want := tc.fails[calls]
+				calls++
+				return want
+			})
+			if calls != tc.wantCalls || err != nil {
+				t.Fatalf("calls = %d, err = %v, want %d calls and success", calls, err, tc.wantCalls)
+			}
+		})
+	}
+}
+
 // TestDefaultScheduleFitsTheDefaultWaitBudget is arithmetic, not sampling, so
-// it cannot flake. The longest schedule the defaults can produce must fit
-// DefaultWaitBudget. Otherwise the last attempt the attempt count promises is
-// only reachable when the jitter draws are kind, and a caller who adopts the
+// it cannot flake. The two classes spend their budgets independently, so a
+// call can wait at most (attempts minus one) plus (transient attempts minus
+// one) times. The longest schedule that count can produce must fit
+// DefaultWaitBudget. Otherwise the last attempt the counts promise is only
+// reachable when the jitter draws are kind, and a caller who adopts the
 // constant can be cut short by it.
 func TestDefaultScheduleFitsTheDefaultWaitBudget(t *testing.T) {
+	waits := (DefaultAttempts - 1) + (DefaultTransientAttempts - 1)
 	var worst time.Duration
 	backoff := DefaultBackoff
-	for i := 0; i < DefaultAttempts-1; i++ {
+	for i := 0; i < waits; i++ {
 		worst += backoff // jitter never exceeds its base
 		if backoff *= 2; backoff > DefaultMax {
 			backoff = DefaultMax
@@ -329,7 +379,7 @@ func TestDefaultScheduleFitsTheDefaultWaitBudget(t *testing.T) {
 	if worst > DefaultWaitBudget {
 		t.Fatalf("worst-case default backoff total %s exceeds DefaultWaitBudget %s", worst, DefaultWaitBudget)
 	}
-	hintWorst := time.Duration(DefaultAttempts-1) * DefaultMax // every wait hint-named at the cap
+	hintWorst := time.Duration(waits) * DefaultMax // every wait hint-named at the cap
 	if hintWorst > DefaultWaitBudget {
 		t.Fatalf("worst-case default hint total %s exceeds DefaultWaitBudget %s", hintWorst, DefaultWaitBudget)
 	}
