@@ -246,7 +246,9 @@ before the work runs. A crash or a retry between claim and work can never charge
 second Run of the same id returns the first outcome and charges nothing. A concurrent Run
 in the same process waits for the one that claimed and shares its outcome, and a Run from
 another process is refused with the `quote_pending` code. The settled charge lands in the
-ledger under the quote's id, so a report can split quoted spend by action. Before it claims,
+ledger under the quote's id, so a report can split quoted spend by action. Once the work
+succeeds, the settle books even if the caller's context cancels, so a paid action never
+finishes unbooked. Before it claims,
 Run re-checks the price through the configured `Reprice` callback. A move past
 `QuoteTolerance` refuses with the `quote_price_moved` code and carries a fresh quote at the
 current price, so the client re-confirms before anything spends. An expired quote refuses
