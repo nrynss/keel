@@ -12,6 +12,26 @@
 // re-creates a recorded task silently, because a second create is a second
 // charge.
 //
+// A provider task is created once and settled once, across processes,
+// including after a crash or a leader stall past its lease. One process
+// drives a recorded task at a time. Another takes over only after the
+// driver's lease expires or is released.
+//
+// Every claim carries a lease. The driving Run renews its lease on a timer
+// of its own, at about a third of the lease length, so a slow create never
+// costs it the drive. A renewal the store cannot write waits for the next
+// tick, because an error names no new owner, and a renewal the row refuses
+// ends the drive. The lease length is about three poll ceilings, with a
+// thirty-second floor. A Run that finds a recorded task takes the lease
+// before it resumes. A Run that ends its drive without a verdict releases
+// the lease, so the next Run takes over without waiting for expiry. A
+// waiter tries the takeover itself whenever the lease it waits on expires
+// mid wait. A driver checks its token immediately before it settles, and
+// Finish refuses a token the row no longer carries, so a leader that wakes
+// past its lease neither books twice nor overwrites the verdict. Takeover
+// compares timestamps, so processes sharing a store must share a clock, or
+// keep their skew well below the lease length.
+//
 // A recorded task that still runs when its age passes Config.Window
 // refuses with ErrWindowExceeded and its stable code. The provider may no
 // longer answer queries about the task, so polling it would spin. The
@@ -68,9 +88,11 @@ import (
 	"math"
 	"reflect"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/nrynss/keel/cost"
+	"github.com/nrynss/keel/id"
 	"github.com/nrynss/keel/job"
 	"github.com/nrynss/keel/throttle"
 )
@@ -128,6 +150,12 @@ var (
 	// ErrDeadline reports a task that did not reach a terminal state
 	// inside Config.Deadline. The task keeps running at the provider.
 	ErrDeadline = errors.New("providertask: deadline passed before the task finished")
+	// ErrStaleToken reports a lease write that named a token the row no
+	// longer carries. The caller that sent it stopped driving the task
+	// before the write landed. Finish refuses a stale token, so a leader
+	// that woke past its lease never overwrites the verdict the new owner
+	// recorded.
+	ErrStaleToken = errors.New("providertask: lease token is stale")
 	// ErrTaskFailed is wrapped by TaskFailure, the provider's terminal
 	// verdict that the task failed.
 	ErrTaskFailed = errors.New("providertask: task failed")
@@ -157,6 +185,27 @@ const defaultKind = "provider_task"
 // errPollAgain is the internal signal that a task or a key is not resolved
 // yet and the wait should continue. It never escapes Run.
 var errPollAgain = errors.New("providertask: not resolved yet")
+
+// errOwnershipLost is the internal signal that this Run lost the lease it
+// drove under, so another process owns the settle now. A Run that receives
+// it stops driving and falls back to awaiting the recorded outcome, like a
+// joiner. It never escapes Run.
+var errOwnershipLost = errors.New("providertask: lease lost mid drive")
+
+// ownerID names this process in lease rows. It is one random id per
+// process, drawn at startup. Every Run in the process claims and renews
+// under the same name, so a takeover the process wins counts as self.
+var (
+	ownerID    string
+	ownerIDErr error
+)
+
+// init draws the process's driver id at startup. An entropy failure is
+// stored for the first Run instead of a panic, because a library returns
+// errors.
+func init() {
+	ownerID, ownerIDErr = id.New()
+}
 
 // Status is one answer about a task. A failed task carries the provider's
 // error code in Code, so a caller can map it onto its own error envelope.
@@ -198,9 +247,9 @@ func failure(taskID, code string) *TaskFailure {
 	return &TaskFailure{TaskID: taskID, Code: code}
 }
 
-// Claim is one key's storable record. A fresh claim carries no task id and
-// StateRunning. Record attaches the task id, and Finish records the
-// provider's terminal verdict.
+// Claim is one key's storable record. A fresh claim carries no task id,
+// StateRunning, and the lease of the Run that inserted it. Record attaches
+// the task id, and Finish records the provider's terminal verdict.
 type Claim struct {
 	// Key is the caller's idempotency key.
 	Key string
@@ -215,18 +264,46 @@ type Claim struct {
 	Code string
 	// CreatedAt is when the key was first claimed.
 	CreatedAt time.Time
+	// Owner names the process that holds the lease. Empty names no driver,
+	// which is the state Finish and ReleaseLease leave behind.
+	Owner string
+	// Token is the lease's fencing number. It starts at one on creation and
+	// increments on every takeover, so a write naming an older token
+	// refuses.
+	Token int64
+	// LeaseUntil is the instant the holder's lease expires. A zero value
+	// names no live lease, so the next takeover wins at once.
+	LeaseUntil time.Time
 }
 
-// Store remembers the task id a key created. This package declares the
-// interface, and providertask/sqlitestore implements it over SQLite. An
-// implementation must be safe for concurrent use, and must return an error
-// matching ErrUnknownKey for a key it does not hold.
+// Store remembers the task id a key created and which process is driving
+// it. This package declares the interface, and providertask/sqlitestore
+// implements it over SQLite. An implementation must be safe for concurrent
+// use, and must return an error matching ErrUnknownKey for a key it does
+// not hold. The lease writes compare timestamps against the caller's now,
+// so an implementation stores them as given and shifts nothing.
 type Store interface {
 	// Claim records key as claimed when the store holds no row for it, and
 	// reports the row either way. It reports created true for the one call
 	// that inserted the row, so concurrent claims pick one creator. The
-	// inserted row carries no task id, StateRunning, and CreatedAt now.
-	Claim(ctx context.Context, key string, now time.Time) (Claim, bool, error)
+	// inserted row carries no task id, StateRunning, CreatedAt now, and a
+	// lease naming owner with token one and the expiry now plus ttl.
+	Claim(ctx context.Context, key, owner string, now time.Time, ttl time.Duration) (Claim, bool, error)
+	// TakeOver transfers the lease of key to owner when it is takeable,
+	// which is when the stored lease expired before now or already names
+	// owner. It bumps the token, so every write the previous holder still
+	// sends refuses as stale, and reports the new token. It reports ok
+	// false without changing the row when another driver still holds an
+	// unexpired lease. An unknown key is an error matching ErrUnknownKey.
+	TakeOver(ctx context.Context, key, owner string, now time.Time, ttl time.Duration) (token int64, ok bool, err error)
+	// Renew extends the lease of key to until when the row still names
+	// owner and carries token. It reports ok false when they do not, which
+	// means the caller lost the drive.
+	Renew(ctx context.Context, key, owner string, token int64, until time.Time) (ok bool, err error)
+	// ReleaseLease clears the lease of key when the row still names owner
+	// and carries token, so the next Run takes over without waiting for
+	// expiry. It changes nothing when they do not match.
+	ReleaseLease(ctx context.Context, key, owner string, token int64) error
 	// Record attaches taskID to the key's row before polling starts. It
 	// writes only while the row still carries no task id, so a key never
 	// moves to a different task. A repeat with the recorded id is not an
@@ -235,10 +312,14 @@ type Store interface {
 	// Get returns the row stored under key, or an error matching
 	// ErrUnknownKey.
 	Get(ctx context.Context, key string) (Claim, error)
-	// Finish records the provider's terminal verdict on the key's row.
-	// State must be StateSucceeded or StateFailed, and Code carries the
-	// provider's error code for a failed task.
-	Finish(ctx context.Context, key string, state State, code string) error
+	// Finish records the provider's terminal verdict on the key's row and
+	// clears its lease. State must be StateSucceeded or StateFailed, and
+	// Code carries the provider's error code for a failed task. It refuses
+	// with an error matching ErrStaleToken when the row no longer carries
+	// token. A driver that lost its lease never overwrites the verdict the
+	// new owner recorded. An unknown key is an error matching
+	// ErrUnknownKey.
+	Finish(ctx context.Context, key string, token int64, state State, code string) error
 	// Release removes the key's row while it still carries no task id, and
 	// changes nothing once a task id is recorded. It reports whether it
 	// removed a row. Run calls it when a run fails before Create, so a
@@ -378,7 +459,8 @@ type Config struct {
 	// the store refused. Nil means slog.Default.
 	Log *slog.Logger
 	// Now supplies the clock that stamps claims and judges the window.
-	// Nil means time.Now.
+	// The lease renewal reads it from a goroutine of its own, so it must
+	// be safe for concurrent use. Nil means time.Now.
 	Now func() time.Time
 }
 
@@ -421,6 +503,22 @@ func (c Config) ceiling() time.Duration {
 		return c.base()
 	}
 	return limit
+}
+
+// minLease is the floor under the computed lease length, so a driver whose
+// provider answers quickly still holds its task long enough for a
+// replacement process to reach a takeover.
+const minLease = 30 * time.Second
+
+// lease returns how long one drive holds its key before another process may
+// take it over. It is about three poll ceilings, because a driver that
+// polls at ceiling pace renews twice inside one lease even when a poll or a
+// create runs long. It never drops below minLease.
+func (c Config) lease() time.Duration {
+	if span := 3 * c.ceiling(); span > minLease {
+		return span
+	}
+	return minLease
 }
 
 // kind returns the billed operation name, substituting the default for an
@@ -485,6 +583,15 @@ func isNilValue(v any) bool {
 // at the provider. A task that fails at the provider returns a TaskFailure
 // carrying the provider's error code.
 //
+// The drive holds a lease. Run that finds a recorded task takes the lease
+// over before it resumes, and waits like a joiner when another process
+// still holds it. A Run that ends its drive without a verdict releases the
+// lease, and Finish clears it, so the next Run takes over at once. The
+// driver renews the lease on a timer of its own and checks its token
+// immediately before it settles. A leader stalled past its lease therefore
+// neither books twice nor overwrites the verdict of the process that took
+// over.
+//
 // With a Meter configured, the Run that creates the task reserves
 // Config.Estimate first, settles when the task succeeds, and frees the
 // reservation when it fails. A refused reservation releases the still
@@ -501,12 +608,16 @@ func Run[T any](ctx context.Context, cfg Config, store Store, key string, spec S
 	if err := validate(cfg, store, key, spec); err != nil {
 		return Outcome[T]{}, err
 	}
+	if ownerIDErr != nil {
+		return Outcome[T]{}, fmt.Errorf("providertask: run %s: %w", key, ownerIDErr)
+	}
 	t := &task[T]{
 		cfg:   cfg,
 		store: store,
 		key:   key,
 		spec:  spec,
 		now:   cfg.nowFunc(),
+		owner: ownerID,
 	}
 	// The provider calls run under the deadline. The store writes run on a
 	// context that outlives it, so a deadline never stops the claim, the
@@ -524,12 +635,12 @@ func Run[T any](ctx context.Context, cfg Config, store Store, key string, spec S
 	}
 	defer cfg.Coordinator.leave(key)
 
-	claim, created, err := store.Claim(t.wctx, key, t.now())
+	claim, created, err := store.Claim(t.wctx, key, t.owner, t.now(), t.cfg.lease())
 	if err != nil {
 		return Outcome[T]{}, fmt.Errorf("providertask: claim %s: %w", key, err)
 	}
 	if created {
-		return t.lead()
+		return t.joinOnLost(t.lead(claim.Token))
 	}
 	if claim.TaskID == "" {
 		// Another process claimed the key and has not recorded a task id.
@@ -537,7 +648,26 @@ func Run[T any](ctx context.Context, cfg Config, store Store, key string, spec S
 		// again.
 		return t.await()
 	}
-	return t.resume(claim)
+	token, ok, err := store.TakeOver(t.wctx, key, t.owner, t.now(), t.cfg.lease())
+	if err != nil {
+		return Outcome[T]{}, fmt.Errorf("providertask: take over %s: %w", key, err)
+	}
+	if !ok {
+		// Another process holds an unexpired lease on the recorded task.
+		// This Run waits like an in-process joiner: no Status calls, no
+		// meter, and it collects the result once one is recorded.
+		return t.await()
+	}
+	return t.joinOnLost(t.resume(claim, token))
+}
+
+// joinOnLost turns a drive that lost its lease mid way into a wait for the
+// recorded outcome, because the process that won the lease settles now.
+func (t *task[T]) joinOnLost(outcome Outcome[T], err error) (Outcome[T], error) {
+	if errors.Is(err, errOwnershipLost) {
+		return t.await()
+	}
+	return outcome, err
 }
 
 // validate refuses a Run this package cannot drive. A typed nil store is
@@ -557,34 +687,50 @@ func validate[T any](cfg Config, store Store, key string, spec Spec[T]) error {
 }
 
 // task is one Run in flight. It carries the config, the store, the key and
-// the spec, plus the two contexts the Run works under.
+// the spec, plus the contexts the Run works under and the lease it drives
+// under.
 type task[T any] struct {
 	cfg   Config
 	store Store
 	key   string
 	spec  Spec[T]
 	now   func() time.Time
+	// owner is this process's driver id. Every lease this Run writes names
+	// it, and a takeover the process wins counts as self.
+	owner string
 	// pctx bounds the provider calls with the overall deadline.
 	pctx context.Context
 	// wctx carries the store writes past the deadline and past a caller
 	// that gives up, so the durable record never waits on a live request.
 	wctx context.Context
+	// dctx bounds the poll phase. drive sets it, and a refused renewal
+	// cancels it, which stops a driver that lost its lease.
+	dctx context.Context
+	// token is the fencing number of the lease this drive holds. drive
+	// sets it, and holdLease reads it immediately before a settle.
+	token int64
+	// lostLease reports that the row refused the renewal, so a poll
+	// stopped by the cancellation above reports the loss instead of a
+	// bare context error. A renewal the store cannot write sets nothing,
+	// because an error names no new owner. The renewal goroutine sets it
+	// and the drive reads it.
+	lostLease atomic.Bool
 }
 
 // lead drives the Run that inserted the claim. It creates the task,
 // records the id before polling, and settles through the meter when one is
 // configured.
-func (t *task[T]) lead() (Outcome[T], error) {
-	taskID, value, usage, err := t.metered(t.createWatch)
-	return t.land(taskID, value, usage, err)
+func (t *task[T]) lead(token int64) (Outcome[T], error) {
+	taskID, value, usage, err := t.drive(token, t.createWatch)
+	return t.land(taskID, value, usage, err, token)
 }
 
-// resume drives a Run that leads a key whose task id is recorded. The Run
-// that recorded it has ended, either because its process restarted or
-// because its deadline passed, so this Run owns the settle. A recorded
-// verdict is honoured at any age, because the provider already answered
-// it, and only the live poll faces the query window.
-func (t *task[T]) resume(claim Claim) (Outcome[T], error) {
+// resume drives a Run that won the lease of a key whose task id is
+// recorded. The Run that recorded it stopped driving, either because its
+// process died or because its deadline passed, so this Run owns the
+// settle. A recorded verdict is honoured at any age, because the provider
+// already answered it, and only the live poll faces the query window.
+func (t *task[T]) resume(claim Claim, token int64) (Outcome[T], error) {
 	switch claim.State {
 	case StateSucceeded:
 		return t.collect(claim)
@@ -594,11 +740,92 @@ func (t *task[T]) resume(claim Claim) (Outcome[T], error) {
 	if err := t.checkWindow(claim); err != nil {
 		return Outcome[T]{}, err
 	}
-	taskID, value, usage, err := t.metered(func() (string, T, cost.Usage, error) {
+	taskID, value, usage, err := t.drive(token, func() (string, T, cost.Usage, error) {
 		v, u, werr := t.watch(claim.TaskID)
 		return claim.TaskID, v, u, werr
 	})
-	return t.land(taskID, value, usage, err)
+	return t.land(taskID, value, usage, err, token)
+}
+
+// drive runs one paid-call body under the lease token. A renewal loop
+// extends the lease on a timer of its own while the work runs, because a
+// single create or poll can outlast a renewal interval. A renewal the row
+// refuses cancels the poll phase and ends the drive with errOwnershipLost,
+// so the caller falls back to awaiting the recorded outcome the new owner
+// will produce. A renewal the store cannot write keeps the drive and waits
+// for the next tick, because an error names no new owner. The renewal
+// goroutine exits when the drive stops it, or after a refused renewal.
+func (t *task[T]) drive(token int64, work func() (string, T, cost.Usage, error)) (string, T, cost.Usage, error) {
+	t.token = token
+	t.lostLease.Store(false)
+	dctx, cancel := context.WithCancel(t.pctx)
+	t.dctx = dctx
+	stop := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(t.cfg.lease() / 3)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				ok, err := t.store.Renew(t.wctx, t.key, t.owner, token, t.now().Add(t.cfg.lease()))
+				if err != nil {
+					// The store refused the write itself, which names no
+					// new owner, so the drive continues. The token check
+					// before a settle and the token condition on Finish
+					// still block a driver the row no longer names, and
+					// the next tick extends the lease when the store
+					// recovers.
+					t.cfg.log().Warn("providertask: renew lease", "key", t.key, "error", err)
+					continue
+				}
+				if !ok {
+					// The row refused the extension, so another driver
+					// owns the settle now. Stop the poll phase and let
+					// the drive fall back to a joiner.
+					t.lostLease.Store(true)
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	defer func() {
+		close(stop)
+		cancel()
+	}()
+	taskID, value, usage, err := t.metered(work)
+	if err != nil && t.lostLease.Load() {
+		// A renewal failed while the work ran, so the fault below is the
+		// lost drive and not the provider's answer.
+		var zero T
+		return taskID, zero, cost.Usage{}, errOwnershipLost
+	}
+	return taskID, value, usage, err
+}
+
+// holdLease reports whether this Run still drives the key under token. The
+// check runs immediately before a settle, so a leader that lost its lease
+// while it worked never books alongside the new owner. The SettleOnce the
+// meter settles with stays as the backstop for the window between this
+// check and the booking.
+func (t *task[T]) holdLease(token int64) bool {
+	claim, err := t.store.Get(t.wctx, t.key)
+	if err != nil {
+		return false
+	}
+	return claim.Owner == t.owner && claim.Token == token
+}
+
+// releaseLease gives the key back when the drive ended without a verdict,
+// so the next Run takes over without waiting for expiry. A fault is
+// logged, because the lease expires on its own and a late release only
+// delays the takeover.
+func (t *task[T]) releaseLease(token int64) {
+	if err := t.store.ReleaseLease(t.wctx, t.key, t.owner, token); err != nil {
+		t.cfg.log().Warn("providertask: release lease", "key", t.key, "error", err)
+	}
 }
 
 // metered drives work through the meter when one is configured. The meter
@@ -674,19 +901,42 @@ func (t *task[T]) createWatch() (string, T, cost.Usage, error) {
 // verdict, keeps the result and returns the outcome. The verdict lands
 // before Keep, so a crash after it never re-settles a later resume, and a
 // Keep failure leaves a row a later Run can collect from without paying
-// again. Any other fault passes through.
-func (t *task[T]) land(taskID string, value T, usage cost.Usage, err error) (Outcome[T], error) {
+// again. A drive that ended without a verdict releases the lease, so the
+// next Run takes over without waiting for expiry. A lost drive is the one
+// exception, because the process that took the lease holds it now. A
+// Finish the row refuses names that loss too, so the Run falls back to
+// the recorded outcome instead of claiming a verdict it did not record.
+// Any other fault passes through.
+func (t *task[T]) land(taskID string, value T, usage cost.Usage, err error, token int64) (Outcome[T], error) {
 	var fail *TaskFailure
 	if err != nil && errors.As(err, &fail) {
-		if ferr := t.store.Finish(t.wctx, t.key, StateFailed, fail.Code); ferr != nil {
+		if ferr := t.store.Finish(t.wctx, t.key, token, StateFailed, fail.Code); ferr != nil {
+			if errors.Is(ferr, ErrStaleToken) {
+				return Outcome[T]{}, errOwnershipLost
+			}
 			t.cfg.log().Warn("providertask: record verdict", "key", t.key, "error", ferr)
 		}
 		return Outcome[T]{}, fail
 	}
 	if err != nil {
+		if !errors.Is(err, errOwnershipLost) {
+			// The drive ended without a verdict, so this Run gives the
+			// key back and the next Run takes over at once, whatever the
+			// fault was. ReleaseLease checks the owner and the token, so
+			// a lease this Run no longer holds refuses the release
+			// harmlessly.
+			t.releaseLease(token)
+		}
 		return Outcome[T]{}, err
 	}
-	if ferr := t.store.Finish(t.wctx, t.key, StateSucceeded, ""); ferr != nil {
+	if ferr := t.store.Finish(t.wctx, t.key, token, StateSucceeded, ""); ferr != nil {
+		if errors.Is(ferr, ErrStaleToken) {
+			// The driver that took the lease owns the verdict and the
+			// settle now, so this Run's own usage is not the books'
+			// answer. Fall back to the joiner and collect the recorded
+			// outcome.
+			return Outcome[T]{}, errOwnershipLost
+		}
 		t.cfg.log().Warn("providertask: record verdict", "key", t.key, "error", ferr)
 	}
 	if t.spec.Keep != nil {
@@ -721,24 +971,37 @@ func (t *task[T]) create() (string, error) {
 
 // watch polls the task to a terminal state and fetches the result. The
 // usage carries the measured price when the spec prices the result, and a
-// provider verdict of failed comes back as the error.
+// provider verdict of failed comes back as the error. The lease is checked
+// immediately before the usage is returned, because the settle follows it,
+// so a driver that lost its lease mid poll books nothing.
 func (t *task[T]) watch(taskID string) (T, cost.Usage, error) {
 	if _, err := t.poll(taskID); err != nil {
 		var zero T
 		return zero, cost.Usage{}, err
 	}
-	value, err := t.spec.Result(t.pctx, taskID)
+	value, err := t.spec.Result(t.dctx, taskID)
 	if err != nil {
 		var zero T
 		return zero, cost.Usage{}, fmt.Errorf("providertask: result %s: %w", taskID, err)
 	}
 	if t.spec.Price == nil {
+		if !t.holdLease(t.token) {
+			var zero T
+			return zero, cost.Usage{}, errOwnershipLost
+		}
 		return value, cost.Usage{}, nil
 	}
-	price, err := t.spec.Price(t.pctx, value)
+	price, err := t.spec.Price(t.dctx, value)
 	if err != nil {
 		var zero T
 		return zero, cost.Usage{}, fmt.Errorf("providertask: price %s: %w", taskID, err)
+	}
+	if !t.holdLease(t.token) {
+		// Another process took the lease while this Run worked, so the new
+		// owner settles the task. This Run books nothing and awaits the
+		// recorded outcome.
+		var zero T
+		return zero, cost.Usage{}, errOwnershipLost
 	}
 	return value, cost.Usage{Price: price, Measured: true}, nil
 }
@@ -746,13 +1009,18 @@ func (t *task[T]) watch(taskID string) (T, cost.Usage, error) {
 // poll asks the provider where the task stands until it reaches a terminal
 // state. Each wait spans half the current step to the whole step, on the
 // curve from the base to the ceiling, and the overall deadline bounds the
-// whole loop. A Status error the classifier
+// whole loop. The poll phase runs under the drive context, so a failed
+// renewal stops it at once. A Status error the classifier
 // calls transient is retried on that curve. A failed verdict and a
 // permanent error stop the loop at once.
 func (t *task[T]) poll(taskID string) (Status, error) {
+	pollCtx := t.pctx
+	if t.dctx != nil {
+		pollCtx = t.dctx
+	}
 	var verdict Status
-	err := throttle.Retry(t.pctx, t.pollCfg(), t.pollRetryable(), func() error {
-		st, err := t.spec.Status(t.pctx, taskID)
+	err := throttle.Retry(pollCtx, t.pollCfg(), t.pollRetryable(), func() error {
+		st, err := t.spec.Status(pollCtx, taskID)
 		if err != nil {
 			return err
 		}
@@ -847,43 +1115,81 @@ func (t *task[T]) checkWindow(claim Claim) error {
 
 // await waits for a key another Run holds. The other Run may be creating
 // the task right now or polling it, so this Run reads the store only and
-// never touches the provider or the meter. A row that reaches a recorded
-// verdict resolves the wait. A row past the window stops the wait, because
-// the verdict that claim is heading for will refuse the same way.
+// never touches the meter. A row that reaches a recorded verdict resolves
+// the wait. A recorded task whose lease expires mid wait is takeable,
+// because the driver that held it stopped renewing, and this Run drives it
+// like any resume. A key that still carries no task id keeps waiting even
+// past its lease, because the create that claim started may still land and
+// a second create is a second charge. A row past the window stops the
+// wait, because the verdict that claim is heading for will refuse the same
+// way.
 func (t *task[T]) await() (Outcome[T], error) {
-	var resolved Claim
-	err := throttle.Retry(t.pctx, t.pollCfg(), func(err error) bool {
-		return errors.Is(err, errPollAgain)
-	}, func() error {
-		claim, err := t.store.Get(t.pctx, t.key)
+	for {
+		var resolved Claim
+		var (
+			token int64
+			took  bool
+		)
+		err := throttle.Retry(t.pctx, t.pollCfg(), func(err error) bool {
+			return errors.Is(err, errPollAgain)
+		}, func() error {
+			claim, err := t.store.Get(t.pctx, t.key)
+			if err != nil {
+				if errors.Is(err, ErrUnknownKey) {
+					// The claim has not landed yet, so the wait continues.
+					return errPollAgain
+				}
+				return fmt.Errorf("providertask: get %s: %w", t.key, err)
+			}
+			switch claim.State {
+			case StateSucceeded, StateFailed:
+				resolved = claim
+				return nil
+			default:
+				if werr := t.checkWindow(claim); werr != nil {
+					return werr
+				}
+				if claim.TaskID == "" || claim.LeaseUntil.After(t.now()) {
+					return errPollAgain
+				}
+				// The lease expired under a recorded task, so this waiter
+				// tries the takeover. A dead leader never strands its
+				// waiters until their own deadline.
+				tok, ok, terr := t.store.TakeOver(t.pctx, t.key, t.owner, t.now(), t.cfg.lease())
+				if terr != nil {
+					return fmt.Errorf("providertask: take over %s: %w", t.key, terr)
+				}
+				if !ok {
+					// Another waiter won the expired lease first, so the
+					// wait continues.
+					return errPollAgain
+				}
+				resolved = claim
+				token, took = tok, true
+				return nil
+			}
+		})
 		if err != nil {
-			if errors.Is(err, ErrUnknownKey) {
-				// The claim has not landed yet, so the wait continues.
-				return errPollAgain
+			if errors.Is(err, errPollAgain) || errors.Is(t.pctx.Err(), context.DeadlineExceeded) {
+				return Outcome[T]{}, fmt.Errorf("providertask: key %s: %w", t.key, ErrTaskPending)
 			}
-			return fmt.Errorf("providertask: get %s: %w", t.key, err)
+			return Outcome[T]{}, err
 		}
-		switch claim.State {
-		case StateSucceeded, StateFailed:
-			resolved = claim
-			return nil
-		default:
-			if werr := t.checkWindow(claim); werr != nil {
-				return werr
+		if took {
+			// This Run owns the drive now, exactly as a resume does.
+			outcome, derr := t.resume(resolved, token)
+			if errors.Is(derr, errOwnershipLost) {
+				// The drive this waiter won was taken over again
+				// underneath it, so the wait starts over.
+				continue
 			}
-			return errPollAgain
+			return outcome, derr
 		}
-	})
-	if err == nil {
 		if resolved.State == StateFailed {
 			return Outcome[T]{}, failure(resolved.TaskID, resolved.Code)
 		}
 		return t.collect(resolved)
 	}
-	if errors.Is(err, errPollAgain) || errors.Is(t.pctx.Err(), context.DeadlineExceeded) {
-		return Outcome[T]{}, fmt.Errorf("providertask: key %s: %w", t.key, ErrTaskPending)
-	}
-	return Outcome[T]{}, err
 }
 
 // publish hands one progress report to the config's hook. An empty report

@@ -77,7 +77,7 @@ func TestOpenAppliesMigrationsOnce(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first Open: %v", err)
 	}
-	if _, _, err := first.Claim(t.Context(), "kept", base); err != nil {
+	if _, _, err := first.Claim(t.Context(), "kept", "test", base, time.Minute); err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
 
@@ -93,8 +93,93 @@ func TestOpenAppliesMigrationsOnce(t *testing.T) {
 	if err := openFresh(t, path).QueryRow("SELECT COUNT(*) FROM providertask_schema_migrations").Scan(&applied); err != nil {
 		t.Fatalf("count migrations: %v", err)
 	}
-	if applied != 1 {
-		t.Errorf("migration ledger holds %d rows, want 1", applied)
+	if applied != 2 {
+		t.Errorf("migration ledger holds %d rows, want 2", applied)
+	}
+}
+
+// TestUpgradeFromTheFirstSchemaKeepsTheRows: a database at the 0001
+// schema carrying rows upgrades to 0002 on the next open. The old rows
+// read back with an empty lease, and an upgraded running row takes a
+// takeover, a verdict and a cleared lease, the way a resumed driver
+// leaves it.
+func TestUpgradeFromTheFirstSchemaKeepsTheRows(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tasks.db")
+	seed := openFresh(t, path)
+	stmts := []string{
+		// The 0001 schema exactly as the migration file wrote it, with the
+		// ledger row that records it as applied.
+		`CREATE TABLE providertask_task (
+			key        TEXT PRIMARY KEY,
+			task_id    TEXT NOT NULL DEFAULT '',
+			state      TEXT NOT NULL DEFAULT 'running',
+			error_code TEXT NOT NULL DEFAULT '',
+			created_at INTEGER NOT NULL
+		)`,
+		`CREATE TABLE providertask_schema_migrations (
+			filename   TEXT PRIMARY KEY,
+			applied_at INTEGER NOT NULL
+		)`,
+		`INSERT INTO providertask_schema_migrations (filename, applied_at)
+			VALUES ('0001_providertask.sql', 1)`,
+		`INSERT INTO providertask_task (key, task_id, state, error_code, created_at)
+			VALUES ('old-running', 'task-old', 'running', '', 1)`,
+		`INSERT INTO providertask_task (key, task_id, state, error_code, created_at)
+			VALUES ('old-done', 'task-done', 'failed', 'unit_limit', 2)`,
+	}
+	for _, stmt := range stmts {
+		if _, err := seed.Exec(stmt); err != nil {
+			t.Fatalf("seed %q: %v", stmt, err)
+		}
+	}
+	if err := seed.Close(); err != nil {
+		t.Fatalf("close the seeded file: %v", err)
+	}
+
+	store := openStore(t, path)
+	running, err := store.Get(t.Context(), "old-running")
+	if err != nil {
+		t.Fatalf("Get old-running: %v", err)
+	}
+	if running.TaskID != "task-old" || running.State != providertask.StateRunning {
+		t.Errorf("running row = %+v, want the recorded task still running", running)
+	}
+	if running.Owner != "" || running.Token != 0 || !running.LeaseUntil.IsZero() {
+		t.Errorf("running row = %+v, want the empty lease the upgrade defaults to", running)
+	}
+	done, err := store.Get(t.Context(), "old-done")
+	if err != nil {
+		t.Fatalf("Get old-done: %v", err)
+	}
+	if done.Code != "unit_limit" || done.State != providertask.StateFailed {
+		t.Errorf("done row = %+v, want the recorded verdict", done)
+	}
+
+	// An upgraded running row leases like any other. The takeover reads
+	// token 1, one past the zero the upgrade defaulted the row to.
+	token, ok, err := store.TakeOver(t.Context(), "old-running", "test", base, time.Minute)
+	if err != nil || !ok {
+		t.Fatalf("TakeOver = %d, %v, %v, want the takeover", token, ok, err)
+	}
+	if token != 1 {
+		t.Errorf("token = %d, want 1, one past the upgraded zero", token)
+	}
+	if err := store.Finish(t.Context(), "old-running", token, providertask.StateSucceeded, ""); err != nil {
+		t.Fatalf("Finish: %v", err)
+	}
+	final, err := store.Get(t.Context(), "old-running")
+	if err != nil {
+		t.Fatalf("Get after Finish: %v", err)
+	}
+	if final.State != providertask.StateSucceeded || final.Owner != "" || !final.LeaseUntil.IsZero() {
+		t.Errorf("final row = %+v, want the verdict recorded and the lease cleared", final)
+	}
+	var applied int
+	if err := openFresh(t, path).QueryRow("SELECT COUNT(*) FROM providertask_schema_migrations").Scan(&applied); err != nil {
+		t.Fatalf("count migrations: %v", err)
+	}
+	if applied != 2 {
+		t.Errorf("migration ledger holds %d rows, want 2 after the upgrade", applied)
 	}
 }
 
@@ -111,7 +196,7 @@ func TestClaimInsertsOnceAndReportsTheWinner(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, created, err := store.Claim(t.Context(), "raced", base)
+			_, created, err := store.Claim(t.Context(), "raced", "test", base, time.Minute)
 			if err != nil {
 				t.Errorf("Claim: %v", err)
 				return
@@ -160,13 +245,13 @@ func countRows(t *testing.T, db *sql.DB, key string) int {
 // the row and no creation, and leaves the stored facts alone.
 func TestClaimReturnsTheExistingRowUnchanged(t *testing.T) {
 	store := openStore(t, filepath.Join(t.TempDir(), "tasks.db"))
-	if _, created, err := store.Claim(t.Context(), "held", base); err != nil || !created {
+	if _, created, err := store.Claim(t.Context(), "held", "test", base, time.Minute); err != nil || !created {
 		t.Fatalf("first Claim = %v %v, want created", err, created)
 	}
 	if err := store.Record(t.Context(), "held", "task-held"); err != nil {
 		t.Fatalf("Record: %v", err)
 	}
-	claim, created, err := store.Claim(t.Context(), "held", base.Add(time.Minute))
+	claim, created, err := store.Claim(t.Context(), "held", "test", base.Add(time.Minute), time.Minute)
 	if err != nil {
 		t.Fatalf("second Claim: %v", err)
 	}
@@ -183,7 +268,7 @@ func TestClaimReturnsTheExistingRowUnchanged(t *testing.T) {
 func TestClaimRoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "tasks.db")
 	store := openStore(t, path)
-	claim, created, err := store.Claim(t.Context(), "fresh", base)
+	claim, created, err := store.Claim(t.Context(), "fresh", "test", base, time.Minute)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -217,7 +302,7 @@ func TestClaimRoundTrip(t *testing.T) {
 // moves.
 func TestRecordAttachesTheTaskIDOnce(t *testing.T) {
 	store := openStore(t, filepath.Join(t.TempDir(), "tasks.db"))
-	if _, _, err := store.Claim(t.Context(), "attach", base); err != nil {
+	if _, _, err := store.Claim(t.Context(), "attach", "test", base, time.Minute); err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
 	if err := store.Record(t.Context(), "attach", "task-a"); err != nil {
@@ -248,13 +333,13 @@ func TestRecordAttachesTheTaskIDOnce(t *testing.T) {
 func TestRecordAfterFinishKeepsTheVerdict(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "tasks.db")
 	store := openStore(t, path)
-	if _, _, err := store.Claim(t.Context(), "done", base); err != nil {
+	if _, _, err := store.Claim(t.Context(), "done", "test", base, time.Minute); err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
 	if err := store.Record(t.Context(), "done", "task-done"); err != nil {
 		t.Fatalf("Record: %v", err)
 	}
-	if err := store.Finish(t.Context(), "done", providertask.StateFailed, "unit_limit"); err != nil {
+	if err := store.Finish(t.Context(), "done", 1, providertask.StateFailed, "unit_limit"); err != nil {
 		t.Fatalf("Finish: %v", err)
 	}
 	if err := store.Record(t.Context(), "done", "task-done"); err != nil {
@@ -292,10 +377,10 @@ func TestGetUnknownKey(t *testing.T) {
 // matches the sentinel.
 func TestFinishRecordsTheVerdict(t *testing.T) {
 	store := openStore(t, filepath.Join(t.TempDir(), "tasks.db"))
-	if _, _, err := store.Claim(t.Context(), "win", base); err != nil {
+	if _, _, err := store.Claim(t.Context(), "win", "test", base, time.Minute); err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
-	if _, _, err := store.Claim(t.Context(), "lose", base); err != nil {
+	if _, _, err := store.Claim(t.Context(), "lose", "test", base, time.Minute); err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
 	if err := store.Record(t.Context(), "win", "task-win"); err != nil {
@@ -304,16 +389,16 @@ func TestFinishRecordsTheVerdict(t *testing.T) {
 	if err := store.Record(t.Context(), "lose", "task-lose"); err != nil {
 		t.Fatalf("Record lose: %v", err)
 	}
-	if err := store.Finish(t.Context(), "win", providertask.StateSucceeded, ""); err != nil {
+	if err := store.Finish(t.Context(), "win", 1, providertask.StateSucceeded, ""); err != nil {
 		t.Errorf("finish succeeded: %v", err)
 	}
-	if err := store.Finish(t.Context(), "lose", providertask.StateFailed, "unit_limit"); err != nil {
+	if err := store.Finish(t.Context(), "lose", 1, providertask.StateFailed, "unit_limit"); err != nil {
 		t.Errorf("finish failed: %v", err)
 	}
-	if err := store.Finish(t.Context(), "win", providertask.StateRunning, ""); !errors.Is(err, sqlitestore.ErrInvalid) {
+	if err := store.Finish(t.Context(), "win", 1, providertask.StateRunning, ""); !errors.Is(err, sqlitestore.ErrInvalid) {
 		t.Errorf("finish running: err = %v, want ErrInvalid", err)
 	}
-	if err := store.Finish(t.Context(), "absent", providertask.StateSucceeded, ""); !errors.Is(err, providertask.ErrUnknownKey) {
+	if err := store.Finish(t.Context(), "absent", 1, providertask.StateSucceeded, ""); !errors.Is(err, providertask.ErrUnknownKey) {
 		t.Errorf("finish unknown: err = %v, want ErrUnknownKey", err)
 	}
 	win, err := store.Get(t.Context(), "win")
@@ -336,10 +421,10 @@ func TestFinishRecordsTheVerdict(t *testing.T) {
 // key that names a task is kept, and the answer says which happened.
 func TestReleaseDeletesOnlyAnEmptyClaim(t *testing.T) {
 	store := openStore(t, filepath.Join(t.TempDir(), "tasks.db"))
-	if _, _, err := store.Claim(t.Context(), "empty", base); err != nil {
+	if _, _, err := store.Claim(t.Context(), "empty", "test", base, time.Minute); err != nil {
 		t.Fatalf("Claim empty: %v", err)
 	}
-	if _, _, err := store.Claim(t.Context(), "recorded", base); err != nil {
+	if _, _, err := store.Claim(t.Context(), "recorded", "test", base, time.Minute); err != nil {
 		t.Fatalf("Claim recorded: %v", err)
 	}
 	if err := store.Record(t.Context(), "recorded", "task-recorded"); err != nil {
@@ -380,7 +465,7 @@ func TestFreshConnectionPinsRows(t *testing.T) {
 		{Key: "two", TaskID: "task-two", State: providertask.StateFailed, Code: "unit_limit", CreatedAt: base.Add(time.Second)},
 	}
 	for _, w := range want {
-		if _, _, err := store.Claim(t.Context(), w.Key, w.CreatedAt); err != nil {
+		if _, _, err := store.Claim(t.Context(), w.Key, "test", w.CreatedAt, time.Minute); err != nil {
 			t.Fatalf("Claim %s: %v", w.Key, err)
 		}
 		if w.TaskID != "" {
@@ -389,7 +474,7 @@ func TestFreshConnectionPinsRows(t *testing.T) {
 			}
 		}
 		if w.State == providertask.StateFailed {
-			if err := store.Finish(t.Context(), w.Key, w.State, w.Code); err != nil {
+			if err := store.Finish(t.Context(), w.Key, 1, w.State, w.Code); err != nil {
 				t.Fatalf("Finish %s: %v", w.Key, err)
 			}
 		}
@@ -446,7 +531,7 @@ func TestConcurrentWritesShareOneWriter(t *testing.T) {
 			defer wg.Done()
 			key := fmt.Sprintf("writer-%d", w)
 			ctx := t.Context()
-			if _, _, err := store.Claim(ctx, key, base); err != nil {
+			if _, _, err := store.Claim(ctx, key, "test", base, time.Minute); err != nil {
 				t.Errorf("Claim %s: %v", key, err)
 				return
 			}
@@ -454,7 +539,7 @@ func TestConcurrentWritesShareOneWriter(t *testing.T) {
 				t.Errorf("Record %s: %v", key, err)
 				return
 			}
-			if err := store.Finish(ctx, key, providertask.StateSucceeded, ""); err != nil {
+			if err := store.Finish(ctx, key, 1, providertask.StateSucceeded, ""); err != nil {
 				t.Errorf("Finish %s: %v", key, err)
 			}
 		}(w)
@@ -509,7 +594,7 @@ func TestStoreSurvivesAKilledProcess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("child sqlitestore.Open: %v", err)
 	}
-	if _, _, err := store.Claim(t.Context(), "survivor", base); err != nil {
+	if _, _, err := store.Claim(t.Context(), "survivor", "test", base, time.Minute); err != nil {
 		t.Fatalf("child Claim: %v", err)
 	}
 	if err := store.Record(t.Context(), "survivor", "task-survivor"); err != nil {
