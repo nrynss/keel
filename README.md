@@ -901,7 +901,7 @@ so an app that keeps blobs on disk never compiles that client.
 library. It checks neither visibility nor an authorizer, because that caller is inside the
 process and owns the decision. The reader it returns supports `Seek`, and the caller closes it.
 `Store.TempCopy` copies a stored blob into a fresh temporary file and returns a remove function
-the caller must call. The ffmpeg based packages take file paths, so stored media reaches them
+the caller must call. The ffmpeg-based packages take file paths, so stored media reaches them
 through this helper.
 
 ### Blob bytes in an S3-compatible store with mediastore/s3
