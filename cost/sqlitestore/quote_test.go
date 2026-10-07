@@ -76,6 +76,18 @@ func freshCharge(t *testing.T, path, ref string) (kind string, unitPrice int64, 
 	return kind, unitPrice, denom
 }
 
+// freshOwnerSpent reads the spend booked on one owner's account over a
+// fresh connection.
+func freshOwnerSpent(t *testing.T, path, owner string) cost.Price {
+	t.Helper()
+	var spent int64
+	if err := openFresh(t, path).QueryRow(
+		`SELECT spent_nd FROM cost_owner_budget WHERE owner = ?`, owner).Scan(&spent); err != nil {
+		t.Fatalf("read owner spend %q: %v", owner, err)
+	}
+	return cost.Price(spent)
+}
+
 // refusalOf fails the test unless err is a quote refusal, and returns it.
 func refusalOf(t *testing.T, err error) *cost.QuoteRefusal {
 	t.Helper()
@@ -669,17 +681,16 @@ func TestWorkFailureReopensQuote(t *testing.T) {
 	}
 }
 
-// TestRunSettlesAfterCallerCancel pins both sides of the cancellation
-// contract. A context cancelled before the claim stops the run and books
-// nothing. A context that dies once the work has run still leaves the
-// outcome recorded, because the spend the work caused is real.
-func TestRunSettlesAfterCallerCancel(t *testing.T) {
+// TestRunCancelledBeforeClaimBooksNothing pins the other side of the
+// cancellation contract from TestRunBooksWhenCallerCancelsAfterWork. A
+// context cancelled before the claim stops the run, so the work never
+// runs, nothing books, and the quote stays open for a retry.
+func TestRunCancelledBeforeClaimBooksNothing(t *testing.T) {
 	clock := &testClock{at: base}
 	path := filepath.Join(t.TempDir(), "cost.db")
 	store := openStore(t, path, withClock(clock.now), withLimit(100*cost.Dollar))
 	ctx := t.Context()
 	setOwnerLimit(t, sqlitestore.NewKeyedBudget(store), "alice", 10*cost.Dollar)
-
 	dead, err := store.Quote(ctx, "alice", cost.Cent, time.Hour)
 	if err != nil {
 		t.Fatalf("quote: %v", err)
@@ -698,34 +709,49 @@ func TestRunSettlesAfterCallerCancel(t *testing.T) {
 	if state := freshQuoteState(t, path, dead.ID); state != "open" {
 		t.Fatalf("refused quote state = %q, want open", state)
 	}
+}
 
+// TestRunBooksWhenCallerCancelsAfterWork pins that a cancellation after
+// the work succeeded cannot leave the action unbooked. The work signals
+// success and the caller cancels in the same instant, so the settle starts
+// on a context that is already gone. Run reports the settled outcome with
+// a nil error, the quote reads as done over a fresh connection, the ledger
+// holds the charge, the owner's spend is recorded, and the hold is freed.
+func TestRunBooksWhenCallerCancelsAfterWork(t *testing.T) {
+	clock := &testClock{at: base}
+	path := filepath.Join(t.TempDir(), "cost.db")
+	store := openStore(t, path, withClock(clock.now), withLimit(100*cost.Dollar))
+	ctx := t.Context()
+	setOwnerLimit(t, sqlitestore.NewKeyedBudget(store), "alice", 10*cost.Dollar)
 	quote, err := store.Quote(ctx, "alice", 5*cost.Cent, time.Hour)
 	if err != nil {
 		t.Fatalf("quote: %v", err)
 	}
-	runCtx, cancel := context.WithCancel(ctx)
+
+	callerCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	usage, err := store.Run(runCtx, quote.ID, func(context.Context) (cost.Usage, error) {
-		cancel()
-		return cost.Usage{Price: 4 * cost.Cent, Measured: true}, nil
+	const charged = 4 * cost.Cent
+	usage, err := store.Run(callerCtx, quote.ID, func(context.Context) (cost.Usage, error) {
+		cancel() // the caller gives up the moment the work has succeeded
+		return cost.Usage{Price: charged, Measured: true}, nil
 	})
 	if err != nil {
-		t.Fatalf("run past a caller that left: %v", err)
+		t.Fatalf("run quote past the cancellation: %v", err)
 	}
-	if usage != (cost.Usage{Price: 4 * cost.Cent, Measured: true}) {
-		t.Fatalf("usage = %+v, want the settled outcome", usage)
+	if usage != (cost.Usage{Price: charged, Measured: true}) {
+		t.Fatalf("usage = %+v, want the measured price", usage)
 	}
-	if spent := spentOf(t, store); spent != 4*cost.Cent {
-		t.Fatalf("spent = %s, want the spend the work caused to book", spent)
+	if state := freshQuoteState(t, path, quote.ID); state != "done" {
+		t.Fatalf("quote state = %q, want done", state)
 	}
-	usage, err = store.Run(ctx, quote.ID, func(context.Context) (cost.Usage, error) {
-		t.Fatal("the run after the settle ran the work")
-		return cost.Usage{}, nil
-	})
-	if err != nil {
-		t.Fatalf("replay: %v", err)
+	kind, unitPrice, denom := freshCharge(t, path, quote.ID)
+	if kind != "quoted" || unitPrice != int64(charged) || denom != "" {
+		t.Fatalf("charge = (%q, %d, %q)", kind, unitPrice, denom)
 	}
-	if usage != (cost.Usage{Price: 4 * cost.Cent, Measured: true}) {
-		t.Fatalf("replayed usage = %+v, want the recorded outcome", usage)
+	if spent := freshOwnerSpent(t, path, "alice"); spent != charged {
+		t.Fatalf("owner spend = %s, want %s", spent, charged)
+	}
+	if n := freshCount(t, path, "cost_reservation"); n != 0 {
+		t.Fatalf("reservations = %d, want the settle to free the hold", n)
 	}
 }

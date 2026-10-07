@@ -15,7 +15,7 @@ nothing logs on its own, and nothing panics.
 ## Install
 
 ```bash
-go get github.com/nrynss/keel@v0.5.0
+go get github.com/nrynss/keel@v0.6.0
 ```
 
 Go 1.27 or newer. The `ffmpeg` package runs the `ffmpeg` and `ffprobe` binaries, so install those
@@ -245,16 +245,14 @@ the quote and takes the owner's reservation in one transaction, so the claim is 
 before the work runs. A crash or a retry between claim and work can never charge twice. A
 second Run of the same id returns the first outcome and charges nothing. A concurrent Run
 in the same process waits for the one that claimed and shares its outcome, and a Run from
-another process is refused with the `quote_pending` code. A waiter whose own context is
-cancelled stops waiting and reports that error. The run it waited on still completes and
-books, so a departed waiter misses only the answer. The settled charge lands in the
-ledger under the quote's id, so a report can split quoted spend by action. Before it claims,
-Run re-checks the price through the configured `Reprice` callback, on an open quote whether
-its confirm window is live or past. A move past
+another process is refused with the `quote_pending` code. The settled charge lands in the
+ledger under the quote's id, so a report can split quoted spend by action. Once the work
+succeeds, the settle books even if the caller's context cancels, so a paid action never
+finishes unbooked. Before it claims,
+Run re-checks the price through the configured `Reprice` callback. A move past
 `QuoteTolerance` refuses with the `quote_price_moved` code and carries a fresh quote at the
-current price, so the client re-confirms before anything spends. An expired quote reprices
-first, then refuses with `quote_expired` and a fresh quote at the current price. Every
-refusal is a `cost.QuoteRefusal`
+current price, so the client re-confirms before anything spends. An expired quote refuses
+with `quote_expired` and a fresh quote the same way. Every refusal is a `cost.QuoteRefusal`
 whose `Code` is one of the stable `cost.CodeQuote` constants, ready for the `wire` envelope.
 Expired quotes are swept at open and inside every write a quote drives, so no scheduler is
 needed.

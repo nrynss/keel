@@ -241,6 +241,43 @@ func TestRecordAttachesTheTaskIDOnce(t *testing.T) {
 	}
 }
 
+// TestRecordAfterFinishKeepsTheVerdict: a repeat of the recorded id after
+// the verdict landed is not an error, and the row keeps its terminal state
+// and the provider's code. The fresh connection reads the stored bytes, so
+// the store never grades its own work.
+func TestRecordAfterFinishKeepsTheVerdict(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tasks.db")
+	store := openStore(t, path)
+	if _, _, err := store.Claim(t.Context(), "done", base); err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if err := store.Record(t.Context(), "done", "task-done"); err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+	if err := store.Finish(t.Context(), "done", providertask.StateFailed, "unit_limit"); err != nil {
+		t.Fatalf("Finish: %v", err)
+	}
+	if err := store.Record(t.Context(), "done", "task-done"); err != nil {
+		t.Errorf("repeat after the verdict: %v, want no error", err)
+	}
+	claim, err := store.Get(t.Context(), "done")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if claim.TaskID != "task-done" || claim.State != providertask.StateFailed || claim.Code != "unit_limit" {
+		t.Errorf("claim = %+v, want the failed verdict intact", claim)
+	}
+	var state, errorCode string
+	if err := openFresh(t, path).QueryRow(
+		`SELECT state, error_code FROM providertask_task WHERE key = 'done'`,
+	).Scan(&state, &errorCode); err != nil {
+		t.Fatalf("fresh query: %v", err)
+	}
+	if state != "failed" || errorCode != "unit_limit" {
+		t.Errorf("row = %q %q, want the terminal verdict the finish wrote", state, errorCode)
+	}
+}
+
 // TestGetUnknownKey: a key with no row matches the sentinel, so a waiter
 // can tell an absent claim from a broken database.
 func TestGetUnknownKey(t *testing.T) {

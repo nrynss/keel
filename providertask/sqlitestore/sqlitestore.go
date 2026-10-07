@@ -132,14 +132,15 @@ func (s *Store) Claim(ctx context.Context, key string, now time.Time) (providert
 }
 
 // Record attaches taskID to the key's row, and writes only while the row
-// still carries no task id or already carries this one. A key therefore
-// never moves to a different task. An unknown key reports an error
-// matching providertask.ErrUnknownKey.
+// still carries no task id. A key therefore never moves to a different
+// task. A repeat with the recorded id changes nothing and is not an
+// error. An unknown key reports an error matching
+// providertask.ErrUnknownKey.
 func (s *Store) Record(ctx context.Context, key, taskID string) error {
 	result, err := s.db.Writer().ExecContext(ctx,
 		`UPDATE providertask_task SET task_id = ?, state = ?, error_code = ''
-			WHERE key = ? AND task_id IN ('', ?)`,
-		taskID, rowState, key, taskID)
+			WHERE key = ? AND task_id = ''`,
+		taskID, rowState, key)
 	if err != nil {
 		return fmt.Errorf("sqlitestore: record %s: %w", key, err)
 	}
@@ -150,9 +151,9 @@ func (s *Store) Record(ctx context.Context, key, taskID string) error {
 	if updated == 1 {
 		return nil
 	}
-	// The update matched no row, which is either an unknown key or a key
-	// that already records this very id. A repeat of the recorded id is
-	// the idempotent case and is not an error.
+	// The update matched no row, which is an unknown key or a key that
+	// already carries a task id. The read tells the two apart. A repeat of
+	// the recorded id is the idempotent case and is not an error.
 	claim, err := s.Get(ctx, key)
 	if err != nil {
 		return fmt.Errorf("sqlitestore: record %s: %w", key, err)

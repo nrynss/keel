@@ -155,10 +155,12 @@ func (s *Store) Quote(ctx context.Context, owner string, estimate cost.Price, tt
 // outlives the TTL can therefore be asked to run again, so the TTL should
 // outlast the slowest quoted action. A panic in work frees the claim and
 // continues past Run with its own value and stack, as it does past the
-// meter. A cancelled context stops the claim, so nothing is booked before
-// the work runs. Once the work has run the spend is real, so the settle
-// records it on a context that survives the caller, the way the abandon
-// does. It reports ErrInvalid when quoteID is empty.
+// meter. A cancelled context stops the claim, the reprice and the work.
+// Once the work succeeds, the settle and the outcome record run on a
+// context detached from the caller's cancellation, so a late cancel
+// cannot leave a paid action unbooked. Run reports the settled outcome
+// with a nil error in that case, because the action ran and the booking
+// stands. It reports ErrInvalid when quoteID is empty.
 func (s *Store) Run(ctx context.Context, quoteID string, work cost.Work) (usage cost.Usage, err error) {
 	if quoteID == "" {
 		return cost.Usage{}, fmt.Errorf("sqlitestore: run quote: %w: the quote id must not be empty", ErrInvalid)
@@ -326,11 +328,11 @@ func (s *Store) runClaimed(ctx context.Context, quoteID string, work cost.Work, 
 		}
 		price = usage.Price
 	}
-	// The work ran, so the spend is real. The settle records it on a
-	// context that survives the caller's cancellation, the way the
-	// abandon below does, because booking money must not wait on a
-	// live request.
-	if err := s.settleQuote(context.WithoutCancel(ctx), claim, price, usage.Measured); err != nil {
+	// The work succeeded, so the booking cannot depend on the caller's
+	// context. The settle drops the cancellation and keeps the values,
+	// because a paid action that finished must always book.
+	settleCtx := context.WithoutCancel(ctx)
+	if err := s.settleQuote(settleCtx, claim, price, usage.Measured); err != nil {
 		return cost.Usage{}, err
 	}
 	live = false
