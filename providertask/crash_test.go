@@ -158,7 +158,15 @@ func TestCrashHelperProcess(t *testing.T) {
 		blockForever(ctx)
 		return providertask.Status{State: providertask.StateSucceeded}, nil
 	}
-	cfg := providertask.Config{Log: slog.New(slog.DiscardHandler)}
+	// The child's clock runs one hour behind the parent's, so the lease
+	// the killed child leaves behind is already expired when the parent
+	// resumes. The takeover the resume wins is the one a crashed driver's
+	// lease expiry grants, and the test stays short.
+	stale := time.Now().Add(-time.Hour)
+	cfg := providertask.Config{
+		Log: slog.New(slog.DiscardHandler),
+		Now: func() time.Time { return stale },
+	}
 	if _, err := providertask.Run(ctx, cfg, store, "crashed", spec); err != nil && !errors.Is(err, context.Canceled) {
 		t.Fatalf("child Run: %v", err)
 	}

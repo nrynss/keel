@@ -36,7 +36,7 @@ func Example() {
 		return
 	}
 
-	claim, created, err := store.Claim(ctx, "order-1", time.Now())
+	claim, created, err := store.Claim(ctx, "order-1", "app", time.Now(), time.Hour)
 	fmt.Println(created, claim.TaskID, claim.State, err)
 
 	// The provider call would sit between these two lines, and its task id
@@ -48,7 +48,7 @@ func Example() {
 	claim, _ = store.Get(ctx, "order-1")
 	fmt.Println(claim.TaskID)
 
-	if err := store.Finish(ctx, "order-1", providertask.StateSucceeded, ""); err != nil {
+	if err := store.Finish(ctx, "order-1", 1, providertask.StateSucceeded, ""); err != nil {
 		fmt.Println("finish failed:", err)
 		return
 	}
@@ -57,7 +57,7 @@ func Example() {
 
 	// The key is one row, so a second claim of the same key creates
 	// nothing.
-	_, created, _ = store.Claim(ctx, "order-1", time.Now())
+	_, created, _ = store.Claim(ctx, "order-1", "app", time.Now(), time.Hour)
 	fmt.Println(created)
 	// Output:
 	// true  running <nil>

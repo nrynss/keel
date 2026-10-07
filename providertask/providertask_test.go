@@ -313,7 +313,7 @@ func TestRunLandsTheVerdictInTheStore(t *testing.T) {
 func TestWindowRefusalNeverRecreates(t *testing.T) {
 	h := newHarness(t)
 	old := h.base.Add(-25 * time.Hour)
-	if _, _, err := h.store.Claim(t.Context(), "stale", old); err != nil {
+	if _, _, err := h.store.Claim(t.Context(), "stale", "test", old, time.Minute); err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
 	if err := h.store.Record(t.Context(), "stale", "task-old"); err != nil {
@@ -347,13 +347,13 @@ func TestWindowRefusalNeverRecreates(t *testing.T) {
 // second charge.
 func TestRecordedSuccessIsCollectedWithoutPollingOrSettling(t *testing.T) {
 	h := newHarness(t)
-	if _, _, err := h.store.Claim(t.Context(), "done", h.base.Add(-time.Hour)); err != nil {
+	if _, _, err := h.store.Claim(t.Context(), "done", "test", h.base.Add(-time.Hour), time.Minute); err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
 	if err := h.store.Record(t.Context(), "done", "task-done"); err != nil {
 		t.Fatalf("Record: %v", err)
 	}
-	if err := h.store.Finish(t.Context(), "done", providertask.StateSucceeded, ""); err != nil {
+	if err := h.store.Finish(t.Context(), "done", 1, providertask.StateSucceeded, ""); err != nil {
 		t.Fatalf("Finish: %v", err)
 	}
 	budget, ledger := meterOf(t, 1000)
@@ -388,13 +388,13 @@ func TestRecordedSuccessIsCollectedWithoutPollingOrSettling(t *testing.T) {
 // the provider.
 func TestRecordedFailureReturnsTheVerdict(t *testing.T) {
 	h := newHarness(t)
-	if _, _, err := h.store.Claim(t.Context(), "lost", h.base.Add(-time.Hour)); err != nil {
+	if _, _, err := h.store.Claim(t.Context(), "lost", "test", h.base.Add(-time.Hour), time.Minute); err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
 	if err := h.store.Record(t.Context(), "lost", "task-lost"); err != nil {
 		t.Fatalf("Record: %v", err)
 	}
-	if err := h.store.Finish(t.Context(), "lost", providertask.StateFailed, "content_broken"); err != nil {
+	if err := h.store.Finish(t.Context(), "lost", 1, providertask.StateFailed, "content_broken"); err != nil {
 		t.Fatalf("Finish: %v", err)
 	}
 	p := newFakeProvider(rendered{}, step{st: providertask.Status{State: providertask.StateSucceeded}})
@@ -1038,9 +1038,9 @@ type gatedStore struct {
 	gate chan struct{}
 }
 
-func (g *gatedStore) Claim(ctx context.Context, key string, now time.Time) (providertask.Claim, bool, error) {
+func (g *gatedStore) Claim(ctx context.Context, key, owner string, now time.Time, ttl time.Duration) (providertask.Claim, bool, error) {
 	<-g.gate
-	return g.Store.Claim(ctx, key, now)
+	return g.Store.Claim(ctx, key, owner, now, ttl)
 }
 
 // TestStaleVerdictsAreHonouredAtAnyAge: a recorded verdict older than the
@@ -1057,13 +1057,13 @@ func TestStaleVerdictsAreHonouredAtAnyAge(t *testing.T) {
 	}
 	plant := func(key, taskID string, state providertask.State, code string) {
 		t.Helper()
-		if _, _, err := h.store.Claim(t.Context(), key, old); err != nil {
+		if _, _, err := h.store.Claim(t.Context(), key, "test", old, time.Minute); err != nil {
 			t.Fatalf("Claim %s: %v", key, err)
 		}
 		if err := h.store.Record(t.Context(), key, taskID); err != nil {
 			t.Fatalf("Record %s: %v", key, err)
 		}
-		if err := h.store.Finish(t.Context(), key, state, code); err != nil {
+		if err := h.store.Finish(t.Context(), key, 1, state, code); err != nil {
 			t.Fatalf("Finish %s: %v", key, err)
 		}
 	}

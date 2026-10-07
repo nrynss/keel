@@ -21,7 +21,7 @@ type finishFaultStore struct {
 
 // Finish passes through until its single fault is spent, then behaves as the
 // wrapped store does.
-func (s *finishFaultStore) Finish(ctx context.Context, key string, state providertask.State, code string) error {
+func (s *finishFaultStore) Finish(ctx context.Context, key string, token int64, state providertask.State, code string) error {
 	s.mu.Lock()
 	pending := s.fails > 0
 	if pending {
@@ -31,7 +31,7 @@ func (s *finishFaultStore) Finish(ctx context.Context, key string, state provide
 	if pending {
 		return errors.New("providertask test: terminal record refused")
 	}
-	return s.Store.Finish(ctx, key, state, code)
+	return s.Store.Finish(ctx, key, token, state, code)
 }
 
 // TestResumeAfterCrashBetweenSettleAndFinishBooksOnce pins the settle-once

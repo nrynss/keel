@@ -55,7 +55,7 @@ else is pure Go, and `CGO_ENABLED=0` builds the whole module.
 | `config/source` | The five built-in secret sources that a `config.Registry` carries |
 | `fetch` | A user-supplied link fetched under an address policy enforced at dial time, with scheme, port, redirect, size, time and content type caps, and preview metadata read from the page |
 | `outbox` | Events written durably on this box first, replayed in insertion order to an app-supplied sink, with spent attempts counted and reported |
-| `providertask` | Provider tasks that are created and then polled, recorded by idempotency key before polling so a restart resumes without a second create, with a query window refusal, jittered backoff, and an immediate copy of the expiring result |
+| `providertask` | Provider tasks that are created and then polled, recorded by idempotency key before polling so a restart resumes without a second create, one driver at a time across processes under a renewed lease other processes take over once it expires, with a query window refusal, jittered backoff, and an immediate copy of the expiring result |
 | `identity` | Guest sessions resolved from a signed cookie or a bearer token, sign-in by emailed code or an external provider, guest upgrade with a conflict rule, and account deletion as one resumable job |
 
 The stores that need SQLite live one directory down, in `cache/sqlitestore`,
@@ -326,6 +326,20 @@ key finds the recorded task, polls it to its verdict, and never calls Create aga
 success is fetched and kept again without a new create, and a recorded failure returns the stored
 provider code without touching the provider.
 
+A provider task is created once and settled once, across processes, including after a crash or a
+leader stall past its lease. One process drives a recorded task at a time. Another takes over only
+after the driver's lease expires or is released. The claim carries that lease. The driver renews it
+on a timer of its own, at about a third of the lease length, so a slow create never costs it the
+drive. The lease length is about three `PollCeiling`s with a thirty second floor. A Run that takes
+a recorded task wins the lease before it resumes. One that finds the lease held waits like an
+in-process joiner, reading the row until the verdict lands or the lease expires under it. A waiter
+tries the takeover itself whenever the lease expires mid wait, so a dead leader never strands its
+waiters. A driver whose own deadline passes without a verdict releases the lease, and `Finish`
+clears it, so the next Run takes over at once. The driver checks its token immediately before it
+settles, and `Finish` refuses a token the row no longer carries. A leader stalled past its lease
+therefore neither books twice nor overwrites the verdict. Takeover compares timestamps, so
+processes sharing a store must share a clock, or keep their skew well below the lease length.
+
 A recorded task that still runs when its age passes the provider's query window refuses with
 `ErrWindowExceeded` and the stable code `task_window_exceeded`. The provider may no longer answer
 for it, so polling it would spin. A recorded verdict is honoured at any age, read back from the
@@ -339,9 +353,9 @@ which is the deliberate recovery once nothing is believed to have landed.
 Polling waits on the upper half jitter `throttle` uses, from `PollBase` to `PollCeiling`, bounded
 by `Deadline`. Each wait spans half the current step to the whole step, so the first wait lands
 between half `PollBase` and `PollBase`. A Status error the `Retryable` classifier calls transient
-waits on that curve, and anything else comes back at once. The deadline passing refuses with `ErrDeadline` and the code `task_timeout`, and a
-later Run resumes the task. A failed verdict is a `TaskFailure` carrying the provider's error code,
-and it is never retried.
+waits on that curve, and anything else comes back at once. The deadline passing refuses with
+`ErrDeadline` and the code `task_timeout`, releases the lease, and a later Run resumes the task.
+A failed verdict is a `TaskFailure` carrying the provider's error code, and it is never retried.
 
 `Keep` copies the result somewhere it outlives the link, before `Run` returns. It runs once per Run
 that reaches the result, so a repeat must land on the same bytes, which a name derived from the key
@@ -355,7 +369,8 @@ charge sink under the key as its reference, and settles through the meter's once
 books at most once. Concurrent Runs of one key share one flight through a shared `Coordinator`, so
 one task settles once and the joiners collect the recorded outcome. The settle and the terminal
 record are two writes. A crash between them books nothing on the resume, and the charge the first
-settle booked stands.
+settle booked stands. The lease narrows the window further, because one process drives a recorded
+task at a time, and the driver that stalled past its lease checks its token before it settles.
 
 `Run` publishes progress into the `job` it sits inside, so the browser sees the created stage and
 the provider's report over `stream`. Provider webhooks are out of scope, and a later Spec field

@@ -1,0 +1,3 @@
+ALTER TABLE providertask_task ADD COLUMN owner TEXT NOT NULL DEFAULT '';
+ALTER TABLE providertask_task ADD COLUMN token INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE providertask_task ADD COLUMN lease_until INTEGER NOT NULL DEFAULT 0;
