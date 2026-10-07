@@ -881,6 +881,13 @@ func (t *task[T]) createWatch() (string, T, cost.Usage, error) {
 	return taskID, value, usage, nil
 }
 
+// isDeadline reports whether a drive fault is the Run's own deadline. The
+// poll loop raises it as ErrDeadline, and the create, result and price
+// phases surface it as the context's own error.
+func isDeadline(err error) bool {
+	return errors.Is(err, ErrDeadline) || errors.Is(err, context.DeadlineExceeded)
+}
+
 // land finishes a Run that drove a task to a verdict. It records the
 // verdict, keeps the result and returns the outcome. The verdict lands
 // before Keep, so a crash after it never re-settles a later resume, and a
@@ -897,7 +904,7 @@ func (t *task[T]) land(taskID string, value T, usage cost.Usage, err error, toke
 		return Outcome[T]{}, fail
 	}
 	if err != nil {
-		if errors.Is(err, ErrDeadline) {
+		if isDeadline(err) {
 			t.releaseLease(token)
 		}
 		return Outcome[T]{}, err

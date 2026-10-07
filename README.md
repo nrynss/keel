@@ -356,8 +356,10 @@ which is the deliberate recovery once nothing is believed to have landed.
 Polling waits on the upper half jitter `throttle` uses, from `PollBase` to `PollCeiling`, bounded
 by `Deadline`. Each wait spans half the current step to the whole step, so the first wait lands
 between half `PollBase` and `PollBase`. A Status error the `Retryable` classifier calls transient
-waits on that curve, and anything else comes back at once. The deadline passing refuses with
-`ErrDeadline` and the code `task_timeout`, releases the lease, and a later Run resumes the task.
+waits on that curve, and anything else comes back at once. The deadline passing in the poll
+refuses with `ErrDeadline` and the code `task_timeout`. A deadline inside the create, result or
+price call surfaces as the context's own error instead. Either way the lease is released, and a
+later Run resumes the task.
 A failed verdict is a `TaskFailure` carrying the provider's error code, and it is never retried.
 
 `Keep` copies the result somewhere it outlives the link, before `Run` returns. It runs once per Run

@@ -619,3 +619,88 @@ func TestStaleTokenCheckSkipsTheSettle(t *testing.T) {
 		t.Errorf("charges = %d rows, want 0, the fenced settle never reaches the sink", len(charges))
 	}
 }
+
+// TestDeadlineOutsideThePollReleasesTheLease: the deadline passes while
+// the Run fetches the result or prices it, after the task id is recorded.
+// The fault surfaces as the context's own error, the lease is released on
+// the way out, and the next Run takes over at once, the way the poll
+// loop's deadline already hands the drive over.
+func TestDeadlineOutsideThePollReleasesTheLease(t *testing.T) {
+	for _, phase := range []string{"result", "price"} {
+		t.Run(phase, func(t *testing.T) {
+			h := newHarness(t)
+			_, storeB := openAt(t, h.path)
+			budget, ledger := meterOf(t, 1000)
+			meter := mustMeter(t, budget, ledger)
+
+			p := newFakeProvider(rendered{Link: "slow"},
+				step{st: providertask.Status{State: providertask.StateSucceeded}},
+			)
+			spec := p.spec(nil)
+			block := func(ctx context.Context) error {
+				<-ctx.Done()
+				return ctx.Err()
+			}
+			if phase == "result" {
+				spec.Result = func(ctx context.Context, taskID string) (rendered, error) {
+					return rendered{}, block(ctx)
+				}
+			} else {
+				spec.Price = func(ctx context.Context, value rendered) (cost.Price, error) {
+					return 0, block(ctx)
+				}
+			}
+			cfgA := h.config()
+			cfgA.Meter = meter
+			cfgA.Estimate = 10
+			cfgA.Coordinator = providertask.NewCoordinator()
+			cfgA.Deadline = 60 * time.Millisecond
+			key := "outside-" + phase
+			_, errA := providertask.Run(t.Context(), cfgA, h.store, key, spec)
+			if !errors.Is(errA, context.DeadlineExceeded) {
+				t.Fatalf("leader error = %v, want the context deadline", errA)
+			}
+			claim, err := storeB.Get(t.Context(), key)
+			if err != nil {
+				t.Fatalf("Get after the deadline: %v", err)
+			}
+			if claim.Owner != "" || !claim.LeaseUntil.IsZero() {
+				t.Fatalf("claim = %+v, want the lease released", claim)
+			}
+			if claim.State != providertask.StateRunning || claim.TaskID == "" {
+				t.Fatalf("claim = %+v, want the recorded task still running", claim)
+			}
+
+			// The second process takes the released lease at once, though
+			// the original lease would run thirty seconds more, and settles
+			// the task the leader left.
+			q := newFakeProvider(rendered{Link: "resumed"},
+				step{st: providertask.Status{State: providertask.StateSucceeded}},
+			)
+			cfgB := h.config()
+			cfgB.Meter = meter
+			cfgB.Estimate = 10
+			cfgB.Coordinator = providertask.NewCoordinator()
+			outcome, err := providertask.Run(t.Context(), cfgB, storeB, key, q.spec(nil))
+			if err != nil {
+				t.Fatalf("takeover Run: %v", err)
+			}
+			if outcome.Value.Link != "resumed" || outcome.Usage.Price != 10 {
+				t.Fatalf("takeover outcome = %+v, want the result and the settled estimate", outcome)
+			}
+			creates, statuses, _, _ := q.counts()
+			if creates != 0 {
+				t.Errorf("creates = %d, want none, the recorded task is resumed", creates)
+			}
+			if statuses != 1 {
+				t.Errorf("statuses = %d, want the takeover's single poll", statuses)
+			}
+			if got := budget.Spent(); got != 10 {
+				t.Errorf("Spent() = %d, want the single takeover booking", got)
+			}
+			if charges := ledger.Charges(); len(charges) != 1 {
+				t.Errorf("charges = %d rows, want 1", len(charges))
+			}
+		})
+	}
+}
