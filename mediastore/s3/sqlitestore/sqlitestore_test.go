@@ -164,6 +164,41 @@ func TestCreateValidatesItsSession(t *testing.T) {
 	}
 }
 
+// TestZeroCreatedAtIsStampedWithTheStoreClock pins the zero-time rule.
+// A session created without a timestamp carries the store clock, so the
+// first sweep pass reads it as fresh, and its life runs normally to the
+// delete that completes it.
+func TestZeroCreatedAtIsStampedWithTheStoreClock(t *testing.T) {
+	path := t.TempDir() + "/sessions.db"
+	store := openStore(t, path)
+	sess := session(strings.Repeat("4", 32), "upload-1")
+	sess.CreatedAt = time.Time{}
+	if err := store.Create(t.Context(), sess); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	got, err := store.Get(t.Context(), sess.BlobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.CreatedAt.Equal(base) {
+		t.Fatalf("created at = %s, want the store clock %s", got.CreatedAt, base)
+	}
+
+	removed, err := store.Sweep(t.Context(), &stubAborter{}, time.Minute)
+	if err != nil {
+		t.Fatalf("first sweep: %v", err)
+	}
+	if removed != 0 {
+		t.Fatalf("first sweep removed %d rows, want the live session untouched", removed)
+	}
+	if _, err := store.Get(t.Context(), sess.BlobID); err != nil {
+		t.Fatalf("get after the sweep: %v", err)
+	}
+	if err := store.Delete(t.Context(), sess.BlobID); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+}
+
 // TestGetAndDeleteOfAnUnknownSession pins the absence classifications.
 func TestGetAndDeleteOfAnUnknownSession(t *testing.T) {
 	store := openStore(t, t.TempDir()+"/sessions.db")

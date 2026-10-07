@@ -101,7 +101,9 @@ type Session struct {
 	PartSize int64
 	// PartCount is the number of parts the plan divides the file into.
 	PartCount int
-	// CreatedAt is when the session was recorded.
+	// CreatedAt is when the session was recorded. Zero means Create
+	// stamps the row with the store clock, so a sweep never reads a
+	// fresh session as ancient.
 	CreatedAt time.Time
 }
 
@@ -161,8 +163,13 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 
 // Create records a session. An id the table already holds is refused
 // with an error matching ErrAlreadyExists, and a session this package
-// cannot store is refused with one matching ErrInvalid.
+// cannot store is refused with one matching ErrInvalid. A zero
+// CreatedAt is stamped with the store clock, the way a mediastore row
+// is stamped.
 func (s *Store) Create(ctx context.Context, sess Session) error {
+	if sess.CreatedAt.IsZero() {
+		sess.CreatedAt = s.now()
+	}
 	if sess.BlobID == "" || sess.UploadID == "" {
 		return fmt.Errorf("sqlitestore: create %q: %w: the blob id and the upload id are required", sess.BlobID, ErrInvalid)
 	}
