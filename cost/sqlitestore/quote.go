@@ -132,26 +132,33 @@ func (s *Store) Quote(ctx context.Context, owner string, estimate cost.Price, tt
 //
 // A second Run with the same id returns the first outcome and charges
 // nothing. A concurrent Run in this process waits for the one that
-// claimed and shares its outcome. A Run from another process finds the
-// live claim and refuses with the quote_pending code, and finds the
-// recorded outcome once the claim finished.
+// claimed and shares its outcome, its failure included. A waiter whose
+// own context is cancelled stops waiting and reports its own context
+// error. The run it waited on still completes, settles and records, so a
+// departed waiter misses the answer and never the booking. A Run from
+// another process finds the live claim and refuses with the
+// quote_pending code, and finds the recorded outcome once the claim
+// finished.
 //
-// Before it claims a live quote, Run calls the configured Reprice and
-// compares the price it reports with the quoted one. A move past the
-// tolerance refuses with the quote_price_moved code and a fresh quote at
-// the current price, so the client can re-confirm before anything spends.
-// An expired quote refuses with the quote_expired code and a fresh quote
-// the same way. A quote no row backs refuses with quote_unknown. Every
-// refusal is a cost.QuoteRefusal whose Code a handler passes to the wire
-// envelope unchanged.
+// Before it claims an open quote, live or past its confirm window, Run
+// calls the configured Reprice and compares the price it reports with the
+// quoted one. A move past the tolerance refuses with the
+// quote_price_moved code and a fresh quote at the current price, so the
+// client can re-confirm before anything spends. An unmoved quote past its
+// window refuses with the quote_expired code and a fresh quote at the
+// price Reprice reported. A quote no row backs refuses with
+// quote_unknown. Every refusal is a cost.QuoteRefusal whose Code a
+// handler passes to the wire envelope unchanged.
 //
 // A claim whose runner vanishes holds the quote until the reservation TTL
 // lapses, then the sweep frees it, and the id reads as unknown. Work that
 // outlives the TTL can therefore be asked to run again, so the TTL should
 // outlast the slowest quoted action. A panic in work frees the claim and
 // continues past Run with its own value and stack, as it does past the
-// meter. A cancelled context stops the claim and the settle, so nothing
-// is booked. It reports ErrInvalid when quoteID is empty.
+// meter. A cancelled context stops the claim, so nothing is booked before
+// the work runs. Once the work has run the spend is real, so the settle
+// records it on a context that survives the caller, the way the abandon
+// does. It reports ErrInvalid when quoteID is empty.
 func (s *Store) Run(ctx context.Context, quoteID string, work cost.Work) (usage cost.Usage, err error) {
 	if quoteID == "" {
 		return cost.Usage{}, fmt.Errorf("sqlitestore: run quote: %w: the quote id must not be empty", ErrInvalid)
@@ -161,8 +168,16 @@ func (s *Store) Run(ctx context.Context, quoteID string, work cost.Work) (usage 
 	}
 	flight, leader := s.registerFlight(quoteID)
 	if !leader {
-		<-flight.done
-		return flight.usage, flight.err
+		// The waiter waits on its own context, so a cancelled caller
+		// stops waiting instead of blocking on a run it did not
+		// start. The leader completes and records either way, so a
+		// departed waiter misses the answer and never the booking.
+		select {
+		case <-flight.done:
+			return flight.usage, flight.err
+		case <-ctx.Done():
+			return cost.Usage{}, ctx.Err()
+		}
 	}
 	completed := false
 	defer func() {
@@ -183,16 +198,21 @@ func (s *Store) Run(ctx context.Context, quoteID string, work cost.Work) (usage 
 
 // registerFlight joins the in-process single-flight table for quoteID. It
 // reports the flight and whether this caller leads it. The leader runs the
-// work and every other caller waits on its outcome.
+// work and every other caller waits on its outcome. A caller that joins as
+// a waiter runs the configured onWaiterJoin hook, outside flightMu.
 func (s *Store) registerFlight(quoteID string) (*quoteFlight, bool) {
 	s.flightMu.Lock()
-	defer s.flightMu.Unlock()
-	if flight, ok := s.flights[quoteID]; ok {
-		return flight, false
+	flight, joined := s.flights[quoteID]
+	if !joined {
+		flight = &quoteFlight{done: make(chan struct{})}
+		s.flights[quoteID] = flight
 	}
-	flight := &quoteFlight{done: make(chan struct{})}
-	s.flights[quoteID] = flight
-	return flight, true
+	join := s.onWaiterJoin
+	s.flightMu.Unlock()
+	if joined && join != nil {
+		join(quoteID)
+	}
+	return flight, !joined
 }
 
 // finishFlight records the leader's outcome, removes the flight from the
@@ -238,7 +258,10 @@ func (s *Store) runLead(ctx context.Context, quoteID string, work cost.Work) (co
 		return cost.Usage{}, unknownQuote(quoteID)
 	}
 	current, repriced := row.price, false
-	if row.live(now) && s.reprice != nil {
+	if s.reprice != nil {
+		// Any open row reprices, live or past its window, so the
+		// price-moved guard covers the claim of a row even where
+		// its price is the oldest.
 		current, err = s.reprice(ctx, row.owner)
 		if err != nil {
 			return cost.Usage{}, fmt.Errorf("sqlitestore: run quote %s: reprice: %w", quoteID, err)
@@ -303,7 +326,11 @@ func (s *Store) runClaimed(ctx context.Context, quoteID string, work cost.Work, 
 		}
 		price = usage.Price
 	}
-	if err := s.settleQuote(ctx, claim, price, usage.Measured); err != nil {
+	// The work ran, so the spend is real. The settle records it on a
+	// context that survives the caller's cancellation, the way the
+	// abandon below does, because booking money must not wait on a
+	// live request.
+	if err := s.settleQuote(context.WithoutCancel(ctx), claim, price, usage.Measured); err != nil {
 		return cost.Usage{}, err
 	}
 	live = false
