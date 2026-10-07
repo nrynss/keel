@@ -1,10 +1,14 @@
-// Package mediastore persists media bytes on disk and serves them back
-// over HTTP.
+// Package mediastore persists media bytes and serves them back over
+// HTTP.
 //
-// A store owns one directory and one metadata index. Each blob is one
-// file named by its id, opened and created through an os.Root confined
-// to that directory. The metadata row lives behind the BlobIndex
-// interface, which this package declares and the caller supplies.
+// A store owns one metadata index and one blob backend. The row lives
+// behind the BlobIndex interface, which the caller supplies. The bytes
+// live behind the Backend interface. Its built-in implementation keeps
+// each blob as one file named by its id, opened and created through an
+// os.Root confined to the store directory. Config.Backend supplies a
+// different home for the bytes. A backend that needs a client library
+// lives in its own subpackage, so an app that stores on disk never
+// compiles that client.
 //
 // Store is an http.Handler. Register it at "GET /media/{id}". It
 // answers through http.ServeContent, so a Range request returns 206
@@ -12,16 +16,19 @@
 // closed set, because the handler serves the stored type verbatim.
 //
 // Configuration arrives through Config, and the package reads no
-// environment. Errors are sentinels matched with errors.Is. Every
-// Persist that returns without error survives an operating system or
-// power failure, because the bytes and their directory entry are
-// fsynced before the row is written. The promise carries one boundary.
+// environment. Errors are sentinels matched with errors.Is. On the disk
+// backend the bytes and their directory entry are fsynced before the
+// row is written. A Persist that returns without error therefore
+// survives an operating system or power failure. Every backend owns the
+// durability of the bytes it accepts, and the store writes the row only
+// after the backend returns, so the bytes-before-row order holds over
+// any of them. On disk the promise carries one boundary.
 // Open creates the store directory when it is absent but never syncs
 // its parent directory entry. A power cut inside the directory's
 // creation window can take the whole directory and every blob in it,
 // while the acknowledged rows survive and point at nothing. Past that
 // window the promise holds. A Persist that fails removes only the
-// file it created, so bytes already stored under an id are never
+// object it wrote, so bytes already stored under an id are never
 // truncated or removed.
 //
 // Snapshot writes a manifest and one file per blob, and Restore recreates
@@ -36,7 +43,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"log/slog"
 	"net/http"
 	"os"
@@ -56,8 +62,8 @@ var ErrNotFound = errors.New("not found")
 
 // ErrAlreadyExists is returned by a BlobIndex that is asked to create a
 // row for an id it already holds, and by PersistWithID when the id's
-// name is already occupied on disk. The interface documents it, so a
-// caller of PersistWithID can classify a taken id.
+// bytes are already occupied in the backend. The interface documents
+// it, so a caller of PersistWithID can classify a taken id.
 var ErrAlreadyExists = errors.New("mediastore: id already exists")
 
 // ErrInvalidContentType is returned by Persist for an empty or
@@ -103,10 +109,10 @@ const Private Visibility = ""
 const Public Visibility = "public"
 
 // Blob is the metadata of one stored blob. The bytes live in the
-// store's directory under a file named by ID.
+// store's backend under the id.
 type Blob struct {
-	// ID is the blob's name on disk and in the index. It comes from the
-	// id package, which makes it unguessable.
+	// ID is the blob's name in the backend and in the index. It comes
+	// from the id package, which makes it unguessable.
 	ID string
 	// Owner is the caller's name for whoever owns the blob. The store
 	// never interprets it.
@@ -184,9 +190,16 @@ type Put struct {
 
 // Config configures Open.
 type Config struct {
-	// Dir is the directory blob files are written under. Open creates
-	// it when it is absent.
+	// Dir is the directory the disk backend keeps blob files under.
+	// Open creates it when it is absent. It is required unless Backend
+	// names one, and a supplied Backend ignores Dir.
 	Dir string
+	// Backend holds and retrieves the blob bytes. Nil means the disk
+	// backend over Dir. A caller that keeps its bytes somewhere else
+	// supplies its own implementation here. An implementation that
+	// needs a client library lives in its own subpackage, so an app
+	// that stores on disk never compiles that client.
+	Backend Backend
 	// Index stores the metadata rows. It must not be nil.
 	Index BlobIndex
 	// Log receives one line per server fault, such as a row whose file
@@ -207,14 +220,15 @@ type Config struct {
 	Authorize func(*http.Request, Blob) bool
 }
 
-// Store persists blobs on disk, records their metadata through a
-// BlobIndex, and serves them over HTTP. Create it with Open, because
-// the zero value has no directory, no index and no clock. Store is safe
-// for concurrent use.
+// Store persists blobs through a Backend, records their metadata
+// through a BlobIndex, and serves them over HTTP. Create it with Open,
+// because the zero value has no backend, no index and no clock. Store
+// is safe for concurrent use.
 type Store struct {
 	dir       string
 	root      *os.Root
 	index     BlobIndex
+	backend   Backend
 	log       *slog.Logger
 	now       func() time.Time
 	types     map[string]bool
@@ -234,25 +248,20 @@ type Store struct {
 	syncDir func() error
 }
 
-// Open creates the blob directory when it is absent, resolves the
-// configuration, and returns the Store. The directory handle is an
-// os.Root, so every blob open and create is confined to Dir even if a
-// crafted id ever reached it.
+// Open resolves the configuration and returns the Store. Without
+// Config.Backend it creates the blob directory when it is absent and
+// installs the disk backend. The directory handle is an os.Root, so
+// every blob open and create on the disk backend is confined to Dir
+// even if a crafted id ever reached it. A supplied Backend replaces the
+// disk backend entirely, and Dir then names nothing.
 func Open(ctx context.Context, cfg Config) (*Store, error) {
-	if cfg.Dir == "" {
+	if cfg.Dir == "" && cfg.Backend == nil {
 		return nil, fmt.Errorf("mediastore: open: %w: Dir must not be empty", ErrInvalid)
 	}
 	if cfg.Index == nil {
 		return nil, fmt.Errorf("mediastore: open: %w: Index must not be nil", ErrInvalid)
 	}
 	types, err := buildTypes(cfg.ContentTypes)
-	if err != nil {
-		return nil, fmt.Errorf("mediastore: open: %w", err)
-	}
-	if err := os.MkdirAll(cfg.Dir, 0o755); err != nil {
-		return nil, fmt.Errorf("mediastore: open: create dir: %w", err)
-	}
-	root, err := os.OpenRoot(cfg.Dir)
 	if err != nil {
 		return nil, fmt.Errorf("mediastore: open: %w", err)
 	}
@@ -266,29 +275,40 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 	}
 	s := &Store{
 		dir:       cfg.Dir,
-		root:      root,
 		index:     cfg.Index,
+		backend:   cfg.Backend,
 		log:       log,
 		now:       now,
 		types:     types,
 		authorize: cfg.Authorize,
 	}
-	s.newBlob = func(blobID string) (blobFile, error) {
-		// An exclusive create never truncates a file already stored
-		// under the id, so a taken name fails with fs.ErrExist and this
-		// call leaves the existing bytes alone.
-		return s.root.OpenFile(blobID, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o666)
-	}
-	s.syncDir = func() error {
-		// The name "." is the directory the root handle confines every
-		// blob open to. Syncing that handle is the fsync that persists
-		// the entry of a file created inside it.
-		d, err := s.root.Open(".")
-		if err != nil {
-			return err
+	if cfg.Backend == nil {
+		if err := os.MkdirAll(cfg.Dir, 0o755); err != nil {
+			return nil, fmt.Errorf("mediastore: open: create dir: %w", err)
 		}
-		defer d.Close()
-		return d.Sync()
+		root, err := os.OpenRoot(cfg.Dir)
+		if err != nil {
+			return nil, fmt.Errorf("mediastore: open: %w", err)
+		}
+		s.root = root
+		s.backend = &diskBackend{store: s}
+		s.newBlob = func(blobID string) (blobFile, error) {
+			// An exclusive create never truncates a file already stored
+			// under the id, so a taken name fails with fs.ErrExist and this
+			// call leaves the existing bytes alone.
+			return s.root.OpenFile(blobID, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o666)
+		}
+		s.syncDir = func() error {
+			// The name "." is the directory the root handle confines every
+			// blob open to. Syncing that handle is the fsync that persists
+			// the entry of a file created inside it.
+			d, err := s.root.Open(".")
+			if err != nil {
+				return err
+			}
+			defer d.Close()
+			return d.Sync()
+		}
 	}
 	return s, nil
 }
@@ -324,15 +344,17 @@ func bareType(contentType string) string {
 // The content type must be one of the store's accepted types.
 // Anything else, including empty, is ErrInvalidContentType. A type with
 // parameters such as "image/png; charset=binary" is accepted and stored
-// as its bare media type. The blob's bytes and its directory entry are
-// fsynced before the metadata row is inserted, so a Persist that
-// returns without error survives an operating system or power failure.
-// The promise carries one boundary. Open creates the store directory
-// when it is absent but never syncs its parent directory entry. A
-// power cut inside the directory's creation window can take the whole
-// directory and every blob in it, while the acknowledged rows survive
-// and point at nothing. Past that window the promise holds. The copy
-// reads only from src, and ctx bounds the metadata write.
+// as its bare media type. On the disk backend the bytes and their
+// directory entry are fsynced before the metadata row is inserted. A
+// Persist that returns without error therefore survives an operating
+// system or power failure. A different backend owns the durability of
+// its own bytes, and the row is written after them either way. The
+// promise carries one boundary. Open creates the store directory when
+// it is absent but never syncs its parent directory entry. A power cut
+// inside the directory's creation window can take the whole directory
+// and every blob in it, while the acknowledged rows survive and point
+// at nothing. Past that window the promise holds. The copy reads only
+// from src, and ctx bounds the metadata write.
 func (s *Store) Persist(ctx context.Context, src io.Reader, p Put) (string, error) {
 	ct, ok := s.normalizeContentType(p.ContentType)
 	if !ok {
@@ -354,9 +376,10 @@ func (s *Store) Persist(ctx context.Context, src io.Reader, p Put) (string, erro
 // ErrNotFound, the same answer an unknown id gets.
 //
 // An id whose row the index already holds is refused with
-// ErrAlreadyExists, and so is one whose name is already occupied on
-// disk. The file is created exclusively, so a call refused this way
-// writes nothing and the blob stored under the id keeps its bytes.
+// ErrAlreadyExists, and so is one whose bytes the backend already
+// stores. The write is refused before anything is written, so a call
+// refused this way stores nothing and the blob under the id keeps its
+// bytes.
 func (s *Store) PersistWithID(ctx context.Context, blobID string, src io.Reader, p Put) error {
 	ct, ok := s.normalizeContentType(p.ContentType)
 	if !ok {
@@ -380,19 +403,18 @@ func createdAt(p Put, now time.Time) time.Time {
 	return now.UTC()
 }
 
-// persistWithID writes the bytes, then the row. The order matters in
+// persistWithID writes the object, then the row. The order matters in
 // both directions: the row is what makes the blob reachable, so the
 // bytes must be durable first, and a row that cannot be written takes
-// the file this call created with it. The bytes are created
-// exclusively, so a name already on disk is refused before anything is
-// written and the stored bytes are never touched.
+// the object this call wrote with it. The write is refused for an id
+// the backend already holds, so the stored bytes are never touched.
 func (s *Store) persistWithID(ctx context.Context, blobID string, src io.Reader, p Put) (string, error) {
-	size, err := s.writeBlob(blobID, src)
+	size, err := s.backend.Write(ctx, blobID, src)
 	if err != nil {
-		if errors.Is(err, fs.ErrExist) {
-			// writeBlob owns nothing when its exclusive create fails,
-			// so this call removes nothing and the stored bytes stand.
-			return "", fmt.Errorf("mediastore: persist %s: %w: %w", blobID, ErrAlreadyExists, err)
+		if errors.Is(err, ErrAlreadyExists) {
+			// Write owns nothing when the id is taken, so this call
+			// removes nothing and the stored bytes stand.
+			return "", fmt.Errorf("mediastore: persist %s: %w", blobID, err)
 		}
 		return "", fmt.Errorf("mediastore: persist: %w", err)
 	}
@@ -406,10 +428,13 @@ func (s *Store) persistWithID(ctx context.Context, blobID string, src io.Reader,
 		CreatedAt:   createdAt(p, s.now()),
 	}
 	if err := s.index.Create(ctx, b); err != nil {
-		// The exclusive create succeeded, so the file belongs to this
-		// call. No row means the blob is unreachable through the API,
-		// so the file is removed rather than left to leak disk space.
-		if rmErr := s.root.Remove(blobID); rmErr != nil {
+		// The write succeeded, so the object belongs to this call. No
+		// row means the blob is unreachable through the API, so it is
+		// removed rather than left to leak. The cleanup runs past a
+		// cancelled context, because a cancelled persist must still not
+		// leak the object it wrote.
+		clean := context.WithoutCancel(ctx)
+		if rmErr := s.backend.Delete(clean, blobID); rmErr != nil && !errors.Is(rmErr, ErrNotFound) {
 			s.log.Error("mediastore: orphaned blob after failed insert", "id", blobID, "err", rmErr.Error())
 		}
 		return "", fmt.Errorf("mediastore: persist: %w", err)
@@ -427,14 +452,14 @@ type blobFile interface {
 	Sync() error
 }
 
-// writeBlob copies src into a file created exclusively for id, fsyncs
-// the file, then fsyncs the blob directory, and closes, so the bytes
-// and the directory entry that names them are on disk when Persist
-// returns. The exclusive create never opens an existing file for
-// truncation, so a name already on disk reports fs.ErrExist and this
-// call writes nothing. Every failure after the create removes the file
-// this call owns, because a blob that was never inserted must not leak
-// disk space.
+// writeBlob is the disk backend's Write body. It copies src into a file
+// created exclusively for id. The file and then the blob directory are
+// fsynced before the close, so the bytes and the entry naming them are
+// on disk when Persist returns. The exclusive create never opens an
+// existing file for truncation, so a name already on disk reports
+// fs.ErrExist and this call writes nothing. Every failure after the
+// create removes the file this call owns, because a blob that was never
+// inserted must not leak disk space.
 func (s *Store) writeBlob(blobID string, src io.Reader) (int64, error) {
 	f, err := s.newBlob(blobID)
 	if err != nil {
@@ -475,8 +500,8 @@ func (s *Store) writeBlob(blobID string, src io.Reader) (int64, error) {
 	return size, nil
 }
 
-// Delete removes the blob's metadata row and then its file. The row
-// goes first, so a crash between the two leaves an unreferenced file,
+// Delete removes the blob's metadata row and then its bytes. The row
+// goes first, so a crash between the two leaves an unreferenced object,
 // which is the shape the retention sweep removes by age. An unknown or
 // malformed id returns an error matching ErrNotFound.
 func (s *Store) Delete(ctx context.Context, blobID string) error {
@@ -486,9 +511,9 @@ func (s *Store) Delete(ctx context.Context, blobID string) error {
 		}
 		return fmt.Errorf("mediastore: delete: %w", err)
 	}
-	// The file is already unreachable once the row is gone, so a
+	// The object is already unreachable once the row is gone, so a
 	// failure here is a log line and not a caller error.
-	if err := s.root.Remove(blobID); err != nil && !errors.Is(err, fs.ErrNotExist) {
+	if err := s.backend.Delete(ctx, blobID); err != nil && !errors.Is(err, ErrNotFound) {
 		s.log.Error("mediastore: unreferenced blob not removed", "id", blobID, "err", err.Error())
 	}
 	return nil
@@ -542,7 +567,7 @@ func serveNotFound(w http.ResponseWriter, r *http.Request) {
 // http.ServeContent does the protocol work, so a Range request returns
 // 206, a matching ETag returns 304, and HEAD sends no body.
 //
-// An unknown, malformed or file-less id is 404. A blob that exists but
+// An unknown, malformed or byte-less id is 404. A blob that exists but
 // cannot be opened is 500 and one log line. A private blob is served
 // only when Config.Authorize allows the request, and a refusal answers
 // the same 404 as an unknown id, with the same private cache header,
@@ -571,14 +596,14 @@ func (s *Store) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		serveNotFound(w, r)
 		return
 	}
-	f, err := s.root.Open(blobID)
+	f, err := s.backend.Open(r.Context(), blobID)
 	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			// The row says the blob exists and the file says otherwise,
-			// which is the vanished-file shape. The client sees the same
+		if errors.Is(err, ErrNotFound) {
+			// The row says the blob exists and the bytes say otherwise,
+			// which is the vanished-blob shape. The client sees the same
 			// 404 as an unknown id and the operator sees the classified
 			// error.
-			s.log.Error("mediastore: row without file", "id", blobID, "err", notFound(blobID, err).Error())
+			s.log.Error("mediastore: row without file", "id", blobID, "err", err.Error())
 			serveNotFound(w, r)
 			return
 		}

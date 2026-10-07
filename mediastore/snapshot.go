@@ -110,7 +110,9 @@ func (s *Store) Snapshot(ctx context.Context, dir string, sel Selection) error {
 	if dir == "." {
 		return fmt.Errorf("mediastore: snapshot: %w: directory must not be the current directory", ErrSnapshot)
 	}
-	if samePath(dir, s.dir) {
+	// A supplied backend may own no directory at all, in which case
+	// there is no store directory to refuse.
+	if s.dir != "" && samePath(dir, s.dir) {
 		return fmt.Errorf("mediastore: snapshot: %w: will not replace the store directory", ErrSnapshot)
 	}
 	if err := ctx.Err(); err != nil {
@@ -174,7 +176,7 @@ func (s *Store) writeSnapshot(ctx context.Context, dir string, blobs []Blob) err
 		if err := ctx.Err(); err != nil {
 			return fail(err)
 		}
-		entry, err := s.captureBlob(root, b)
+		entry, err := s.captureBlob(ctx, root, b)
 		if err != nil {
 			return fail(err)
 		}
@@ -310,13 +312,22 @@ func (s *Store) selectBlobs(ctx context.Context, sel Selection) ([]Blob, error) 
 	return out, nil
 }
 
-// captureBlob copies one blob into the snapshot directory and returns its
-// manifest entry. The digest is of the bytes just written. The bytes come
-// from openBlob, so a storage backend replaces that read without this
-// function learning where they live. The snapshot directory stays local.
-func (s *Store) captureBlob(root *os.Root, b Blob) (ManifestBlob, error) {
-	src, err := s.openBlob(b.ID)
+// captureBlob copies one blob into the snapshot directory and returns
+// its manifest entry. The digest is of the bytes just written. The
+// bytes come from the backend, so the capture never learns where they
+// live. The snapshot directory stays local.
+func (s *Store) captureBlob(ctx context.Context, root *os.Root, b Blob) (ManifestBlob, error) {
+	src, err := s.backend.Open(ctx, b.ID)
 	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			// The capture drives off rows rather than listings, so a row
+			// whose bytes are gone is a disappearance mid-capture and not
+			// an absence. It reports as a fault matching no sentinel, the
+			// reading it had before the backend seam, so the absent-object
+			// classification the backend added is dropped here on purpose.
+			// The %s keeps the text and drops the chain.
+			return ManifestBlob{}, fmt.Errorf("mediastore: snapshot %s: %s", b.ID, err)
+		}
 		return ManifestBlob{}, fmt.Errorf("mediastore: snapshot %s: %w", b.ID, err)
 	}
 	defer src.Close()
@@ -348,14 +359,6 @@ func (s *Store) captureBlob(root *os.Root, b Blob) (ManifestBlob, error) {
 		SHA256:      sum,
 		CreatedAt:   b.CreatedAt.UTC(),
 	}, nil
-}
-
-// openBlob returns a reader for the stored bytes of id. Snapshot is the
-// caller. A storage backend replaces this function. The snapshot
-// directory, a manifest plus files, is a local fixture and is not read
-// through here.
-func (s *Store) openBlob(id string) (io.ReadCloser, error) {
-	return s.root.Open(id)
 }
 
 // Restore recreates every blob in the snapshot at dir. Each blob keeps

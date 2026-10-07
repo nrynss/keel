@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/fs"
-	"os"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -23,29 +21,29 @@ import (
 //   - An unplaced row. A blob is persisted before anything claims it,
 //     so an interrupted flow leaves a row no group owns and no delete
 //     path reaches. Sweep A removes them by age.
-//   - An unreferenced file. Delete removes the row first, so a crash
-//     between the two leaves a file with no row. Sweep B removes them
-//     by file age.
+//   - An unreferenced object. Delete removes the row first, so a crash
+//     between the two leaves an object with no row. Sweep B removes
+//     them by the backend's own object age.
 //   - A whole group. Groups are what a caller evicts, because half a
 //     group is worse than none of it. Sweep C evicts whole groups,
-//     oldest first, until the directory fits the byte budget.
+//     oldest first, until the store fits the byte budget.
 //
-// A row whose file has already vanished is not reached, because the
-// pass is driven by the blob directory. That costs a row of storage and
-// no disk.
+// A row whose object has already vanished is not reached, because the
+// pass is driven by what the backend lists. That costs a row of storage
+// and no space behind the backend.
 //
 // # A veto protects an id another lifetime owner holds
 //
 // RetentionConfig.Retain is asked about every candidate id before
 // anything is deleted, and a consumer wires it to its own tracking set.
-// Even with a misconfigured age, this sweep cannot remove a row or a
-// file that owner still holds, including an id the owner reserved
+// Even with a misconfigured age, this sweep cannot remove a row or an
+// object that owner still holds, including an id the owner reserved
 // before its blob existed. A short-lived voice sample outlives neither
 // its own expiry nor this veto, and the veto is the stronger of the
 // two.
 
-// defaultMaxBytes is the default byte budget for the blob directory. A
-// few hundred groups fit in six GiB, which still leaves most of a small
+// defaultMaxBytes is the default byte budget for the store. A few
+// hundred groups fit in six GiB, which still leaves most of a small
 // disk free.
 const defaultMaxBytes int64 = 6 << 30
 
@@ -55,11 +53,11 @@ const defaultMaxBytes int64 = 6 << 30
 // leaving an in-flight persist far outside the window.
 const defaultUnplacedAge = 2 * time.Hour
 
-// defaultOrphanFileAge is how long a file with no row may live. It is
-// longer than defaultUnplacedAge on purpose, because a blob is written
-// before its row, so "no row" is briefly the normal state of a healthy
-// persist. The age is what tells a crash leftover apart from a write in
-// progress.
+// defaultOrphanFileAge is how long an object with no row may live. It
+// is longer than defaultUnplacedAge on purpose, because a blob is
+// written before its row, so "no row" is briefly the normal state of a
+// healthy persist. The age is what tells a crash leftover apart from a
+// write in progress.
 const defaultOrphanFileAge = 6 * time.Hour
 
 // defaultMinGroupAge is the youngest a group may be and still be
@@ -69,7 +67,7 @@ const defaultOrphanFileAge = 6 * time.Hour
 const defaultMinGroupAge = 24 * time.Hour
 
 // defaultMinGroups is how many of the newest groups the byte budget
-// never evicts, whatever the arithmetic says. Emptying the directory to
+// never evicts, whatever the arithmetic says. Emptying the store to
 // satisfy a budget is a worse outcome than being over it.
 const defaultMinGroups = 3
 
@@ -93,10 +91,10 @@ type RetentionConfig struct {
 	// UnplacedAge is how old a blob with no group must be before the
 	// sweep removes it. Zero means defaultUnplacedAge.
 	UnplacedAge time.Duration
-	// OrphanFileAge is how old a file with no row must be before the
+	// OrphanFileAge is how old an object with no row must be before the
 	// sweep removes it. Zero means defaultOrphanFileAge.
 	OrphanFileAge time.Duration
-	// MaxBytes is the byte budget for the blob directory. Zero means
+	// MaxBytes is the byte budget for the store. Zero means
 	// defaultMaxBytes, and a negative value is ErrInvalidRetention. Set
 	// it to Unbounded to sweep orphans only and never evict a group.
 	MaxBytes int64
@@ -127,11 +125,11 @@ type RetentionConfig struct {
 // than on a total several causes could produce.
 type SweepResult struct {
 	// UnplacedDeleted and UnplacedBytes count sweep A: aged-out rows
-	// with no group, row and file.
+	// with no group, row and object.
 	UnplacedDeleted int
 	UnplacedBytes   int64
-	// OrphanFilesDeleted and OrphanFileBytes count sweep B: files with
-	// no row at all.
+	// OrphanFilesDeleted and OrphanFileBytes count sweep B: objects
+	// with no row at all.
 	OrphanFilesDeleted int
 	OrphanFileBytes    int64
 	// GroupsEvicted and GroupBytes count sweep C: whole groups dropped
@@ -142,8 +140,8 @@ type SweepResult struct {
 	// non-zero value here is two mechanisms staying out of each other's
 	// way, not a failure.
 	Retained int
-	// BytesBefore and BytesAfter are the blob directory's measured size
-	// at the start and end of the pass.
+	// BytesBefore and BytesAfter are the store's measured size at the
+	// start and end of the pass.
 	BytesBefore int64
 	BytesAfter  int64
 }
@@ -265,7 +263,7 @@ func (w *Sweeper) Close() {
 	}
 }
 
-// blobEntry is one file in the blob directory, classified against its
+// blobEntry is one object behind the backend, classified against its
 // metadata row.
 type blobEntry struct {
 	id      string
@@ -273,19 +271,19 @@ type blobEntry struct {
 	modTime time.Time
 	group   string
 	created time.Time
-	// orphan is true when the file has no metadata row at all.
+	// orphan is true when the object has no metadata row at all.
 	orphan bool
 }
 
 // Sweep runs one retention pass: aged-out unplaced rows, then
-// unreferenced files, then whole groups when the directory is still
-// over budget, oldest first.
+// unreferenced objects, then whole groups when the store is still over
+// budget, oldest first.
 //
-// It returns what it did. A failure to remove one file is logged and
+// It returns what it did. A failure to remove one object is logged and
 // the pass continues, because a sweep that stops at the first stubborn
-// file leaves the rest of the disk uncollected, which is the failure it
-// exists to prevent. A failure to read the directory or the index is
-// returned, because nothing after it can be trusted.
+// object leaves the rest of the store uncollected, which is the failure
+// it exists to prevent. A failure to list the backend or to read the
+// index is returned, because nothing after it can be trusted.
 func (w *Sweeper) Sweep(ctx context.Context) (SweepResult, error) {
 	now := w.now()
 	blobs, err := w.scan(ctx)
@@ -310,7 +308,7 @@ func (w *Sweeper) Sweep(ctx context.Context) (SweepResult, error) {
 				live = append(live, b)
 				continue
 			}
-			if err := w.store.root.Remove(b.id); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			if err := w.store.backend.Delete(ctx, b.id); err != nil && !errors.Is(err, ErrNotFound) {
 				w.store.log.Error("mediastore: unreferenced blob not removed", "id", b.id, "err", err.Error())
 				live = append(live, b)
 				continue
@@ -344,39 +342,32 @@ func (w *Sweeper) Sweep(ctx context.Context) (SweepResult, error) {
 	return result, nil
 }
 
-// scan lists the blob directory and classifies every file against its
-// row. A file whose name is not a blob id is ignored entirely, because
-// this package named every blob it wrote and anything else belongs to
+// scan lists the objects the backend holds and classifies each against
+// its row. A name that is not a blob id is ignored entirely, because
+// this package named every object it wrote and anything else belongs to
 // somebody the sweep has no business deleting.
 //
-// The lookups run one at a time in directory order. Each is a point
+// The lookups run one at a time in listing order. Each is a point
 // read on the index, and the whole pass runs on a sweep ticker rather
-// than on a request, so holding the index for the length of a directory
-// listing buys nothing.
+// than on a request, so holding the index for the length of a listing
+// buys nothing.
 func (w *Sweeper) scan(ctx context.Context) ([]blobEntry, error) {
-	entries, err := os.ReadDir(w.store.dir)
+	objects, err := w.store.backend.List(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("mediastore: sweep: read blob dir: %w", err)
+		return nil, fmt.Errorf("mediastore: sweep: list blobs: %w", err)
 	}
-	blobs := make([]blobEntry, 0, len(entries))
-	for _, entry := range entries {
-		if entry.IsDir() || !id.Valid(entry.Name()) {
+	blobs := make([]blobEntry, 0, len(objects))
+	for _, o := range objects {
+		if !id.Valid(o.ID) {
 			continue
 		}
-		info, err := entry.Info()
-		if err != nil {
-			if errors.Is(err, fs.ErrNotExist) {
-				continue // removed under us, so the next pass will not see it
-			}
-			return nil, fmt.Errorf("mediastore: sweep: stat %s: %w", entry.Name(), err)
-		}
-		b := blobEntry{id: entry.Name(), size: info.Size(), modTime: info.ModTime()}
+		b := blobEntry{id: o.ID, size: o.SizeBytes, modTime: o.ModTime}
 		m, err := w.store.find(ctx, b.id)
 		switch {
 		case errors.Is(err, ErrNotFound):
 			b.orphan = true
 		case err != nil:
-			// A failed lookup means this file was classified as
+			// A failed lookup means this object was classified as
 			// nothing, so the failure reaches the caller rather than
 			// reading as a clean pass.
 			return nil, fmt.Errorf("mediastore: sweep: %w", err)
@@ -391,12 +382,12 @@ func (w *Sweeper) scan(ctx context.Context) ([]blobEntry, error) {
 // enforceBudget evicts whole groups, oldest first, until the surviving
 // blobs fit the byte budget. A group is the unit because half a group
 // is worse than a group that is gone, so one removal takes every row
-// and every file the group held.
+// and every object the group held.
 //
 // Three things are never evicted, whatever the arithmetic says: a group
 // in Protected, a group younger than MinGroupAge, whose work may still
-// be running, and the newest MinGroups groups, because an empty
-// directory is worse than an over-budget one.
+// be running, and the newest MinGroups groups, because an empty store
+// is worse than an over-budget one.
 func (w *Sweeper) enforceBudget(ctx context.Context, now time.Time, live []blobEntry) (int, int64, error) {
 	if w.maxBytes < 0 {
 		return 0, 0, nil
@@ -439,9 +430,9 @@ func (w *Sweeper) enforceBudget(ctx context.Context, now time.Time, live []blobE
 		if err != nil {
 			return evicted, freed, err
 		}
-		// byGroup is what this pass measured on disk, and the rows' own
-		// sizes are the fallback for a blob written between the
-		// directory scan and the eviction.
+		// byGroup is what this pass measured through the backend, and
+		// the rows' own sizes are the fallback for a blob written
+		// between the listing and the eviction.
 		size := byGroup[group.ID]
 		if removed > size {
 			size = removed
@@ -453,9 +444,9 @@ func (w *Sweeper) enforceBudget(ctx context.Context, now time.Time, live []blobE
 	return evicted, freed, nil
 }
 
-// evictGroup deletes one group and every file its rows named. The group
-// arrives with its blobs already read, because the delete takes the
-// rows and nothing could name the files afterwards.
+// evictGroup deletes one group and every object its rows named. The
+// group arrives with its blobs already read, because the delete takes
+// the rows and nothing could name the objects afterwards.
 func (w *Sweeper) evictGroup(ctx context.Context, group Group) (int64, error) {
 	err := w.store.index.DeleteGroup(ctx, group.ID)
 	if errors.Is(err, ErrNotFound) {
@@ -467,14 +458,12 @@ func (w *Sweeper) evictGroup(ctx context.Context, group Group) (int64, error) {
 	var freed int64
 	for _, b := range group.Blobs {
 		if w.retain(b.ID) {
-			// The veto is absolute, so the file stays and its owner
+			// The veto is absolute, so the object stays and its owner
 			// removes it.
 			continue
 		}
-		if err := w.store.root.Remove(b.ID); err != nil {
-			if !errors.Is(err, fs.ErrNotExist) {
-				w.store.log.Error("mediastore: evicted blob not removed", "id", b.ID, "group", group.ID, "err", err.Error())
-			}
+		if err := w.store.backend.Delete(ctx, b.ID); err != nil && !errors.Is(err, ErrNotFound) {
+			w.store.log.Error("mediastore: evicted blob not removed", "id", b.ID, "group", group.ID, "err", err.Error())
 			continue
 		}
 		freed += b.SizeBytes
