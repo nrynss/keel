@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -1041,5 +1042,142 @@ func TestPersistSyncFailureWithFailingRemoveLogsOrphan(t *testing.T) {
 	}
 	if !logs.has("mediastore: partial blob not removed") {
 		t.Fatal("no partial-blob-not-removed line was logged")
+	}
+}
+
+// syncCounter replaces the store's directory sync with one that counts
+// its calls and can fail on demand. A power cut cannot be reproduced in
+// a test, so the pins hold the call itself: once per created blob on
+// every create path, and a refusal with cleanup when it fails.
+type syncCounter struct {
+	calls int
+	fail  error
+}
+
+func (sc *syncCounter) sync() error {
+	sc.calls++
+	return sc.fail
+}
+
+// TestPersistSyncsBlobDirectoryOncePerBlob: both public create paths
+// funnel through writeBlob, so a Persist and a PersistWithID each pay
+// exactly one directory sync. That sync is what makes the create itself
+// survive a power cut on filesystems where a file's own fsync does not
+// persist the file's directory entry.
+func TestPersistSyncsBlobDirectoryOncePerBlob(t *testing.T) {
+	s := openTestStore(t)
+	sc := &syncCounter{}
+	s.syncDir = sc.sync
+	if _, err := s.Persist(t.Context(), bytes.NewReader(blob(64)), Put{ContentType: "image/png"}); err != nil {
+		t.Fatalf("persist: %v", err)
+	}
+	blobID, err := id.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PersistWithID(t.Context(), blobID, bytes.NewReader(blob(64)), Put{ContentType: "image/png"}); err != nil {
+		t.Fatalf("persist with id: %v", err)
+	}
+	if sc.calls != 2 {
+		t.Fatalf("directory sync ran %d times for two created blobs, want 2", sc.calls)
+	}
+}
+
+// TestRestoreSyncsBlobDirectoryPerBlob: a restore creates its blobs
+// through the same write path as a persist, so each restored blob pays
+// one directory sync and a restored row can never name a file the next
+// power cut takes away.
+func TestRestoreSyncsBlobDirectoryPerBlob(t *testing.T) {
+	src := openTestStore(t)
+	first := putBytes(t, src, "one", Put{ContentType: "image/png", Owner: "alice"})
+	second := putBytes(t, src, "two", Put{ContentType: "image/png", Owner: "alice"})
+	dir := filepath.Join(t.TempDir(), "snap")
+	if err := src.Snapshot(t.Context(), dir, Selection{IDs: []string{first, second}}); err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	dst := openTestStore(t)
+	sc := &syncCounter{}
+	dst.syncDir = sc.sync
+	if err := dst.Restore(t.Context(), dir); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	if sc.calls != 2 {
+		t.Fatalf("directory sync ran %d times for two restored blobs, want 2", sc.calls)
+	}
+}
+
+// TestPersistDirSyncFailureRemovesPartialBlob: a failed directory sync
+// refuses the write, the same way a failed file fsync does. The bytes
+// may be on disk, but the entry that names them is not, so the file
+// this call created is removed and no row lands.
+func TestPersistDirSyncFailureRemovesPartialBlob(t *testing.T) {
+	s := openTestStore(t)
+	s.syncDir = func() error { return errors.New("directory sync refuses") }
+	blobID, err := s.Persist(t.Context(), bytes.NewReader(blob(64)), Put{ContentType: "image/png"})
+	if err == nil || !strings.Contains(err.Error(), "sync dir blob") {
+		t.Fatalf("err = %v, want the directory sync failure", err)
+	}
+	if blobID != "" {
+		t.Fatalf("persist returned id %q alongside an error", blobID)
+	}
+	emptyDir(t, s.dir)
+	rows, err := s.index.Blobs(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("index holds %d rows after a refused persist, want none", len(rows))
+	}
+}
+
+// syncSpy records the order of the two sync seams in one shared
+// sequence. The data promise rests on that order, not on the presence
+// of the calls alone, so the file's Sync must land in the sequence
+// before the directory sync of the same blob.
+type syncSpy struct {
+	events []string
+	fail   error
+}
+
+// spiedBlob serves real writes through the underlying file and records
+// each Sync through the shared spy. It is the newBlob half of the seam
+// pair, the directory sync being the other half.
+type spiedBlob struct {
+	*os.File
+	spy *syncSpy
+}
+
+func (f *spiedBlob) Sync() error {
+	f.spy.events = append(f.spy.events, "file sync")
+	return f.File.Sync()
+}
+
+func (sp *syncSpy) syncDir() error {
+	sp.events = append(sp.events, "dir sync")
+	return sp.fail
+}
+
+// TestPersistSyncsFileBeforeDirectory: the blob's bytes must reach
+// stable storage before its directory entry is flushed, so each
+// created blob's directory sync is preceded by that blob's file sync.
+// Moving the directory sync above the file sync in writeBlob fails
+// this pin.
+func TestPersistSyncsFileBeforeDirectory(t *testing.T) {
+	s := openTestStore(t)
+	sp := &syncSpy{}
+	s.syncDir = sp.syncDir
+	s.newBlob = func(blobID string) (blobFile, error) {
+		f, err := s.root.Create(blobID)
+		if err != nil {
+			return nil, err
+		}
+		return &spiedBlob{File: f, spy: sp}, nil
+	}
+	if _, err := s.Persist(t.Context(), bytes.NewReader(blob(64)), Put{ContentType: "image/png"}); err != nil {
+		t.Fatalf("persist: %v", err)
+	}
+	want := []string{"file sync", "dir sync"}
+	if !slices.Equal(sp.events, want) {
+		t.Fatalf("sync events = %v, want %v", sp.events, want)
 	}
 }
