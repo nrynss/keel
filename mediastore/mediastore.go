@@ -189,9 +189,16 @@ type Put struct {
 
 // Config configures Open.
 type Config struct {
-	// Dir is the directory blob files are written under. Open creates
-	// it when it is absent.
+	// Dir is the directory the disk backend keeps blob files under.
+	// Open creates it when it is absent. It is required unless Backend
+	// names one, and a supplied Backend ignores Dir.
 	Dir string
+	// Backend holds and retrieves the blob bytes. Nil means the disk
+	// backend over Dir. A caller that keeps its bytes somewhere else
+	// supplies its own implementation here. An implementation that
+	// needs a client library lives in its own subpackage, so an app
+	// that stores on disk never compiles that client.
+	Backend Backend
 	// Index stores the metadata rows. It must not be nil.
 	Index BlobIndex
 	// Log receives one line per server fault, such as a row whose file
@@ -240,25 +247,20 @@ type Store struct {
 	syncDir func() error
 }
 
-// Open creates the blob directory when it is absent, resolves the
-// configuration, and returns the Store. The directory handle is an
-// os.Root, so every blob open and create on the disk backend is
-// confined to Dir even if a crafted id ever reached it.
+// Open resolves the configuration and returns the Store. Without
+// Config.Backend it creates the blob directory when it is absent and
+// installs the disk backend. The directory handle is an os.Root, so
+// every blob open and create on the disk backend is confined to Dir
+// even if a crafted id ever reached it. A supplied Backend replaces the
+// disk backend entirely, and Dir then names nothing.
 func Open(ctx context.Context, cfg Config) (*Store, error) {
-	if cfg.Dir == "" {
+	if cfg.Dir == "" && cfg.Backend == nil {
 		return nil, fmt.Errorf("mediastore: open: %w: Dir must not be empty", ErrInvalid)
 	}
 	if cfg.Index == nil {
 		return nil, fmt.Errorf("mediastore: open: %w: Index must not be nil", ErrInvalid)
 	}
 	types, err := buildTypes(cfg.ContentTypes)
-	if err != nil {
-		return nil, fmt.Errorf("mediastore: open: %w", err)
-	}
-	if err := os.MkdirAll(cfg.Dir, 0o755); err != nil {
-		return nil, fmt.Errorf("mediastore: open: create dir: %w", err)
-	}
-	root, err := os.OpenRoot(cfg.Dir)
 	if err != nil {
 		return nil, fmt.Errorf("mediastore: open: %w", err)
 	}
@@ -272,30 +274,40 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 	}
 	s := &Store{
 		dir:       cfg.Dir,
-		root:      root,
 		index:     cfg.Index,
+		backend:   cfg.Backend,
 		log:       log,
 		now:       now,
 		types:     types,
 		authorize: cfg.Authorize,
 	}
-	s.backend = &diskBackend{store: s}
-	s.newBlob = func(blobID string) (blobFile, error) {
-		// An exclusive create never truncates a file already stored
-		// under the id, so a taken name fails with fs.ErrExist and this
-		// call leaves the existing bytes alone.
-		return s.root.OpenFile(blobID, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o666)
-	}
-	s.syncDir = func() error {
-		// The name "." is the directory the root handle confines every
-		// blob open to. Syncing that handle is the fsync that persists
-		// the entry of a file created inside it.
-		d, err := s.root.Open(".")
-		if err != nil {
-			return err
+	if cfg.Backend == nil {
+		if err := os.MkdirAll(cfg.Dir, 0o755); err != nil {
+			return nil, fmt.Errorf("mediastore: open: create dir: %w", err)
 		}
-		defer d.Close()
-		return d.Sync()
+		root, err := os.OpenRoot(cfg.Dir)
+		if err != nil {
+			return nil, fmt.Errorf("mediastore: open: %w", err)
+		}
+		s.root = root
+		s.backend = &diskBackend{store: s}
+		s.newBlob = func(blobID string) (blobFile, error) {
+			// An exclusive create never truncates a file already stored
+			// under the id, so a taken name fails with fs.ErrExist and this
+			// call leaves the existing bytes alone.
+			return s.root.OpenFile(blobID, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o666)
+		}
+		s.syncDir = func() error {
+			// The name "." is the directory the root handle confines every
+			// blob open to. Syncing that handle is the fsync that persists
+			// the entry of a file created inside it.
+			d, err := s.root.Open(".")
+			if err != nil {
+				return err
+			}
+			defer d.Close()
+			return d.Sync()
+		}
 	}
 	return s, nil
 }

@@ -110,7 +110,9 @@ func (s *Store) Snapshot(ctx context.Context, dir string, sel Selection) error {
 	if dir == "." {
 		return fmt.Errorf("mediastore: snapshot: %w: directory must not be the current directory", ErrSnapshot)
 	}
-	if samePath(dir, s.dir) {
+	// A supplied backend may own no directory at all, in which case
+	// there is no store directory to refuse.
+	if s.dir != "" && samePath(dir, s.dir) {
 		return fmt.Errorf("mediastore: snapshot: %w: will not replace the store directory", ErrSnapshot)
 	}
 	if err := ctx.Err(); err != nil {

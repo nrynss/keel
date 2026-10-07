@@ -35,8 +35,8 @@ type Object struct {
 
 // Backend stores and retrieves the bytes behind a blob id. It is the
 // seam between this package's metadata and the place the bytes live.
-// Open installs the disk backend over Config.Dir, and a caller that
-// needs another home for its bytes supplies its own implementation.
+// Open installs the disk backend over Config.Dir, and Config.Backend
+// replaces it with an implementation of the caller's own.
 //
 // The interface carries no directory, no rename and no parent handle.
 // One id names one immutable object, and a backend owns its own
@@ -49,6 +49,15 @@ type Object struct {
 // an error matching ErrNotFound, and a Write against a taken id is one
 // matching ErrAlreadyExists. Every other error is a fault the store
 // reports as one.
+//
+// Presigned reads are deliberately absent from this interface. A
+// short-lived read URL is a capability of some homes for bytes and not
+// of others: a bucket can hand one out and a directory cannot. A
+// backend that can issue one declares it on its own concrete type in
+// its own subpackage. The app holds that type beside the store and asks
+// for the URL only after its own authorizer has passed. The interface
+// stays at the operations every home shares, so the disk store never
+// carries a URL it cannot honour.
 //
 // The durability split runs along one line. A backend owns the
 // durability of the bytes it accepts. The disk backend fsyncs the file
