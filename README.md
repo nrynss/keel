@@ -333,15 +333,18 @@ A provider task is created once and settled once, across processes, including af
 leader stall past its lease. One process drives a recorded task at a time. Another takes over only
 after the driver's lease expires or is released. The claim carries that lease. The driver renews it
 on a timer of its own, at about a third of the lease length, so a slow create never costs it the
-drive. The lease length is about three `PollCeiling`s with a thirty second floor. A Run that takes
-a recorded task wins the lease before it resumes. One that finds the lease held waits like an
-in-process joiner, reading the row until the verdict lands or the lease expires under it. A waiter
-tries the takeover itself whenever the lease expires mid wait, so a dead leader never strands its
-waiters. A driver whose own deadline passes without a verdict releases the lease, and `Finish`
-clears it, so the next Run takes over at once. The driver checks its token immediately before it
-settles, and `Finish` refuses a token the row no longer carries. A leader stalled past its lease
-therefore neither books twice nor overwrites the verdict. Takeover compares timestamps, so
-processes sharing a store must share a clock, or keep their skew well below the lease length.
+drive. A renewal the store cannot write waits for the next tick, because an error names no new
+owner, and a renewal the row refuses ends the drive. The lease length is about three `PollCeiling`s
+with a thirty-second floor. A Run that takes a recorded task wins the lease before it resumes. One
+that finds the lease held waits like an in-process joiner, reading the row until the verdict lands
+or the lease expires under it. A waiter tries the takeover itself whenever the lease expires mid
+wait, so a dead leader never strands its waiters. A drive that ends without a verdict releases the
+lease, and `Finish` clears it, so the next Run takes over at once. The driver checks its token
+immediately before it settles, and `Finish` refuses a token the row no longer carries. A leader
+stalled past its lease therefore neither books twice nor overwrites the verdict, and a `Finish` the
+row refuses sends the Run to the recorded outcome, because the driver that took over owns the
+verdict and the settle. Takeover compares timestamps, so processes sharing a store must share a
+clock, or keep their skew well below the lease length.
 
 A recorded task that still runs when its age passes the provider's query window refuses with
 `ErrWindowExceeded` and the stable code `task_window_exceeded`. The provider may no longer answer
@@ -358,8 +361,8 @@ by `Deadline`. Each wait spans half the current step to the whole step, so the f
 between half `PollBase` and `PollBase`. A Status error the `Retryable` classifier calls transient
 waits on that curve, and anything else comes back at once. The deadline passing in the poll
 refuses with `ErrDeadline` and the code `task_timeout`. A deadline inside the create, result or
-price call surfaces as the context's own error instead. Either way the lease is released, and a
-later Run resumes the task.
+price call surfaces as the context's own error instead. Every drive that ends without a verdict
+releases the lease, so a later Run resumes the task without waiting for the lease.
 A failed verdict is a `TaskFailure` carrying the provider's error code, and it is never retried.
 
 `Keep` copies the result somewhere it outlives the link, before `Run` returns. It runs once per Run

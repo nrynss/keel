@@ -34,7 +34,7 @@ func (c *leaseClock) advance(d time.Duration) {
 
 // newLeaseClock returns a clock at the harness base with a config whose
 // waits are fast and whose clock is the shared one. The lease length stays
-// at its thirty second floor, and the tests move the clock past it instead
+// at its thirty-second floor, and the tests move the clock past it instead
 // of waiting.
 func newLeaseClock(h *harness) (*leaseClock, providertask.Config) {
 	clk := &leaseClock{at: h.base}
@@ -417,9 +417,11 @@ func TestStalledLeaderWithStaleTokenBooksNothing(t *testing.T) {
 	cfgA.Estimate = 10
 	cfgA.Coordinator = coordinatorA
 	doneA := make(chan struct{})
+	var outcomeA providertask.Outcome[rendered]
+	var errA error
 	go func() {
 		defer close(doneA)
-		_, _ = providertask.Run(t.Context(), cfgA, finishA, "fenced", p.spec(nil))
+		outcomeA, errA = providertask.Run(t.Context(), cfgA, finishA, "fenced", p.spec(nil))
 	}()
 	// The leader parks inside its settle with its token still fresh.
 	<-gated.entered
@@ -443,9 +445,19 @@ func TestStalledLeaderWithStaleTokenBooksNothing(t *testing.T) {
 	}
 
 	// The leader wakes. Its settle books nothing and frees its hold, and
-	// its stale Finish refuses.
+	// its stale Finish refuses, so the Run falls back to the recorded
+	// outcome instead of claiming a verdict it did not record.
 	close(gated.gate)
 	<-doneA
+	if errA != nil {
+		t.Errorf("leader Run = %v, want the collected recorded outcome", errA)
+	}
+	if outcomeA.Value.Link != "fenced" {
+		t.Errorf("leader outcome = %+v, want the recorded result collected", outcomeA)
+	}
+	if outcomeA.Usage != (cost.Usage{}) {
+		t.Errorf("leader usage = %+v, want the zero usage, the takeover settled", outcomeA.Usage)
+	}
 	if got := budget.Spent(); got != 10 {
 		t.Errorf("Spent() after the wake = %d, want the single booking", got)
 	}
@@ -471,9 +483,15 @@ func TestStalledLeaderWithStaleTokenBooksNothing(t *testing.T) {
 	if claim.State != providertask.StateSucceeded {
 		t.Errorf("state = %s, want the takeover's verdict intact", claim.State)
 	}
-	creates, _, _, _ := p.counts()
+	creates, statuses, results, _ := p.counts()
 	if creates != 1 {
 		t.Errorf("creates = %d, want the leader's single create", creates)
+	}
+	// The leader's fallback collects the recorded outcome, which fetches
+	// the result a second time for that Run. A leader that claimed its own
+	// outcome instead would stop at two fetches.
+	if statuses != 2 || results != 3 {
+		t.Errorf("statuses = %d results = %d, want two polls and three fetches, the leader collects the recorded outcome", statuses, results)
 	}
 }
 
@@ -564,6 +582,119 @@ func TestRenewalFailureFallsBackToAwait(t *testing.T) {
 	}
 	if got := budget.Spent(); got != 10 {
 		t.Errorf("Spent() = %d, want the single takeover booking", got)
+	}
+	if charges := ledger.Charges(); len(charges) != 1 {
+		t.Errorf("charges = %d rows, want 1", len(charges))
+	}
+}
+
+// renewFaultStore fails the first renewals with a store error, then lets
+// every later one through. An error names no new owner, which is not the
+// same as the row refusing the extension.
+type renewFaultStore struct {
+	providertask.Store
+	failLeft atomic.Int64
+	errors   atomic.Int64
+	passes   atomic.Int64
+	renewed  chan struct{}
+	once     sync.Once
+}
+
+func (s *renewFaultStore) Renew(ctx context.Context, key, owner string, token int64, until time.Time) (bool, error) {
+	if s.failLeft.Add(-1) >= 0 {
+		s.errors.Add(1)
+		return false, errors.New("providertask test: renew refused by the store")
+	}
+	if s.passes.Add(1) == 1 {
+		s.once.Do(func() { close(s.renewed) })
+	}
+	return s.Store.Renew(ctx, key, owner, token, until)
+}
+
+// TestRenewErrorKeepsTheDrive: a Renew that comes back with a store error
+// names no new owner, so the drive continues across two failed ticks, the
+// third renewal extends the lease, and the Run finishes under its own
+// token, which a lost drive would have surrendered. The ticker runs on
+// wall time at one third of the lease, so this test waits out three ticks.
+func TestRenewErrorKeepsTheDrive(t *testing.T) {
+	h := newHarness(t)
+	budget, ledger := meterOf(t, 1000)
+	meter := mustMeter(t, budget, ledger)
+
+	p := newFakeProvider(rendered{Link: "patient"})
+	spec := p.spec(nil)
+	gate := make(chan struct{})
+	var statuses atomic.Int64
+	spec.Status = func(ctx context.Context, taskID string) (providertask.Status, error) {
+		statuses.Add(1)
+		select {
+		case <-gate:
+			return providertask.Status{State: providertask.StateSucceeded}, nil
+		case <-ctx.Done():
+			return providertask.Status{}, ctx.Err()
+		}
+	}
+	wrapped := &renewFaultStore{Store: h.store, renewed: make(chan struct{})}
+	wrapped.failLeft.Store(2)
+	cfgA := h.config()
+	cfgA.Meter = meter
+	cfgA.Estimate = 10
+	cfgA.Coordinator = providertask.NewCoordinator()
+	cfgA.Deadline = 90 * time.Second
+	doneA := make(chan struct{})
+	var outcomeA providertask.Outcome[rendered]
+	var errA error
+	go func() {
+		defer close(doneA)
+		outcomeA, errA = providertask.Run(t.Context(), cfgA, wrapped, "patient", spec)
+	}()
+
+	// The first two ticks error, and the drive is still parked on its
+	// provider call. The third tick succeeds, so the lease is extended.
+	deadline := time.Now().Add(60 * time.Second)
+	for wrapped.errors.Load() < 2 {
+		if time.Now().After(deadline) {
+			t.Fatal("the second renewal error never came")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case <-wrapped.renewed:
+	case <-time.After(45 * time.Second):
+		t.Fatal("the renewal never succeeded after the errors")
+	}
+
+	// The work ends, and the Run finishes under the token it started
+	// with, which only a drive that never lost the lease can do.
+	close(gate)
+	<-doneA
+	if errA != nil {
+		t.Fatalf("Run: %v", errA)
+	}
+	if outcomeA.Value.Link != "patient" || outcomeA.Usage.Price != 10 {
+		t.Fatalf("outcome = %+v, want the result and the settled estimate", outcomeA)
+	}
+	if got := statuses.Load(); got != 1 {
+		t.Errorf("statuses = %d, want the one parked provider call", got)
+	}
+	if wrapped.passes.Load() < 1 || wrapped.errors.Load() != 2 {
+		t.Errorf("renewals = %d errors, %d passes, want two errors then a pass", wrapped.errors.Load(), wrapped.passes.Load())
+	}
+	claim, err := h.store.Get(t.Context(), "patient")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if claim.State != providertask.StateSucceeded {
+		t.Errorf("state = %s, want the verdict recorded", claim.State)
+	}
+	if claim.Token != 1 {
+		t.Errorf("token = %d, want 1, the drive never lost the lease", claim.Token)
+	}
+	if claim.Owner != "" || !claim.LeaseUntil.IsZero() {
+		t.Errorf("claim = %+v, want the lease cleared by Finish", claim)
+	}
+	if got := budget.Spent(); got != 10 {
+		t.Errorf("Spent() = %d, want the single booking", got)
 	}
 	if charges := ledger.Charges(); len(charges) != 1 {
 		t.Errorf("charges = %d rows, want 1", len(charges))
@@ -703,4 +834,210 @@ func TestDeadlineOutsideThePollReleasesTheLease(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestStaleFinishOnAFailedVerdictFallsBackToTheRecordedOne: a leader that
+// lost its lease and then records a failed verdict has the record refused,
+// and the Run falls back to the failed verdict the takeover recorded
+// instead of claiming one it did not record.
+func TestStaleFinishOnAFailedVerdictFallsBackToTheRecordedOne(t *testing.T) {
+	h := newHarness(t)
+	clk, cfg := newLeaseClock(h)
+	_, storeB := openAt(t, h.path)
+	coordinatorA := providertask.NewCoordinator()
+	coordinatorB := providertask.NewCoordinator()
+	budget, ledger := meterOf(t, 1000)
+	meter := mustMeter(t, budget, ledger)
+
+	p := newFakeProvider(rendered{Link: "lost"})
+	finishA := &finishCaptureStore{Store: h.store}
+	specA := p.spec(nil)
+	gate := make(chan struct{})
+	parked := make(chan struct{})
+	var parkOnce sync.Once
+	specA.Status = func(ctx context.Context, taskID string) (providertask.Status, error) {
+		// The park says the task id is recorded and the lease is live, so
+		// the takeover below races nothing. The leader answers a code of
+		// its own, so a returned verdict that names the recorded code
+		// proves the outcome came from the row and not from this Run.
+		parkOnce.Do(func() { close(parked) })
+		select {
+		case <-gate:
+			return providertask.Status{State: providertask.StateFailed, Code: "leader_code"}, nil
+		case <-ctx.Done():
+			return providertask.Status{}, ctx.Err()
+		}
+	}
+	cfgA := cfg
+	cfgA.Meter = meter
+	cfgA.Estimate = 10
+	cfgA.Coordinator = coordinatorA
+	doneA := make(chan struct{})
+	var errA error
+	go func() {
+		defer close(doneA)
+		_, errA = providertask.Run(t.Context(), cfgA, finishA, "fenced-fail", specA)
+	}()
+
+	// The leader parks, then the lease passes, and the second process
+	// takes over, records the same failed verdict under its own token,
+	// and settles nothing, because the provider charges nothing for the
+	// failure.
+	<-parked
+	clk.advance(31 * time.Second)
+	q := newFakeProvider(rendered{Link: "lost"},
+		step{st: providertask.Status{State: providertask.StateFailed, Code: "unit_limit"}},
+	)
+	cfgB := cfg
+	cfgB.Meter = meter
+	cfgB.Estimate = 10
+	cfgB.Coordinator = coordinatorB
+	_, errB := providertask.Run(t.Context(), cfgB, storeB, "fenced-fail", q.spec(nil))
+	var fail *providertask.TaskFailure
+	if !errors.As(errB, &fail) || fail.Code != "unit_limit" {
+		t.Fatalf("takeover error = %v, want the provider's failed verdict", errB)
+	}
+
+	// The leader wakes, its failed Finish refuses, and the Run collects
+	// the recorded verdict instead.
+	close(gate)
+	<-doneA
+	if !errors.As(errA, &fail) || fail.Code != "unit_limit" {
+		t.Errorf("leader error = %v, want the recorded failed verdict", errA)
+	}
+	stale := false
+	for _, ferr := range finishA.finishErrs() {
+		if errors.Is(ferr, providertask.ErrStaleToken) {
+			stale = true
+		}
+	}
+	if !stale {
+		t.Errorf("leader Finish faults = %v, want one matching ErrStaleToken", finishA.finishErrs())
+	}
+	if charges := ledger.Charges(); len(charges) != 0 {
+		t.Errorf("charges = %d rows, want 0, the provider charges nothing for the failure", len(charges))
+	}
+}
+
+// TestFaultWithoutVerdictReleasesTheLease: a price fault and a refused
+// reservation both end the drive without a verdict, and both leave the
+// lease released, so the next Run takes over without waiting for expiry.
+func TestFaultWithoutVerdictReleasesTheLease(t *testing.T) {
+	t.Run("price fault", func(t *testing.T) {
+		h := newHarness(t)
+		_, storeB := openAt(t, h.path)
+		budget, ledger := meterOf(t, 1000)
+		meter := mustMeter(t, budget, ledger)
+
+		p := newFakeProvider(rendered{Link: "never"},
+			step{st: providertask.Status{State: providertask.StateSucceeded}},
+		)
+		spec := p.spec(nil)
+		spec.Price = func(context.Context, rendered) (cost.Price, error) {
+			return 0, errPermanent
+		}
+		cfgA := h.config()
+		cfgA.Meter = meter
+		cfgA.Estimate = 10
+		cfgA.Coordinator = providertask.NewCoordinator()
+		_, errA := providertask.Run(t.Context(), cfgA, h.store, "priced", spec)
+		if !errors.Is(errA, errPermanent) {
+			t.Fatalf("leader error = %v, want the price fault", errA)
+		}
+		claim, err := storeB.Get(t.Context(), "priced")
+		if err != nil {
+			t.Fatalf("Get after the fault: %v", err)
+		}
+		if claim.Owner != "" || !claim.LeaseUntil.IsZero() {
+			t.Fatalf("claim = %+v, want the lease released", claim)
+		}
+		if claim.State != providertask.StateRunning || claim.TaskID == "" {
+			t.Fatalf("claim = %+v, want the recorded task still running", claim)
+		}
+
+		// The next Run takes the released lease at once and settles the
+		// task the leader left.
+		q := newFakeProvider(rendered{Link: "resumed"},
+			step{st: providertask.Status{State: providertask.StateSucceeded}},
+		)
+		cfgB := h.config()
+		cfgB.Meter = meter
+		cfgB.Estimate = 10
+		cfgB.Coordinator = providertask.NewCoordinator()
+		outcome, err := providertask.Run(t.Context(), cfgB, storeB, "priced", q.spec(nil))
+		if err != nil {
+			t.Fatalf("takeover Run: %v", err)
+		}
+		if outcome.Value.Link != "resumed" || outcome.Usage.Price != 10 {
+			t.Fatalf("takeover outcome = %+v, want the result and the settled estimate", outcome)
+		}
+		creates, statuses, _, _ := q.counts()
+		if creates != 0 || statuses != 1 {
+			t.Errorf("creates = %d statuses = %d, want a resume with one poll", creates, statuses)
+		}
+		if got := budget.Spent(); got != 10 {
+			t.Errorf("Spent() = %d, want the single takeover booking", got)
+		}
+		if charges := ledger.Charges(); len(charges) != 1 {
+			t.Errorf("charges = %d rows, want 1", len(charges))
+		}
+	})
+
+	t.Run("refused reservation", func(t *testing.T) {
+		h := newHarness(t)
+		_, storeB := openAt(t, h.path)
+		// The planted leader's lease expired an hour ago, so the Run wins
+		// the takeover at once and reaches the meter.
+		plantLeader(t, storeB, "refused", h.base.Add(-time.Hour))
+		broke, ledger := meterOf(t, 5)
+		meter := mustMeter(t, broke, ledger)
+
+		p := newFakeProvider(rendered{Link: "priced"},
+			step{st: providertask.Status{State: providertask.StateSucceeded}},
+		)
+		cfgB := h.config()
+		cfgB.Meter = meter
+		cfgB.Estimate = 10
+		cfgB.Coordinator = providertask.NewCoordinator()
+		_, errB := providertask.Run(t.Context(), cfgB, storeB, "refused", p.spec(nil))
+		if !errors.Is(errB, cost.ErrOverBudget) {
+			t.Fatalf("resume error = %v, want the refused reservation", errB)
+		}
+		claim, err := storeB.Get(t.Context(), "refused")
+		if err != nil {
+			t.Fatalf("Get after the refusal: %v", err)
+		}
+		if claim.Owner != "" || !claim.LeaseUntil.IsZero() {
+			t.Fatalf("claim = %+v, want the lease released", claim)
+		}
+		if claim.State != providertask.StateRunning || claim.TaskID == "" {
+			t.Fatalf("claim = %+v, want the recorded task still running", claim)
+		}
+
+		// A funded Run takes the released lease at once and settles the
+		// task, so the refusal cost nobody the drive.
+		funded, ledger := meterOf(t, 1000)
+		generous := mustMeter(t, funded, ledger)
+		q := newFakeProvider(rendered{Link: "resumed"},
+			step{st: providertask.Status{State: providertask.StateSucceeded}},
+		)
+		cfgC := h.config()
+		cfgC.Meter = generous
+		cfgC.Estimate = 10
+		cfgC.Coordinator = providertask.NewCoordinator()
+		outcome, err := providertask.Run(t.Context(), cfgC, storeB, "refused", q.spec(nil))
+		if err != nil {
+			t.Fatalf("funded Run: %v", err)
+		}
+		if outcome.Value.Link != "resumed" || outcome.Usage.Price != 10 {
+			t.Fatalf("funded outcome = %+v, want the result and the settled estimate", outcome)
+		}
+		creates, statuses, _, _ := q.counts()
+		if creates != 0 || statuses != 1 {
+			t.Errorf("creates = %d statuses = %d, want a resume with one poll", creates, statuses)
+		}
+		if charges := ledger.Charges(); len(charges) != 1 {
+			t.Errorf("charges = %d rows, want 1", len(charges))
+		}
+	})
 }
