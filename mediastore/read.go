@@ -11,9 +11,8 @@ import (
 
 // Open returns the stored bytes of id and the row that names them. It
 // is the read path for a caller that holds the store as a library
-// rather than as a handler, such as a route that streams a blob
-// somewhere the handler does not reach, or TempCopy, which lands the
-// bytes in a file for the ffmpeg based packages.
+// rather than as a handler. TempCopy is one such caller, and it lands
+// the bytes in a file for the ffmpeg based packages.
 //
 // An unknown, malformed or byte-less id returns an error matching
 // ErrNotFound, the same classification the handler answers with a 404.
@@ -39,10 +38,12 @@ func (s *Store) Open(ctx context.Context, blobID string) (BlobReader, Blob, erro
 }
 
 // TempCopy copies the stored bytes of id into a fresh temporary file
-// and returns the file's path and a remove function. The ffmpeg based
-// packages take a file path rather than a reader, so a stored blob
-// reaches them through this helper. The file carries no extension, so a
-// consumer that needs one renames the path first.
+// and returns the file's path and a remove function. The file lands in
+// the directory os.TempDir names, which matters when that is a small
+// tmpfs and the blob is large media. The ffmpeg based packages take a
+// file path rather than a reader, so a stored blob reaches them through
+// this helper. The file carries no extension, so a consumer that needs
+// one renames the path first.
 //
 // The caller must call remove on every path out of its own code, and
 // remove is safe to call more than once. The copy is not fsynced,

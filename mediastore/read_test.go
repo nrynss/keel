@@ -8,8 +8,8 @@ import (
 	"testing"
 )
 
-// TestOpenReturnsBytesAndRow pins the read path: one call returns the
-// stored bytes whole and the row that names them, and the reader seeks,
+// TestOpenReturnsBytesAndRow pins the read path. One call returns the
+// stored bytes whole and the row that names them. The reader seeks,
 // because the handler's Range answers and every copy ride on Seek.
 func TestOpenReturnsBytesAndRow(t *testing.T) {
 	s := openTestStore(t)

@@ -3,11 +3,12 @@
 //
 // A store owns one metadata index and one blob backend. The row lives
 // behind the BlobIndex interface, which the caller supplies. The bytes
-// live behind the Backend interface, whose built-in implementation
-// keeps each blob as one file named by its id, opened and created
-// through an os.Root confined to the store directory. A backend that
-// needs a client library lives in its own subpackage, so an app that
-// stores on disk never compiles that client.
+// live behind the Backend interface. Its built-in implementation keeps
+// each blob as one file named by its id, opened and created through an
+// os.Root confined to the store directory. Config.Backend supplies a
+// different home for the bytes. A backend that needs a client library
+// lives in its own subpackage, so an app that stores on disk never
+// compiles that client.
 //
 // Store is an http.Handler. Register it at "GET /media/{id}". It
 // answers through http.ServeContent, so a Range request returns 206
@@ -16,12 +17,12 @@
 //
 // Configuration arrives through Config, and the package reads no
 // environment. Errors are sentinels matched with errors.Is. On the disk
-// backend, every Persist that returns without error survives an
-// operating system or power failure, because the bytes and their
-// directory entry are fsynced before the row is written. Every backend
-// owns the durability of the bytes it accepts, and the store writes the
-// row only after the backend returns, so the bytes-before-row order
-// holds over any of them. On disk the promise carries one boundary.
+// backend the bytes and their directory entry are fsynced before the
+// row is written. A Persist that returns without error therefore
+// survives an operating system or power failure. Every backend owns the
+// durability of the bytes it accepts, and the store writes the row only
+// after the backend returns, so the bytes-before-row order holds over
+// any of them. On disk the promise carries one boundary.
 // Open creates the store directory when it is absent but never syncs
 // its parent directory entry. A power cut inside the directory's
 // creation window can take the whole directory and every blob in it,
@@ -344,16 +345,16 @@ func bareType(contentType string) string {
 // Anything else, including empty, is ErrInvalidContentType. A type with
 // parameters such as "image/png; charset=binary" is accepted and stored
 // as its bare media type. On the disk backend the bytes and their
-// directory entry are fsynced before the metadata row is inserted, so a
-// Persist that returns without error survives an operating system or
-// power failure. A different backend owns the durability of its own
-// bytes, and the row is written after them either way. The promise
-// carries one boundary. Open creates the store directory when it is
-// absent but never syncs its parent directory entry. A power cut inside
-// the directory's creation window can take the whole directory and
-// every blob in it, while the acknowledged rows survive and point at
-// nothing. Past that window the promise holds. The copy reads only from
-// src, and ctx bounds the metadata write.
+// directory entry are fsynced before the metadata row is inserted. A
+// Persist that returns without error therefore survives an operating
+// system or power failure. A different backend owns the durability of
+// its own bytes, and the row is written after them either way. The
+// promise carries one boundary. Open creates the store directory when
+// it is absent but never syncs its parent directory entry. A power cut
+// inside the directory's creation window can take the whole directory
+// and every blob in it, while the acknowledged rows survive and point
+// at nothing. Past that window the promise holds. The copy reads only
+// from src, and ctx bounds the metadata write.
 func (s *Store) Persist(ctx context.Context, src io.Reader, p Put) (string, error) {
 	ct, ok := s.normalizeContentType(p.ContentType)
 	if !ok {
@@ -452,13 +453,13 @@ type blobFile interface {
 }
 
 // writeBlob is the disk backend's Write body. It copies src into a file
-// created exclusively for id, fsyncs the file, then fsyncs the blob
-// directory, and closes, so the bytes and the directory entry that
-// names them are on disk when Persist returns. The exclusive create
-// never opens an existing file for truncation, so a name already on
-// disk reports fs.ErrExist and this call writes nothing. Every failure
-// after the create removes the file this call owns, because a blob that
-// was never inserted must not leak disk space.
+// created exclusively for id. The file and then the blob directory are
+// fsynced before the close, so the bytes and the entry naming them are
+// on disk when Persist returns. The exclusive create never opens an
+// existing file for truncation, so a name already on disk reports
+// fs.ErrExist and this call writes nothing. Every failure after the
+// create removes the file this call owns, because a blob that was never
+// inserted must not leak disk space.
 func (s *Store) writeBlob(blobID string, src io.Reader) (int64, error) {
 	f, err := s.newBlob(blobID)
 	if err != nil {

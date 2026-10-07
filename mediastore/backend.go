@@ -29,7 +29,9 @@ type Object struct {
 	// SizeBytes is the object's size as the backend reports it.
 	SizeBytes int64
 	// ModTime is the backend's own modification time for the object.
-	// The orphan sweep ages an object with no row by it.
+	// The orphan sweep ages an object with no row by it. A zero time
+	// reads as ancient, so an object carrying one ages out at the first
+	// pass.
 	ModTime time.Time
 }
 
@@ -63,8 +65,8 @@ type Object struct {
 // durability of the bytes it accepts. The disk backend fsyncs the file
 // and its directory entry before Write returns. An object storage
 // backend owns whatever durability its service promises once it
-// acknowledges the write. The store owns the order across the seam: it
-// writes the metadata row only after Write returns, so a backend that
+// acknowledges the write. The store owns the order across the seam. It
+// writes the metadata row only after Write returns. A backend that
 // returns early weakens the bytes-before-row promise for its own store
 // alone.
 type Backend interface {
@@ -80,9 +82,9 @@ type Backend interface {
 	Write(ctx context.Context, blobID string, src io.Reader) (int64, error)
 	// Delete removes the stored bytes of blobID. An error matching
 	// ErrNotFound reports that blobID has no stored bytes. Any other
-	// error is a fault for the caller to log rather than to fail on,
-	// because the row that made the bytes reachable is already gone by
-	// the time the store deletes.
+	// error is a fault for the caller to log. The row that made the
+	// bytes reachable is already gone by then, so failing the caller
+	// cannot bring them back.
 	Delete(ctx context.Context, blobID string) error
 	// List returns every object the backend holds, in no particular
 	// order. The store matches each object against the index and ages
@@ -115,10 +117,10 @@ func (d *diskBackend) Open(ctx context.Context, blobID string) (BlobReader, erro
 }
 
 // Write copies src into a file created exclusively for blobID through
-// writeBlob, which fsyncs the file and then the blob directory, so the
-// bytes and the directory entry that names them are on disk before the
-// store writes the row. A name already stored is refused before
-// anything is written, and the stored bytes are never touched.
+// writeBlob. The call fsyncs the file and then the blob directory, so
+// the bytes and the entry naming them are on disk before the store
+// writes the row. A name already stored is refused before anything is
+// written, and the stored bytes are never touched.
 func (d *diskBackend) Write(ctx context.Context, blobID string, src io.Reader) (int64, error) {
 	size, err := d.store.writeBlob(blobID, src)
 	if err != nil {
@@ -146,12 +148,12 @@ func (d *diskBackend) Delete(ctx context.Context, blobID string) error {
 	return fmt.Errorf("remove blob %s: %w", blobID, err)
 }
 
-// List reads the store's directory. A subdirectory is not an object, so
-// it is skipped, and so is a file that was removed between the listing
-// and its stat, because the next pass will not see it. A file whose
-// name is not an id is listed anyway: the backend lists what it holds,
-// and the sweep decides what belongs to the store by matching names
-// against the index.
+// List reads the store's directory. A subdirectory is not an object,
+// so it is skipped. A file removed between the listing and its stat is
+// skipped too, because the next pass will not see it. A file whose name
+// is not an id is listed anyway. The backend lists what it holds, and
+// the sweep matches names against the index to decide what belongs to
+// the store.
 func (d *diskBackend) List(ctx context.Context) ([]Object, error) {
 	entries, err := os.ReadDir(d.store.dir)
 	if err != nil {
