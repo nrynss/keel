@@ -55,11 +55,13 @@ else is pure Go, and `CGO_ENABLED=0` builds the whole module.
 | `config/source` | The five built-in secret sources that a `config.Registry` carries |
 | `fetch` | A user-supplied link fetched under an address policy enforced at dial time, with scheme, port, redirect, size, time and content type caps, and preview metadata read from the page |
 | `outbox` | Events written durably on this box first, replayed in insertion order to an app-supplied sink, with spent attempts counted and reported |
+| `providertask` | Provider tasks that are created and then polled, recorded by idempotency key before polling so a restart resumes without a second create, with a query window refusal, jittered backoff, and an immediate copy of the expiring result |
 | `identity` | Guest sessions resolved from a signed cookie or a bearer token, sign-in by emailed code or an external provider, guest upgrade with a conflict rule, and account deletion as one resumable job |
 
 The stores that need SQLite live one directory down, in `cache/sqlitestore`,
 `job/sqlitestore`, `mediastore/sqlitestore`, `cost/sqlitestore`,
-`flag/sqlitestore`, `lease/sqlitestore`, `outbox/sqlitestore` and
+`flag/sqlitestore`, `lease/sqlitestore`, `outbox/sqlitestore`,
+`providertask/sqlitestore` and
 `identity/sqlitestore`. Only those
 packages import a SQLite driver, so an app that uses `gate` alone never
 compiles one. The TOML parser stays the same way behind `config` and
@@ -272,6 +274,80 @@ at once. The cap is held only while a call runs, and the backoff waits outside
 it. `cost.Meter` still reserves and settles. This package only paces the call.
 `throttle.Note` is how a caller marks an error that used up the attempts,
 with the same config the call used. One spent attempt reads "1 attempt".
+
+### Run a provider task that survives a restart
+
+A create call returns a task id. A status call reports running, succeeded or failed. A result call
+carries the outcome, and its link expires within hours. `providertask` drives those three calls
+under an idempotency key, so the same key never creates twice.
+
+```go
+tasks, err := tasksql.Open(ctx, tasksql.Config{DB: db})
+
+spec := providertask.Spec[rendered]{
+	Create: func(ctx context.Context) (string, error) {
+		return client.Start(ctx, request) // the provider client stays in the app
+	},
+	Status: func(ctx context.Context, taskID string) (providertask.Status, error) {
+		st, err := client.Task(ctx, taskID)
+		if err != nil {
+			return providertask.Status{}, err
+		}
+		return providertask.Status{
+			State:    st.Phase,
+			Code:     st.ErrorCode,
+			Progress: job.Progress{Stage: st.Step},
+		}, nil
+	},
+	Result: func(ctx context.Context, taskID string) (rendered, error) {
+		return client.Fetch(ctx, taskID)
+	},
+	Keep: func(ctx context.Context, v rendered) error {
+		return media.PersistWithID(ctx, "upscale-"+key, bytes.NewReader(v.Bytes),
+			mediastore.Put{ContentType: "image/png", Owner: owner})
+	},
+}
+
+outcome, err := providertask.Run(ctx, providertask.Config{
+	Window:   24 * time.Hour,
+	Deadline: 10 * time.Minute,
+}, tasks, key, spec)
+```
+
+`Run` claims the key in SQLite and records the task id before it polls. A restart that runs the same
+key finds the recorded task, polls it to its verdict, and never calls Create again. A recorded
+success is fetched and kept again without a new create, and a recorded failure returns the stored
+provider code without touching the provider.
+
+A task id older than the provider's query window refuses with `ErrWindowExceeded` and the stable
+code `task_window_exceeded`, because the provider may no longer answer for it. A key whose create
+never resolved refuses with `ErrTaskPending` and `task_pending`. A create that failed mid call
+leaves its key in that state on purpose, since the provider may have created the task even though
+the answer was lost.
+
+Polling waits on a full jitter backoff from `PollBase` to `PollCeiling`, bounded by `Deadline`. A
+Status error the `Retryable` classifier calls transient waits on that curve, and anything else comes
+back at once. The deadline passing refuses with `ErrDeadline` and the code `task_timeout`, and a
+later Run resumes the task. A failed verdict is a `TaskFailure` carrying the provider's error code,
+and it is never retried.
+
+`Keep` copies the result somewhere it outlives the link, before `Run` returns. It runs once per Run
+that reaches the result, so a repeat must land on the same bytes, which a name derived from the key
+gives you.
+
+With a `Meter` configured, the Run that creates the task reserves the `Estimate`, settles it on
+success, and frees it on failure. `Spec.Price` settles a measured price instead of the estimate, and
+`ChargesOnFailure` books the estimate for a provider that charges for failures. A refused
+reservation releases the still empty claim, so the key stays usable. Every settle lands in the
+charge sink under the key as its reference. Concurrent Runs of one key share one flight through a
+shared `Coordinator`, so one task settles once and the joiners collect the recorded outcome. The
+settle and the terminal record are two writes, and a crash between them books the charge again on
+the resume, so the books over-count spend rather than under-count it.
+
+`Run` publishes progress into the `job` it sits inside, so the browser sees the created stage and
+the provider's report over `stream`. Provider webhooks are out of scope, and a later Spec field
+could accept one in place of the polling loop. `providertask/sqlitestore` owns the store's
+migration, like every other store here.
 
 ### Reuse a paid generation
 
