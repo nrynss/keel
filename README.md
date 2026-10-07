@@ -60,8 +60,8 @@ else is pure Go, and `CGO_ENABLED=0` builds the whole module.
 | `identity` | Guest sessions resolved from a signed cookie or a bearer token, sign-in by emailed code or an external provider, guest upgrade with a conflict rule, and account deletion as one resumable job |
 
 The stores that need SQLite live one directory down, in `cache/sqlitestore`,
-`job/sqlitestore`, `mediastore/sqlitestore`, `cost/sqlitestore`,
-`flag/sqlitestore`, `lease/sqlitestore`, `outbox/sqlitestore`,
+`job/sqlitestore`, `mediastore/sqlitestore`, `mediastore/s3/sqlitestore`,
+`cost/sqlitestore`, `flag/sqlitestore`, `lease/sqlitestore`, `outbox/sqlitestore`,
 `providertask/sqlitestore` and
 `identity/sqlitestore`. Only those
 packages import a SQLite driver, so an app that uses `gate` alone never
