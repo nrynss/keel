@@ -65,7 +65,9 @@ The stores that need SQLite live one directory down, in `cache/sqlitestore`,
 `providertask/sqlitestore` and
 `identity/sqlitestore`. Only those
 packages import a SQLite driver, so an app that uses `gate` alone never
-compiles one. The TOML parser stays the same way behind `config` and
+compiles one. The driver's own dependency chain follows the same rule,
+so no package outside those directories reaches a chain module either.
+The TOML parser stays the same way behind `config` and
 `config/source`, so an app that uses `gate` alone never compiles it either.
 The PDF library stays behind `book` the same way. The object storage
 client stays behind `mediastore/s3`, so an app that keeps blobs on disk
