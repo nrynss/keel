@@ -34,7 +34,7 @@ else is pure Go, and `CGO_ENABLED=0` builds the whole module.
 | `stream` | Topic broker and server-sent events, with heartbeats, a non-blocking slow-subscriber policy, and best-effort replay after Last-Event-ID |
 | `job` | Long work started by a short request, observed over `stream`, durable across restarts |
 | `mediastore` | Blobs under unguessable ids on a storage backend, with the disk store built in, a read path for local tools, Range serving, retention sweeps and a snapshot that restores the same ids |
-| `mediastore/s3` | The blob backend for an S3-compatible object store, with presigned GET serving after the app's own authorizer, a proxy fallback with Range support, an opt-in presigned PUT issuer and multipart sessions whose completion verifies size and digest before the row, compiled only by apps that keep bytes off the box |
+| `mediastore/s3` | The blob backend for an S3-compatible object store, with presigned GET serving after the app's own authorizer, a proxy fallback with Range support, an opt-in presigned PUT issuer and multipart sessions whose records live in a SQLite session store with a sweep for abandoned ones and whose completion verifies size and digest before the row, compiled only by apps that keep bytes off the box |
 | `upload` | Resumable chunked uploads that land in `mediastore`, resumable by id after a dropped connection |
 | `photo` | Normalises an uploaded photo: EXIF orientation applied to the pixels, metadata stripped, resized under side and pixel caps, re-encoded under a byte cap |
 | `sqlite` | One SQLite file with WAL and synchronous FULL, so an acknowledged write survives a power cut once the file's creation window has passed, plus a writer handle, a read-only reader pool, namespaced migrations and online backup |
@@ -1010,11 +1010,24 @@ number and the upload id travel inside the URL, so a URL moved to another part r
 - `AbortUpload` discards every part and reads an upload the service no longer holds as already
 aborted, so a sweep and a retry can both run without asking twice.
 
-The assembled object completes through `Store.Adopt` exactly as a single PUT does. Session
-records live in the app's database under the app's own deadline, never in the bucket, because the
-bucket's record names the parts and nothing else. Never-completed objects are owned by the
-store's orphan sweep, and abandoned multipart sessions are owned by the session sweep that calls
-`AbortUpload` and drops the row.
+The assembled object completes through `Store.Adopt` exactly as a single PUT does.
+
+Session records live in `mediastore/s3/sqlitestore`, one table under the shared migration runner,
+never in the bucket, because the bucket's record names the parts and nothing else. Entry points:
+`sqlitestore.Open`, `Store.Create`, `Store.Get`, `Store.Delete`, `Store.Expired`, `Store.Sweep`.
+A session carries the blob id, the upload id, the part plan, and the metadata completion hands to
+`Store.Adopt`, which is the only state a restart or a sweep reads. `Sweep` abandons what the
+client left behind: it aborts every session recorded older than the bound, which discards its
+parts in the bucket, and deletes the row once the abort went through. A row whose abort failed
+stays for the next pass, because removing it would orphan parts the service still holds. An
+upload the service no longer holds aborts as done, so a session a completion left behind reads
+the same as one the abort closed.
+
+Sweep ownership has two halves. Abandoned multipart sessions belong to the session sweep, which
+owns both the row and the parts, because the abort is what discards the parts. Never-completed
+objects belong to the store's orphan sweep: the bytes of a direct PUT that was never completed,
+and of a completion whose row write failed, age out by the service's modification time like every
+object with no row.
 
 Refusals are written in the shared `wire` envelope by the routes the app mounts, and the codes
 are exported constants so clients branch on them: `CodeInvalidRequest`, `CodeNotFound`,
