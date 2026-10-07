@@ -56,7 +56,7 @@ else is pure Go, and `CGO_ENABLED=0` builds the whole module.
 | `config/source` | The five built-in secret sources that a `config.Registry` carries |
 | `fetch` | A user-supplied link fetched under an address policy enforced at dial time, with scheme, port, redirect, size, time and content type caps, and preview metadata read from the page |
 | `outbox` | Events written durably on this box first, replayed in insertion order to an app-supplied sink, with spent attempts counted and reported |
-| `providertask` | Provider tasks that are created and then polled, recorded by idempotency key before polling so a restart resumes without a second create, one driver at a time across processes under a renewed lease other processes take over once it expires, with a query window refusal, jittered backoff, and an immediate copy of the expiring result |
+| `providertask` | Provider tasks recorded by idempotency key, created once, polled to a verdict, driven by one process at a time under a lease, with a query window refusal and jittered backoff |
 | `identity` | Guest sessions resolved from a signed cookie or a bearer token, sign-in by emailed code or an external provider, guest upgrade with a conflict rule, and account deletion as one resumable job |
 
 The stores that need SQLite live one directory down, in `cache/sqlitestore`,

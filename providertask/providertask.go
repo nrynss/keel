@@ -457,7 +457,8 @@ type Config struct {
 	// the store refused. Nil means slog.Default.
 	Log *slog.Logger
 	// Now supplies the clock that stamps claims and judges the window.
-	// Nil means time.Now.
+	// The lease renewal reads it from a goroutine of its own, so it must
+	// be safe for concurrent use. Nil means time.Now.
 	Now func() time.Time
 }
 

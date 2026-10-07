@@ -98,6 +98,91 @@ func TestOpenAppliesMigrationsOnce(t *testing.T) {
 	}
 }
 
+// TestUpgradeFromTheFirstSchemaKeepsTheRows: a database at the 0001
+// schema carrying rows upgrades to 0002 on the next open. The old rows
+// read back with an empty lease, and an upgraded running row takes a
+// takeover, a verdict and a cleared lease, the way a resumed driver
+// leaves it.
+func TestUpgradeFromTheFirstSchemaKeepsTheRows(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tasks.db")
+	seed := openFresh(t, path)
+	stmts := []string{
+		// The 0001 schema exactly as the migration file wrote it, with the
+		// ledger row that records it as applied.
+		`CREATE TABLE providertask_task (
+			key        TEXT PRIMARY KEY,
+			task_id    TEXT NOT NULL DEFAULT '',
+			state      TEXT NOT NULL DEFAULT 'running',
+			error_code TEXT NOT NULL DEFAULT '',
+			created_at INTEGER NOT NULL
+		)`,
+		`CREATE TABLE providertask_schema_migrations (
+			filename   TEXT PRIMARY KEY,
+			applied_at INTEGER NOT NULL
+		)`,
+		`INSERT INTO providertask_schema_migrations (filename, applied_at)
+			VALUES ('0001_providertask.sql', 1)`,
+		`INSERT INTO providertask_task (key, task_id, state, error_code, created_at)
+			VALUES ('old-running', 'task-old', 'running', '', 1)`,
+		`INSERT INTO providertask_task (key, task_id, state, error_code, created_at)
+			VALUES ('old-done', 'task-done', 'failed', 'unit_limit', 2)`,
+	}
+	for _, stmt := range stmts {
+		if _, err := seed.Exec(stmt); err != nil {
+			t.Fatalf("seed %q: %v", stmt, err)
+		}
+	}
+	if err := seed.Close(); err != nil {
+		t.Fatalf("close the seeded file: %v", err)
+	}
+
+	store := openStore(t, path)
+	running, err := store.Get(t.Context(), "old-running")
+	if err != nil {
+		t.Fatalf("Get old-running: %v", err)
+	}
+	if running.TaskID != "task-old" || running.State != providertask.StateRunning {
+		t.Errorf("running row = %+v, want the recorded task still running", running)
+	}
+	if running.Owner != "" || running.Token != 0 || !running.LeaseUntil.IsZero() {
+		t.Errorf("running row = %+v, want the empty lease the upgrade defaults to", running)
+	}
+	done, err := store.Get(t.Context(), "old-done")
+	if err != nil {
+		t.Fatalf("Get old-done: %v", err)
+	}
+	if done.Code != "unit_limit" || done.State != providertask.StateFailed {
+		t.Errorf("done row = %+v, want the recorded verdict", done)
+	}
+
+	// An upgraded running row leases like any other. The takeover reads
+	// token 1, one past the zero the upgrade defaulted the row to.
+	token, ok, err := store.TakeOver(t.Context(), "old-running", "test", base, time.Minute)
+	if err != nil || !ok {
+		t.Fatalf("TakeOver = %d, %v, %v, want the takeover", token, ok, err)
+	}
+	if token != 1 {
+		t.Errorf("token = %d, want 1, one past the upgraded zero", token)
+	}
+	if err := store.Finish(t.Context(), "old-running", token, providertask.StateSucceeded, ""); err != nil {
+		t.Fatalf("Finish: %v", err)
+	}
+	final, err := store.Get(t.Context(), "old-running")
+	if err != nil {
+		t.Fatalf("Get after Finish: %v", err)
+	}
+	if final.State != providertask.StateSucceeded || final.Owner != "" || !final.LeaseUntil.IsZero() {
+		t.Errorf("final row = %+v, want the verdict recorded and the lease cleared", final)
+	}
+	var applied int
+	if err := openFresh(t, path).QueryRow("SELECT COUNT(*) FROM providertask_schema_migrations").Scan(&applied); err != nil {
+		t.Fatalf("count migrations: %v", err)
+	}
+	if applied != 2 {
+		t.Errorf("migration ledger holds %d rows, want 2 after the upgrade", applied)
+	}
+}
+
 // TestClaimInsertsOnceAndReportsTheWinner: concurrent claims of one key
 // pick exactly one creator, and the file holds exactly one row for the key.
 func TestClaimInsertsOnceAndReportsTheWinner(t *testing.T) {
