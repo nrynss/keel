@@ -329,9 +329,10 @@ type Spec[T any] struct {
 // Config configures Run. The zero value is usable and carries no meter, no
 // retry classification and no progress publication.
 type Config struct {
-	// Window is how long a recorded task id is trusted to stay queryable.
-	// A recorded row older than the window refuses with
-	// ErrWindowExceeded. Zero or negative means DefaultWindow.
+	// Window is how long a recorded running task id is trusted to stay
+	// queryable. A recorded row in the running state older than the window
+	// refuses with ErrWindowExceeded. A recorded verdict is honoured at any
+	// age. Zero or negative means DefaultWindow.
 	Window time.Duration
 	// Deadline bounds one Run from the claim to the result. The task keeps
 	// running at the provider when it passes, and a later Run resumes the
@@ -473,7 +474,8 @@ func isNilValue(v any) bool {
 // records the task id before it polls. A restart that calls Run again with
 // the same key resumes the recorded task and never calls Create again.
 //
-// A recorded task older than Config.Window refuses with ErrWindowExceeded.
+// A recorded running task older than Config.Window refuses with
+// ErrWindowExceeded, while a recorded verdict is honoured at any age.
 // A key claimed but never recorded refuses with ErrTaskPending once the
 // deadline passes, because the create that claim started may have landed
 // at the provider. A task that fails at the provider returns a TaskFailure
