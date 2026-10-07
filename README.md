@@ -867,7 +867,7 @@ terminal chains older than a supplied time and leaves active chains alone.
 
 ### Private and public media with mediastore
 
-Entry points: `mediastore.Open`, `Store.Persist`, `Store.PersistWithID`, `Store.Open`,
+Entry points: `mediastore.Open`, `Store.Persist`, `Store.PersistWithID`, `Store.Adopt`, `Store.Open`,
 `Store.TempCopy`, `Store.Delete`, `Store.ServeHTTP`, `Store.NewSweeper`, `Store.Snapshot`,
 `Store.Restore`.
 
@@ -903,6 +903,14 @@ process and owns the decision. The reader it returns supports `Seek`, and the ca
 `Store.TempCopy` copies a stored blob into a fresh temporary file and returns a remove function
 the caller must call. The ffmpeg based packages take file paths, so stored media reaches them
 through this helper.
+
+`Store.Adopt` records a row for bytes that already sit in the backend under an id the caller
+holds, after the stored object verified against the size and digest the caller names. It streams
+the object once, counting and hashing as it reads, and writes the row only after both checks
+pass. A size or digest that disagrees refuses, an id with no bytes refuses, and an id the index
+already holds refuses, so nothing becomes reachable until the call returns nil. It is the
+completion half of a direct upload, where the client sent the bytes to the backend itself and
+this call is what first makes them servable.
 
 ### Blob bytes in an S3-compatible store with mediastore/s3
 
