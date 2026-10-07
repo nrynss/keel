@@ -32,7 +32,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -94,9 +93,6 @@ type Config struct {
 	// SDK builds. An operator points it at a proxy or at a client that
 	// trusts an internal certificate authority.
 	Client *http.Client
-	// Log receives one line per fault this package survives without
-	// failing its caller. Nil discards.
-	Log *slog.Logger
 }
 
 // Backend stores mediastore blob bytes in one S3-compatible bucket.
@@ -107,7 +103,6 @@ type Backend struct {
 	presign *s3sdk.PresignClient
 	bucket  string
 	expiry  time.Duration
-	log     *slog.Logger
 }
 
 // Open validates cfg and builds the client over the configured
@@ -129,10 +124,6 @@ func Open(_ context.Context, cfg Config) (*Backend, error) {
 	expiry := cfg.PresignExpiry
 	if expiry == 0 {
 		expiry = defaultPresignExpiry
-	}
-	log := cfg.Log
-	if log == nil {
-		log = slog.New(slog.DiscardHandler)
 	}
 	awsCfg := aws.Config{
 		Region:       cfg.Region,
@@ -159,7 +150,6 @@ func Open(_ context.Context, cfg Config) (*Backend, error) {
 		presign: s3sdk.NewPresignClient(client),
 		bucket:  cfg.Bucket,
 		expiry:  expiry,
-		log:     log,
 	}, nil
 }
 
