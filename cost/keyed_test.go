@@ -312,10 +312,10 @@ func TestOwnerAccountSettleOnceBooksAReferenceOnce(t *testing.T) {
 }
 
 // TestKeyedSetLimitCarriesThePairSet pins that a limit change keeps the
-// owner's settle-once history. SetLimit replaces the owner's budget value,
-// and the replacement carries the booked spend, the outstanding holds and
-// the settled pairs, so a repeat of a settled pair still books nothing on
-// the new ceiling.
+// owner's settle-once history. SetLimit replaces the owner's budget value.
+// The replacement carries the booked spend, the outstanding holds and the
+// settled pairs, so a repeat of a settled pair still books nothing on the
+// new ceiling.
 func TestKeyedSetLimitCarriesThePairSet(t *testing.T) {
 	k := mustKeyed(t, 100*Cent)
 	mustOwnerLimit(t, k, "a", 50*Cent)

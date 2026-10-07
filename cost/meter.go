@@ -166,8 +166,10 @@ func NewMeter(account Account, sink ChargeSink) (*Meter, error) {
 // the same reference therefore leaves the books exactly as the first run
 // wrote them. Under Once a charge the sink refuses after the settle stays
 // unrecorded, because the pair is booked and no repeat of the reference
-// reaches the sink. The ErrUnrecordedCharge Call then reports is final for
-// that reference. Without Once, Call is unchanged, so a reference that
+// reaches the sink. The ErrUnrecordedCharge that Call then reports is
+// final for that reference. Without Once, Call is unchanged, so a
+// reference that legitimately carries several charges keeps booking every
+// one.
 // legitimately carries several charges keeps booking every one.
 //
 // Every failure on the way to the settle frees the reservation, so a call

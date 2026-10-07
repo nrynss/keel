@@ -635,8 +635,8 @@ func (s *Store) SettleOnce(ctx context.Context, r Reservation, actual cost.Price
 // transaction. It reports whether this call inserted the pair, which makes
 // it the one settle that may book. An empty ref is refused with an error
 // matching both ErrInvalid and cost.ErrEmptyReference, the same sentinel
-// the in-memory accounts refuse with, because the pair key must name its
-// work to stay unique.
+// the in-memory accounts refuse with. The pair key must name its work to
+// stay unique.
 func insertSettleOnce(ctx context.Context, tx *sql.Tx, now time.Time, kind, ref string) (bool, error) {
 	if ref == "" {
 		return false, fmt.Errorf("%w: the reference must not be empty: %w", ErrInvalid, cost.ErrEmptyReference)

@@ -17,9 +17,9 @@ var ErrNegativeLimit = errors.New("cost: negative budget limit")
 var ErrNegativeEstimate = errors.New("cost: negative reservation estimate")
 
 // ErrEmptyReference reports a settle once without a reference. A once
-// settle dedupes on the kind and reference pair, and an empty reference
-// would collapse every once settle of a kind onto one pair and drop every
-// later charge, so every account refuses it and books nothing.
+// settle dedupes on the kind and reference pair. An empty reference would
+// collapse every once settle of a kind onto one pair and drop every later
+// charge, so every account refuses it and books nothing.
 var ErrEmptyReference = errors.New("cost: empty settle-once reference")
 
 // Budget bounds the total spend of a sequence of paid calls in one
