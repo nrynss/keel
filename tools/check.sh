@@ -305,7 +305,7 @@ api_version_lt() {
     fi
 }
 
-# Check 12: the records under api/ freeze what a release shipped. A release is
+# Check 13: the records under api/ freeze what a release shipped. A release is
 # their only writer. Between releases the gate asks one question: did any
 # released byte move? A modification or a deletion refuses outright, read from
 # both views, because a commit carries the index and not the working tree. The

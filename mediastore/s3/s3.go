@@ -183,10 +183,14 @@ func (b *Backend) Open(ctx context.Context, blobID string) (mediastore.BlobReade
 // bytes it read from src. An object already under the id is refused
 // with an error matching mediastore.ErrAlreadyExists, and the stored
 // bytes stay untouched. The check and the put are two calls, so this
-// is weaker than the disk backend's exclusive create. A concurrent
-// writer can take the name between them, and the common service API
-// keeps no conditional put to lean on. The bytes are durable under the
-// service's own guarantees before it acknowledges the put, and the
+// is weaker than the disk backend's exclusive create: a concurrent
+// writer can take the name between them. The client can carry a
+// conditional put, and a service that honours it would close that
+// window. This backend does not send one. The promise here is
+// S3-compatible breadth, and a dialect that silently drops the unknown
+// header would overwrite instead of refusing, which is the exact
+// damage the refusal exists to prevent. The bytes are durable under
+// the service's own guarantees before it acknowledges the put, and the
 // store writes the metadata row only after.
 func (b *Backend) Write(ctx context.Context, blobID string, src io.Reader) (int64, error) {
 	if !validKey(blobID) {
@@ -348,7 +352,10 @@ func (c *countingReader) Read(p []byte) (int, error) {
 // objectReader reads one object through ranged gets. Open learns the
 // size from a head and fetches nothing until the first read, so the
 // handler's seek around for a size transfers no body. A seek closes
-// the body in flight and the next read resumes from the new offset.
+// the body in flight and the next read resumes from the new offset. A
+// seek past the end reports the position it was asked for and reads
+// EOF, the way a file handle behaves. Both backends then answer the
+// one Store API with one shape.
 type objectReader struct {
 	ctx    context.Context
 	blobID string
@@ -391,7 +398,6 @@ func (o *objectReader) Seek(offset int64, whence int) (int64, error) {
 	if offset < 0 {
 		return 0, fmt.Errorf("s3: seek %s: before the start of the object", o.blobID)
 	}
-	offset = min(offset, o.size)
 	if offset != o.offset {
 		if o.body != nil {
 			o.body.Close() // best effort, the next read opens a fresh range

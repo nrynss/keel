@@ -40,6 +40,7 @@ type fakeS3 struct {
 	mu       sync.Mutex
 	objects  map[string][]byte
 	modTimes map[string]time.Time
+	denied   map[string]bool
 	region   string
 	secret   string
 	now      func() time.Time
@@ -83,6 +84,18 @@ func (f *fakeS3) backdate(key string, modTime time.Time) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.modTimes[key] = modTime
+}
+
+// deny makes the double answer every read of key with the service's
+// permission-refused shape, which is how a test drives a fault that is
+// not an absence.
+func (f *fakeS3) deny(key string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.denied == nil {
+		f.denied = map[string]bool{}
+	}
+	f.denied[key] = true
 }
 
 // holds reports whether the double stores an object under key.
@@ -166,6 +179,10 @@ func (f *fakeS3) put(w http.ResponseWriter, r *http.Request, key string) {
 
 // head answers what a caller learns before it reads or deletes.
 func (f *fakeS3) head(w http.ResponseWriter, key string) {
+	if f.denied[key] {
+		serveXMLError(w, http.StatusForbidden, "AccessDenied", "access denied")
+		return
+	}
 	body, ok := f.objects[key]
 	if !ok {
 		w.WriteHeader(http.StatusNotFound)
@@ -181,6 +198,10 @@ func (f *fakeS3) head(w http.ResponseWriter, key string) {
 func (f *fakeS3) get(w http.ResponseWriter, r *http.Request, key string) {
 	if f.events != nil {
 		f.events.add("get " + key)
+	}
+	if f.denied[key] {
+		serveXMLError(w, http.StatusForbidden, "AccessDenied", "access denied")
+		return
 	}
 	body, ok := f.objects[key]
 	if !ok {

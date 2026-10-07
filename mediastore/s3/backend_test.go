@@ -608,3 +608,86 @@ func TestPersistOverADeadServiceLeavesNoRow(t *testing.T) {
 		t.Fatalf("%d rows landed for a persist the service refused, want none", len(rows))
 	}
 }
+
+// TestOpenOfAnAbsentIDMatchesNotFound pins the absent-id read
+// classification directly. A well formed id the service does not hold
+// is an absence, and it arrives as the sentinel the store classifies
+// on, with no reader alongside.
+func TestOpenOfAnAbsentIDMatchesNotFound(t *testing.T) {
+	_, endpoint, client := newFakeS3(t, func() time.Time { return base })
+	b := openBackend(t, endpoint, client)
+	r, err := b.Open(t.Context(), strings.Repeat("7", 32))
+	if !errors.Is(err, mediastore.ErrNotFound) {
+		t.Fatalf("open of an absent id = %v, want ErrNotFound", err)
+	}
+	if r != nil {
+		r.Close()
+		t.Fatal("open returned a reader alongside an error")
+	}
+}
+
+// TestARefusedReadIsAFaultAndNotAnAbsence pins outage versus absence.
+// A permission fault on an object the service holds must stay a fault,
+// so no caller can mistake a dead or refused service for a deleted
+// blob. The store's own read path must classify it the same way.
+func TestARefusedReadIsAFaultAndNotAnAbsence(t *testing.T) {
+	f, endpoint, client := newFakeS3(t, func() time.Time { return base })
+	b := openBackend(t, endpoint, client)
+	s := openStore(t, b, newMemIndex())
+	blobID, err := s.Persist(t.Context(), bytes.NewReader(deterministic(32)), mediastore.Put{
+		ContentType: "image/png",
+	})
+	if err != nil {
+		t.Fatalf("persist: %v", err)
+	}
+	f.deny(blobID)
+
+	if _, err := b.Open(t.Context(), blobID); err == nil || errors.Is(err, mediastore.ErrNotFound) {
+		t.Fatalf("open = %v, want a fault that matches no sentinel", err)
+	}
+	if err := b.Delete(t.Context(), blobID); err == nil || errors.Is(err, mediastore.ErrNotFound) {
+		t.Fatalf("delete = %v, want a fault that matches no sentinel", err)
+	}
+	if _, _, err := s.Open(t.Context(), blobID); err == nil || errors.Is(err, mediastore.ErrNotFound) {
+		t.Fatalf("store open = %v, want a fault that matches no sentinel", err)
+	}
+}
+
+// TestSeekPastTheEndMatchesTheDiskReader pins the seek semantics the
+// one Store API promises over every backend. A seek past the end
+// reports the position it was asked for, the next read answers EOF,
+// and the object keeps its size.
+func TestSeekPastTheEndMatchesTheDiskReader(t *testing.T) {
+	_, endpoint, client := newFakeS3(t, func() time.Time { return base })
+	b := openBackend(t, endpoint, client)
+	s := openStore(t, b, newMemIndex())
+	data := deterministic(32)
+	blobID, err := s.Persist(t.Context(), bytes.NewReader(data), mediastore.Put{
+		ContentType: "image/png",
+	})
+	if err != nil {
+		t.Fatalf("persist: %v", err)
+	}
+	r, _, err := s.Open(t.Context(), blobID)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer r.Close()
+
+	pos, err := r.Seek(9999, io.SeekStart)
+	if err != nil || pos != 9999 {
+		t.Fatalf("seek past the end = %d, %v, want 9999 with no error", pos, err)
+	}
+	n, err := r.Read(make([]byte, 8))
+	if n != 0 || !errors.Is(err, io.EOF) {
+		t.Fatalf("read past the end = %d, %v, want 0 with io.EOF", n, err)
+	}
+
+	if _, err := r.Seek(3, io.SeekStart); err != nil {
+		t.Fatalf("seek back: %v", err)
+	}
+	tail, err := io.ReadAll(r)
+	if err != nil || !bytes.Equal(tail, data[3:]) {
+		t.Fatalf("read after seeking back = %d bytes, %v, want the %d remaining", len(tail), err, len(data)-3)
+	}
+}
