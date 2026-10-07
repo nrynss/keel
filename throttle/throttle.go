@@ -69,7 +69,8 @@ const DefaultMax = 90 * time.Second
 // DefaultWaitBudget is the total waiting one call may spend across its
 // attempts when the caller sets Config.WaitBudget to it. The default
 // schedule's worst case fits with room to spare, so adopting the constant
-// never cuts a default-schedule call short. See TestDefaultScheduleFitsTheWaitBudget.
+// never cuts a default-schedule call short. See
+// TestDefaultScheduleFitsTheDefaultWaitBudget.
 const DefaultWaitBudget = 5 * time.Minute
 
 // Config paces one retry loop. The zero value is usable and behaves exactly
@@ -344,7 +345,9 @@ func jitterAt(draw func(n int64) int64, d time.Duration) time.Duration {
 // re-trip the same window. A hint that is not positive is no hint, because a
 // caller can overflow a huge value into a negative duration and a negative
 // wait would be a retry hammer. The hint is clamped to the ceiling before the
-// spread is added, so the addition cannot overflow either.
+// spread is added. The sum is guarded too, because a ceiling within a second
+// of the top of int64 can wrap the addition negative, and a sum past either
+// bound answers the ceiling.
 func hintWait(hint func(error) (time.Duration, bool), draw func(int64) int64, err error, ceiling time.Duration) (time.Duration, bool) {
 	if hint == nil {
 		return 0, false
@@ -360,7 +363,7 @@ func hintWait(hint func(error) (time.Duration, bool), draw func(int64) int64, er
 		draw = rand.Int64N
 	}
 	d += time.Duration(draw(int64(time.Second) + 1))
-	if d > ceiling {
+	if d <= 0 || d > ceiling {
 		d = ceiling
 	}
 	return d, true

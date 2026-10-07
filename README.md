@@ -289,8 +289,8 @@ with the same config the call used. One spent attempt reads "1 attempt".
 Rate-limit refusals and transient faults draw on separate attempt budgets.
 Set `Transient` to a func that claims the transient class, and those errors
 retry `TransientAttempts` times, 2 by default, because every further try is
-another paid submission. Errors the classifier claims get `Attempts`, 3 by
-default. Set `WaitBudget` to bound the total waiting of one call, whatever
+another paid submission. Errors the classifier does not claim get `Attempts`,
+3 by default. Set `WaitBudget` to bound the total waiting of one call, whatever
 the attempt counts allow. `DefaultWaitBudget` is a value the default
 schedule's worst case fits.
 

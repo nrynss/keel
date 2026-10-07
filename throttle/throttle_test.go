@@ -477,6 +477,37 @@ func TestRetryHintIsClamped(t *testing.T) {
 	}
 }
 
+// TestRetryHintOverflowStillWaitsTheCap pins the corner the clamps exist
+// for: a ceiling within a second of the top of int64, and a hint clamped to
+// it. Adding the spread wraps the sum negative, and the wait must answer the
+// cap, never a negative or near-zero value that would retry at once.
+func TestRetryHintOverflowStillWaitsTheCap(t *testing.T) {
+	rec := &sleepRecorder{}
+	ceiling := time.Duration(math.MaxInt64)
+	calls := 0
+	cfg := Config{
+		Backoff: time.Hour,
+		Max:     ceiling,
+		RetryAfter: func(error) (time.Duration, bool) {
+			return ceiling, true
+		},
+		randN: at(500 * time.Millisecond), // the spread that overflows the sum
+		Sleep: rec.sleep,
+	}
+	if err := Retry(context.Background(), cfg, retryable, func() error {
+		calls++
+		if calls == 1 {
+			return errLimited
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if w := rec.waits(); len(w) != 1 || w[0] != ceiling {
+		t.Fatalf("waits = %v with ceiling %d, want exactly [%d], the cap", w, int64(ceiling), int64(ceiling))
+	}
+}
+
 // TestRetryGarbledHintFallsBack pins that a hint which is not positive is no
 // hint. A caller can overflow a huge value into a negative duration, and
 // waiting nothing at all would be a retry hammer.
