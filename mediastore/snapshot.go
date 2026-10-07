@@ -317,6 +317,15 @@ func (s *Store) selectBlobs(ctx context.Context, sel Selection) ([]Blob, error) 
 func (s *Store) captureBlob(ctx context.Context, root *os.Root, b Blob) (ManifestBlob, error) {
 	src, err := s.backend.Open(ctx, b.ID)
 	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			// The capture drives off rows rather than listings, so a row
+			// whose bytes are gone is a disappearance mid-capture and not
+			// an absence. It reports as a fault matching no sentinel, the
+			// reading it had before the backend seam, so the absent-object
+			// classification the backend added is dropped here on purpose.
+			// The %s keeps the text and drops the chain.
+			return ManifestBlob{}, fmt.Errorf("mediastore: snapshot %s: %s", b.ID, err)
+		}
 		return ManifestBlob{}, fmt.Errorf("mediastore: snapshot %s: %w", b.ID, err)
 	}
 	defer src.Close()
