@@ -22,6 +22,17 @@
 // seeks through this backend, so Range requests work in that proxy
 // mode as they do on disk.
 //
+// Direct uploads share the concrete type for the same reason, with one
+// rule added. A presigned write skips this process, so it also skips
+// the gate, the rate limit and the size checks a proxied upload passes,
+// and issuing one is an act the app takes for a route of its own after
+// its authorizer has passed. Nothing in this module issues a write URL
+// on its own. Completion runs through the store's Adopt, which checks
+// the stored object against the size and the digest the upload declared
+// and writes the metadata row only after both pass, so nothing is
+// reachable until completion succeeds. Session records for multipart
+// uploads live in a database, never in the bucket.
+//
 // The bucket is the backend's alone. Every object sits at the bucket
 // root named by its blob id, so the listing the orphan sweep consumes
 // is the whole bucket and nothing else is kept there.

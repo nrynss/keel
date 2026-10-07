@@ -34,7 +34,7 @@ else is pure Go, and `CGO_ENABLED=0` builds the whole module.
 | `stream` | Topic broker and server-sent events, with heartbeats, a non-blocking slow-subscriber policy, and best-effort replay after Last-Event-ID |
 | `job` | Long work started by a short request, observed over `stream`, durable across restarts |
 | `mediastore` | Blobs under unguessable ids on a storage backend, with the disk store built in, a read path for local tools, Range serving, retention sweeps and a snapshot that restores the same ids |
-| `mediastore/s3` | The blob backend for an S3-compatible object store, with presigned GET serving after the app's own authorizer and a proxy fallback with Range support, compiled only by apps that keep bytes off the box |
+| `mediastore/s3` | The blob backend for an S3-compatible object store, with presigned GET serving after the app's own authorizer, a proxy fallback with Range support, an opt-in presigned PUT issuer and multipart sessions whose records live in a SQLite session store with a sweep for abandoned ones and whose completion verifies size and digest before the row, compiled only by apps that keep bytes off the box |
 | `upload` | Resumable chunked uploads that land in `mediastore`, resumable by id after a dropped connection |
 | `photo` | Normalises an uploaded photo: EXIF orientation applied to the pixels, metadata stripped, resized under side and pixel caps, re-encoded under a byte cap |
 | `sqlite` | One SQLite file with WAL and synchronous FULL, so an acknowledged write survives a power cut once the file's creation window has passed, plus a writer handle, a read-only reader pool, namespaced migrations and online backup |
@@ -60,8 +60,8 @@ else is pure Go, and `CGO_ENABLED=0` builds the whole module.
 | `identity` | Guest sessions resolved from a signed cookie or a bearer token, sign-in by emailed code or an external provider, guest upgrade with a conflict rule, and account deletion as one resumable job |
 
 The stores that need SQLite live one directory down, in `cache/sqlitestore`,
-`job/sqlitestore`, `mediastore/sqlitestore`, `cost/sqlitestore`,
-`flag/sqlitestore`, `lease/sqlitestore`, `outbox/sqlitestore`,
+`job/sqlitestore`, `mediastore/sqlitestore`, `mediastore/s3/sqlitestore`,
+`cost/sqlitestore`, `flag/sqlitestore`, `lease/sqlitestore`, `outbox/sqlitestore`,
 `providertask/sqlitestore` and
 `identity/sqlitestore`. Only those
 packages import a SQLite driver, so an app that uses `gate` alone never
@@ -867,7 +867,7 @@ terminal chains older than a supplied time and leaves active chains alone.
 
 ### Private and public media with mediastore
 
-Entry points: `mediastore.Open`, `Store.Persist`, `Store.PersistWithID`, `Store.Open`,
+Entry points: `mediastore.Open`, `Store.Persist`, `Store.PersistWithID`, `Store.Adopt`, `Store.Open`,
 `Store.TempCopy`, `Store.Delete`, `Store.ServeHTTP`, `Store.NewSweeper`, `Store.Snapshot`,
 `Store.Restore`.
 
@@ -904,9 +904,18 @@ process and owns the decision. The reader it returns supports `Seek`, and the ca
 the caller must call. The ffmpeg-based packages take file paths, so stored media reaches them
 through this helper.
 
+`Store.Adopt` records a row for bytes that already sit in the backend under an id the caller
+holds, after the stored object verified against the size and digest the caller names. It streams
+the object once, counting and hashing as it reads, and writes the row only after both checks
+pass. A size or digest that disagrees refuses, an id with no bytes refuses, and an id the index
+already holds refuses, so nothing becomes reachable until the call returns nil. It is the
+completion half of a direct upload, where the client sent the bytes to the backend itself and
+this call is what first makes them servable.
+
 ### Blob bytes in an S3-compatible store with mediastore/s3
 
-Entry points: `s3.Open`, `Backend.PresignGet`.
+Entry points: `s3.Open`, `Backend.PresignGet`, `Backend.PresignPut`, `Backend.StartUpload`,
+`Backend.PresignPart`, `Backend.CompleteUpload`, `Backend.AbortUpload`.
 
 `s3.Open` takes an `s3.Config` with the endpoint, one bucket the backend owns alone, the signing
 region, the credential pair, the presign expiry, and whether the service wants the bucket in the
@@ -950,6 +959,90 @@ The URL carries an expiry from `s3.Config` and a signature the service verifies,
 a missing object once it expires. A deployment that cannot redirect serves through the store
 handler instead. That proxy mode streams and seeks through the backend, so Range requests answer
 206 with exactly the requested bytes, as they do on disk.
+
+### Direct uploads with mediastore/s3
+
+A browser that uploads a large file can put its bytes straight into the bucket instead of through
+the app process. The URL issuer, the multipart calls and the error codes are all on the concrete
+backend type, and every one of them is opt-in: a presigned write skips the gate, the rate limit
+and the size checks a proxied upload passes, so issuing a URL is an act the app takes for one
+route of its own, after its own authorizer has passed. Nothing in Keel issues one on its own. The
+store handler streams through the backend and the resumable upload handler stays behind its own
+checks, so a deployment that never calls the issuer never has the path.
+
+`PresignPut` takes the blob id, the content type, the exact size the client declared, and the
+digest of the client's bytes. The declared size and type sign as request headers, so the
+bucket itself refuses a PUT of any other length or shape, and a route applies its own byte cap to
+the declared size before it calls. The digest signs as the dialect's checksum
+header, so the service refuses bytes of any other shape before they land:
+
+```go
+put, err := backend.PresignPut(ctx, s3.PresignPutInput{
+	BlobID:      id,
+	ContentType: "video/mp4",
+	SizeBytes:   declared,
+	SHA256:      declaredDigest,
+})
+// put.URL and put.Headers go to the client, put.Expires is the
+// instant the service closes the URL.
+```
+
+The client sends the returned headers verbatim and the URL carries the signature, so the app
+process never touches the bytes. The pinned digest holds for the URL's whole life, so a URL that
+outlives its completion can put the verified bytes again and no others. The bucket refuses a
+same-size body of any other shape as a bad digest, so the store never serves bytes completion did
+not verify. Completion runs through `Store.Adopt`, which never trusts the bucket's own accounting: it streams the stored object once, checks the size and the digest
+against what the upload declared, and writes the metadata row only after both pass. A completion
+that arrives before the bytes refuses, a completion that fails a check refuses and records
+nothing, and an id the index already holds refuses, so nothing is reachable until completion
+succeeds. The bytes precede the row because the service acknowledged the client's put before
+completion was ever called, which is the same promise a persist through this backend makes. A
+row write that fails leaves the bytes unreachable, and the orphan sweep ages them out by the
+service's modification time, as it ages every object with no row.
+
+A file too large for one PUT runs as a multipart session. The app plans the parts, records the
+session in its own database, and drives four calls:
+
+- `StartUpload` opens the upload in the bucket and returns the service's upload id.
+- `PresignPart` returns a URL for one part, with that part's length signed into it. The part
+number and the upload id travel inside the URL, so a URL moved to another part reads as tampered.
+Every part before the last carries at least the dialect's minimum, `s3.MinPartSize`, which the
+service checks when the parts assemble, so a plan under the floor refuses at completion.
+- `CompleteUpload` assembles the planned parts from the service's own listing and refuses with
+`s3.ErrIncomplete` while a part is still missing. A completion that already ran through reports
+`s3.ErrNoSuchUpload`, and the caller's next stop is recording the object.
+- `AbortUpload` discards every part and reads an upload the service no longer holds as already
+aborted, so a sweep and a retry can both run without asking twice.
+
+The assembled object completes through `Store.Adopt` exactly as a single PUT does.
+
+Session records live in `mediastore/s3/sqlitestore`, one table under the shared migration runner,
+never in the bucket, because the bucket's record names the parts and nothing else. Entry points:
+`sqlitestore.Open`, `Store.Create`, `Store.Get`, `Store.Delete`, `Store.Expired`, `Store.Sweep`.
+A session carries the blob id, the upload id, the part plan, and the metadata completion hands to
+`Store.Adopt`, which is the only state a restart or a sweep reads. `Sweep` abandons what the
+client left behind: it aborts every session recorded older than the bound, which discards its
+parts in the bucket, and deletes the row once the abort went through. A row whose abort failed
+stays for the next pass, because removing it would orphan parts the service still holds. An
+upload the service no longer holds aborts as done, so a session a completion left behind reads
+the same as one the abort closed.
+
+Sweep ownership has two halves. Abandoned multipart sessions belong to the session sweep, which
+owns both the row and the parts, because the abort is what discards the parts. Never-completed
+objects belong to the store's orphan sweep: the bytes of a direct PUT that was never completed,
+and of a completion whose row write failed, age out by the service's modification time like every
+object with no row.
+
+Refusals are written in the shared `wire` envelope by the routes the app mounts, and the codes
+are exported constants so clients branch on them: `CodeInvalidRequest`, `CodeNotFound`,
+`CodeConflict`, `CodeUnsupportedType`, `CodeSizeMismatch`, `CodeHashMismatch`,
+`CodeIncomplete` and `CodeStorageError`. The size and digest codes answer completion's
+`mediastore.ErrSizeMismatch` and `mediastore.ErrDigestMismatch`, and the incomplete code answers
+`s3.ErrIncomplete`.
+
+The secret signs every presigned URL and appears in no part of one, in no log line and no error
+string the package writes. The access key id rides in the credential parameter the signing
+dialect places in every URL, which is how the service finds the signer.
 
 ### Resumable uploads with upload
 
