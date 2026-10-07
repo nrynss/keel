@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -1126,5 +1127,57 @@ func TestPersistDirSyncFailureRemovesPartialBlob(t *testing.T) {
 	}
 	if len(rows) != 0 {
 		t.Fatalf("index holds %d rows after a refused persist, want none", len(rows))
+	}
+}
+
+// syncSpy records the order of the two sync seams in one shared
+// sequence. The data promise rests on that order, not on the presence
+// of the calls alone, so the file's Sync must land in the sequence
+// before the directory sync of the same blob.
+type syncSpy struct {
+	events []string
+	fail   error
+}
+
+// spiedBlob serves real writes through the underlying file and records
+// each Sync through the shared spy. It is the newBlob half of the seam
+// pair, the directory sync being the other half.
+type spiedBlob struct {
+	*os.File
+	spy *syncSpy
+}
+
+func (f *spiedBlob) Sync() error {
+	f.spy.events = append(f.spy.events, "file sync")
+	return f.File.Sync()
+}
+
+func (sp *syncSpy) syncDir() error {
+	sp.events = append(sp.events, "dir sync")
+	return sp.fail
+}
+
+// TestPersistSyncsFileBeforeDirectory: the blob's bytes must reach
+// stable storage before its directory entry is flushed, so each
+// created blob's directory sync is preceded by that blob's file sync.
+// Moving the directory sync above the file sync in writeBlob fails
+// this pin.
+func TestPersistSyncsFileBeforeDirectory(t *testing.T) {
+	s := openTestStore(t)
+	sp := &syncSpy{}
+	s.syncDir = sp.syncDir
+	s.newBlob = func(blobID string) (blobFile, error) {
+		f, err := s.root.Create(blobID)
+		if err != nil {
+			return nil, err
+		}
+		return &spiedBlob{File: f, spy: sp}, nil
+	}
+	if _, err := s.Persist(t.Context(), bytes.NewReader(blob(64)), Put{ContentType: "image/png"}); err != nil {
+		t.Fatalf("persist: %v", err)
+	}
+	want := []string{"file sync", "dir sync"}
+	if !slices.Equal(sp.events, want) {
+		t.Fatalf("sync events = %v, want %v", sp.events, want)
 	}
 }
