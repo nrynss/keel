@@ -14,6 +14,7 @@ import (
 	"sync"
 	"testing"
 	"testing/fstest"
+	"time"
 )
 
 // openTestDB opens a database for a test and closes it at cleanup. Records go
@@ -190,6 +191,129 @@ func TestConcurrentWritesDoNotBusy(t *testing.T) {
 	}
 	if want := writers * perWriter; count != want {
 		t.Fatalf("row count = %d, want %d", count, want)
+	}
+}
+
+// raceTwoOpens releases two Opens of one path through one barrier and returns
+// the two handles and errors in goroutine order.
+func raceTwoOpens(ctx context.Context, path string, log *slog.Logger) ([2]*DB, [2]error) {
+	var (
+		dbs   [2]*DB
+		errs  [2]error
+		wg    sync.WaitGroup
+		start = make(chan struct{})
+	)
+	wg.Add(2)
+	for j := range 2 {
+		go func(j int) {
+			defer wg.Done()
+			<-start
+			dbs[j], errs[j] = Open(ctx, Config{Path: path, Logger: log})
+		}(j)
+	}
+	close(start)
+	wg.Wait()
+	return dbs, errs
+}
+
+// TestConcurrentOpensOnVirginFileConverge pins the busy window at the pool
+// ping. Two concurrent Opens of one virgin file race the journal-mode change,
+// and SQLite returns busy for it at once instead of waiting out the busy
+// timeout. Both opens must end usable, and no raw busy error may escape. The
+// recorded log pins the retry as live code, because a pass with no retried
+// ping would prove nothing.
+func TestConcurrentOpensOnVirginFileConverge(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	handler := &recordingHandler{}
+	log := slog.New(handler)
+
+	const runs = 100
+	for i := range runs {
+		dbs, errs := raceTwoOpens(ctx, filepath.Join(t.TempDir(), "keel.db"), log)
+		for j, err := range errs {
+			if err != nil {
+				t.Fatalf("run %d open %d: Open: %v", i, j, err)
+			}
+		}
+		for j := range dbs {
+			if err := dbs[j].Writer().PingContext(ctx); err != nil {
+				t.Fatalf("run %d open %d: writer pool unusable: %v", i, j, err)
+			}
+			if err := dbs[j].Reader().PingContext(ctx); err != nil {
+				t.Fatalf("run %d open %d: reader pool unusable: %v", i, j, err)
+			}
+		}
+		for j := range dbs {
+			if err := dbs[j].Close(); err != nil {
+				t.Fatalf("run %d open %d: Close: %v", i, j, err)
+			}
+		}
+	}
+	if handler.count(busyPingRecord) == 0 {
+		t.Fatal("no run recorded a retried ping, so the racing pair never met the busy window")
+	}
+}
+
+// TestOpenCancelledContextFailsFast pins the fast side of the retry. A dead
+// context must surface as the ping error with context.Canceled reachable,
+// without exhausting the retry window and without a retry record.
+func TestOpenCancelledContextFailsFast(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	handler := &recordingHandler{}
+	started := time.Now()
+	_, err := Open(ctx, Config{Path: filepath.Join(t.TempDir(), "keel.db"), Logger: slog.New(handler)})
+	elapsed := time.Since(started)
+	if err == nil {
+		t.Fatal("Open on a cancelled context returned nil, want an error")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled Open error = %v, want context.Canceled reachable", err)
+	}
+	if handler.count(busyPingRecord) != 0 {
+		t.Fatal("a cancelled context recorded a ping retry")
+	}
+	if elapsed >= pingRetryDelay*pingRetryAttempts {
+		t.Fatalf("cancelled Open took %v, the retry window did not break early", elapsed)
+	}
+}
+
+// TestOpenNonBusyPingErrorSurfaces pins the narrow class of the retry. A ping
+// that fails for any other reason must surface once, with the driver error
+// still reachable behind the ping wrap, and must never retry. The elapsed
+// bound is the immediacy pin: the honest path answers in microseconds, and a
+// fifth of the retry window leaves room for scheduler noise while any real
+// retry of this failure would overrun it.
+func TestOpenNonBusyPingErrorSurfaces(t *testing.T) {
+	t.Parallel()
+	handler := &recordingHandler{}
+	blocked := filepath.Join(t.TempDir(), "db")
+	if err := os.Mkdir(blocked, 0o755); err != nil {
+		t.Fatalf("create blocking directory: %v", err)
+	}
+	started := time.Now()
+	_, err := Open(context.Background(), Config{Path: blocked, Logger: slog.New(handler)})
+	elapsed := time.Since(started)
+	if err == nil {
+		t.Fatal("Open over a directory returned nil, want an error")
+	}
+	if !strings.HasPrefix(err.Error(), "sqlite: open: ping: ") {
+		t.Fatalf("directory Open error = %v, want the ping wrap preserved", err)
+	}
+	var driverErr *moderncsqlite.Error
+	if !errors.As(err, &driverErr) {
+		t.Fatalf("directory Open error = %v, want the driver error reachable", err)
+	}
+	if busyPingError(err) {
+		t.Fatalf("directory Open error = %v, the retry must not cover this class", err)
+	}
+	if handler.count(busyPingRecord) != 0 {
+		t.Fatal("a non-busy ping failure recorded a retry")
+	}
+	if elapsed >= pingRetryDelay*pingRetryAttempts/5 {
+		t.Fatalf("directory Open took %v, a non-busy failure retried instead of surfacing", elapsed)
 	}
 }
 

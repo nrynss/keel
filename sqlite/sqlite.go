@@ -23,7 +23,9 @@
 // Keel stores and the embedding application share one database file without
 // colliding. Concurrent first opens converge on one schema. When an apply
 // collides with a file another open has just applied, the loser re-reads the
-// ledger and proceeds past the winner's files instead of failing.
+// ledger and proceeds past the winner's files instead of failing. When a
+// first open loses the journal-mode change to a concurrent open, its pool
+// ping retries inside a bounded window instead of failing with SQLITE_BUSY.
 //
 // This package is one of the few allowed to import the SQLite driver.
 // Everything else reaches SQLite through it.
@@ -45,8 +47,10 @@ import (
 	"time"
 
 	// Register the pure-Go driver under the name this package opens, so a
-	// build with cgo disabled still carries SQLite.
-	_ "modernc.org/sqlite"
+	// build with cgo disabled still carries SQLite. The named import keeps
+	// the driver's error type reachable for busy classification.
+	moderncsqlite "modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 // driverName is the name the SQLite driver registers itself under.
@@ -65,6 +69,19 @@ const defaultMaxReaders = 4
 // versionTableSuffix names the per-namespace ledger table. The table records
 // the migrations a namespace has applied.
 const versionTableSuffix = "_schema_migrations"
+
+// pingRetryAttempts caps how many times openPool pings before it gives up,
+// first attempt included. Fifty attempts ten milliseconds apart bound the
+// retry window near half a second, far under the busy timeout one statement
+// already waits out.
+const pingRetryAttempts = 50
+
+// pingRetryDelay is the pause between two ping attempts.
+const pingRetryDelay = 10 * time.Millisecond
+
+// busyPingRecord is the log message openPool writes when a ping succeeded
+// after waiting out a busy first boot.
+const busyPingRecord = "sqlite: open ping waited out a concurrent open"
 
 var (
 	// ErrInvalidConfig is returned by Open, Migrate and Backup for an argument
@@ -148,11 +165,11 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 		now = time.Now
 	}
 
-	writer, err := openPool(ctx, abs, timeout, 1, false)
+	writer, err := openPool(ctx, abs, timeout, 1, false, logger)
 	if err != nil {
 		return nil, err
 	}
-	reader, err := openPool(ctx, abs, timeout, maxReaders, true)
+	reader, err := openPool(ctx, abs, timeout, maxReaders, true, logger)
 	if err != nil {
 		writer.Close() // the ping failed, so the writer swallowed nothing
 		return nil, err
@@ -162,17 +179,65 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 
 // openPool opens one pool over the database at abs. A read pool carries
 // query_only on every connection. The pool opens exactly limit connections.
-func openPool(ctx context.Context, abs string, timeout time.Duration, limit int, readOnly bool) (*sql.DB, error) {
+func openPool(ctx context.Context, abs string, timeout time.Duration, limit int, readOnly bool, log *slog.Logger) (*sql.DB, error) {
 	pool, err := sql.Open(driverName, dsn(abs, timeout, readOnly))
 	if err != nil {
 		return nil, fmt.Errorf("sqlite: open: %w", err)
 	}
 	pool.SetMaxOpenConns(limit)
-	if err := pool.PingContext(ctx); err != nil {
+	if err := pingUntilUsable(ctx, pool, log); err != nil {
 		pool.Close() // the ping failed before a session was usable, nothing to drain
-		return nil, fmt.Errorf("sqlite: open: ping: %w", err)
+		return nil, err
 	}
 	return pool, nil
+}
+
+// pingUntilUsable proves the pool can reach the file. Two concurrent first
+// opens race the journal-mode change a virgin file needs, and SQLite returns
+// SQLITE_BUSY for it at once, without honouring the busy timeout. A
+// busy-class ping therefore retries a bounded number of times, so the loser
+// of that one-time race waits out the winner instead of failing. The retry
+// covers the ping alone, the way the migration runner's ledger re-read covers
+// applies, and neither guard masks the other's classified errors. Any other
+// error surfaces immediately, and a cancelled context ends the wait at the
+// next boundary.
+func pingUntilUsable(ctx context.Context, pool *sql.DB, log *slog.Logger) error {
+	for attempt := 1; ; attempt++ {
+		err := pool.PingContext(ctx)
+		if err == nil {
+			if attempt > 1 {
+				log.InfoContext(ctx, busyPingRecord, "attempts", attempt)
+			}
+			return nil
+		}
+		if !busyPingError(err) || attempt == pingRetryAttempts {
+			return fmt.Errorf("sqlite: open: ping: %w", err)
+		}
+		if err := wait(ctx, pingRetryDelay); err != nil {
+			return fmt.Errorf("sqlite: open: ping: %w", err)
+		}
+	}
+}
+
+// busyPingError reports whether err is the driver's busy class, the result
+// code SQLite raises when another connection holds the file. Extended result
+// codes carry the primary code in the low byte.
+func busyPingError(err error) bool {
+	var driverErr *moderncsqlite.Error
+	return errors.As(err, &driverErr) && driverErr.Code()&0xff == sqlite3.SQLITE_BUSY
+}
+
+// wait pauses for d, or returns the context error when the caller cancels
+// first.
+func wait(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 // dsn builds the file URI that Open hands the driver. The pragmas travel in
