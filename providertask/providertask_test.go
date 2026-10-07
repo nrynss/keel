@@ -1029,3 +1029,105 @@ func TestJoinerTimesOutWithTaskPending(t *testing.T) {
 		t.Fatalf("leader Run: %v", err)
 	}
 }
+
+// gatedStore holds a Run at its Claim, so a second Run can read the same
+// row while the first still holds the flight. That is the two caller shape
+// the stale verdict pin needs.
+type gatedStore struct {
+	providertask.Store
+	gate chan struct{}
+}
+
+func (g *gatedStore) Claim(ctx context.Context, key string, now time.Time) (providertask.Claim, bool, error) {
+	<-g.gate
+	return g.Store.Claim(ctx, key, now)
+}
+
+// TestStaleVerdictsAreHonouredAtAnyAge: a recorded verdict older than the
+// query window is answered from the row, never refused as stale. Two
+// callers of one stale failed row get the identical stored code, whatever
+// path each takes to the row.
+func TestStaleVerdictsAreHonouredAtAnyAge(t *testing.T) {
+	h := newHarness(t)
+	old := h.base.Add(-25 * time.Hour)
+	cfg := providertask.Config{
+		Window: 24 * time.Hour,
+		Log:    h.log,
+		Now:    func() time.Time { return h.base },
+	}
+	plant := func(key, taskID string, state providertask.State, code string) {
+		t.Helper()
+		if _, _, err := h.store.Claim(t.Context(), key, old); err != nil {
+			t.Fatalf("Claim %s: %v", key, err)
+		}
+		if err := h.store.Record(t.Context(), key, taskID); err != nil {
+			t.Fatalf("Record %s: %v", key, err)
+		}
+		if err := h.store.Finish(t.Context(), key, state, code); err != nil {
+			t.Fatalf("Finish %s: %v", key, err)
+		}
+	}
+	plant("stale-lost", "task-lost", providertask.StateFailed, "unit_limit")
+
+	// A plain Run answers from the row: the stored verdict, not the window.
+	p := newFakeProvider(rendered{}, step{st: providertask.Status{State: providertask.StateSucceeded}})
+	_, err := providertask.Run(t.Context(), cfg, h.store, "stale-lost", p.spec(nil))
+	var fail *providertask.TaskFailure
+	if !errors.As(err, &fail) || fail.Code != "unit_limit" || fail.TaskID != "task-lost" {
+		t.Fatalf("err = %v, want the stored verdict", err)
+	}
+	creates, statuses, _, _ := p.counts()
+	if creates != 0 || statuses != 0 {
+		t.Errorf("creates=%d statuses=%d, want none: the verdict is already recorded", creates, statuses)
+	}
+
+	// A recorded success past the window is collected, not refused.
+	plant("stale-won", "task-won", providertask.StateSucceeded, "")
+	pw := newFakeProvider(rendered{Link: "kept"}, step{st: providertask.Status{State: providertask.StateSucceeded}})
+	outcome, err := providertask.Run(t.Context(), cfg, h.store, "stale-won", pw.spec(nil))
+	if err != nil {
+		t.Fatalf("stale success Run: %v", err)
+	}
+	if outcome.TaskID != "task-won" || outcome.Value.Link != "kept" {
+		t.Errorf("outcome = %+v, want the recorded task fetched again", outcome)
+	}
+	if creates, statuses, results, _ := pw.counts(); creates != 0 || statuses != 0 || results != 1 {
+		t.Errorf("creates=%d statuses=%d results=%d, want only the fetch", creates, statuses, results)
+	}
+
+	// Two overlapping callers of the stale failed row read the same row and
+	// answer with the identical stored code, whichever one leads.
+	coord := providertask.NewCoordinator()
+	cfg.Coordinator = coord
+	joinerCfg := cfg
+	gate := make(chan struct{})
+	gated := &gatedStore{Store: h.store, gate: gate}
+	leaderDone := make(chan error, 1)
+	go func() {
+		_, err := providertask.Run(t.Context(), cfg, gated, "stale-lost", p.spec(nil))
+		leaderDone <- err
+	}()
+	joinerDone := make(chan error, 1)
+	go func() {
+		_, err := providertask.Run(t.Context(), joinerCfg, h.store, "stale-lost", p.spec(nil))
+		joinerDone <- err
+	}()
+	var joinFail *providertask.TaskFailure
+	select {
+	case err := <-joinerDone:
+		if !errors.As(err, &joinFail) || joinFail.Code != "unit_limit" || joinFail.TaskID != "task-lost" {
+			t.Fatalf("joiner err = %v, want the stored verdict", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("joiner never resolved")
+	}
+	close(gate)
+	leadErr := <-leaderDone
+	var leadFail *providertask.TaskFailure
+	if !errors.As(leadErr, &leadFail) || leadFail.Code != "unit_limit" || leadFail.TaskID != "task-lost" {
+		t.Fatalf("leader err = %v, want the stored verdict", leadErr)
+	}
+	if joinFail.Code != fail.Code || joinFail.TaskID != fail.TaskID {
+		t.Errorf("joiner answered %+v, want the first caller's %+v", joinFail, fail)
+	}
+}

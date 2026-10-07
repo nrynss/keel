@@ -12,10 +12,12 @@
 // re-creates a recorded task silently, because a second create is a second
 // charge.
 //
-// A task id whose recorded age passes Config.Window refuses with
-// ErrWindowExceeded and its stable code. The provider may no longer know
-// the task, so polling it would spin. The refusal names the fact instead
-// of papering over it, and the caller resolves the key out of band.
+// A recorded task that still runs when its age passes Config.Window
+// refuses with ErrWindowExceeded and its stable code. The provider may no
+// longer answer queries about the task, so polling it would spin. The
+// refusal names the fact instead of papering over it, and the caller
+// resolves the key out of band. A recorded verdict is honoured at any age,
+// because the provider already answered it.
 //
 // A key that is claimed but carries no task id yet is a create some Run
 // started and has not recorded. Another Run waits for that record rather
@@ -107,8 +109,9 @@ var (
 	ErrInvalid = errors.New("providertask: invalid input")
 	// ErrUnknownKey is returned by a Store for a key it holds no row for.
 	ErrUnknownKey = errors.New("providertask: unknown key")
-	// ErrWindowExceeded reports a task id whose recorded age passed the
-	// provider's query window. The refusal never re-creates the task.
+	// ErrWindowExceeded reports a recorded task that still runs when its
+	// age passed the provider's query window. The refusal never re-creates
+	// the task, and a recorded verdict is never refused.
 	ErrWindowExceeded = errors.New("providertask: task id is older than the query window")
 	// ErrTaskPending reports a key whose create is still unresolved, or
 	// whose task has not finished, when the deadline passed. The claim may
@@ -560,18 +563,20 @@ func (t *task[T]) lead() (Outcome[T], error) {
 	return t.land(taskID, value, usage, err)
 }
 
-// resume drives a recorded task whose verdict is not recorded. The Run
+// resume drives a Run that leads a key whose task id is recorded. The Run
 // that recorded it has ended, either because its process restarted or
-// because its deadline passed, so this Run owns the settle.
+// because its deadline passed, so this Run owns the settle. A recorded
+// verdict is honoured at any age, because the provider already answered
+// it, and only the live poll faces the query window.
 func (t *task[T]) resume(claim Claim) (Outcome[T], error) {
-	if err := t.checkWindow(claim); err != nil {
-		return Outcome[T]{}, err
-	}
 	switch claim.State {
 	case StateSucceeded:
 		return t.collect(claim)
 	case StateFailed:
 		return Outcome[T]{}, failure(claim.TaskID, claim.Code)
+	}
+	if err := t.checkWindow(claim); err != nil {
+		return Outcome[T]{}, err
 	}
 	taskID, value, usage, err := t.metered(func() (string, T, cost.Usage, error) {
 		v, u, werr := t.watch(claim.TaskID)
@@ -810,6 +815,9 @@ func (t *task[T]) collect(claim Claim) (Outcome[T], error) {
 }
 
 // checkWindow refuses a claim whose recorded age passed the query window.
+// Only a claim that still runs faces the window, because the provider may
+// no longer answer queries about the task. A recorded verdict is never
+// refused, because the provider already answered it.
 func (t *task[T]) checkWindow(claim Claim) error {
 	age := t.now().Sub(claim.CreatedAt)
 	if age <= t.cfg.window() {
