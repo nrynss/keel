@@ -33,6 +33,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -180,13 +181,18 @@ func (b *Backend) Open(ctx context.Context, blobID string) (mediastore.BlobReade
 }
 
 // Write stores src as the bytes named id and returns the number of
-// bytes it read from src. An object already under the id is refused
-// with an error matching mediastore.ErrAlreadyExists, and the stored
-// bytes stay untouched. The check and the put are two calls, so this
-// is weaker than the disk backend's exclusive create: a concurrent
-// writer can take the name between them. The client can carry a
-// conditional put, and a service that honours it would close that
-// window. This backend does not send one. The promise here is
+// bytes it read from src. A source with no length of its own, such as
+// a stream without a Seek, lands in a temporary file first. The put
+// then names a Content-Length, which an S3-compatible service may
+// require. That breadth costs a length-less write one pass of the blob
+// on the local disk. A seekable source skips the spool, because a
+// seek names its length for free. An object already under the id is
+// refused with an error matching mediastore.ErrAlreadyExists, and the
+// stored bytes stay untouched. The check and the put are two calls, so
+// this is weaker than the disk backend's exclusive create: a
+// concurrent writer can take the name between them. The client can
+// carry a conditional put, and a service that honours it would close
+// that window. This backend does not send one. The promise here is
 // S3-compatible breadth, and a dialect that silently drops the unknown
 // header would overwrite instead of refusing, which is the exact
 // damage the refusal exists to prevent. The bytes are durable under
@@ -206,15 +212,76 @@ func (b *Backend) Write(ctx context.Context, blobID string, src io.Reader) (int6
 	if !absent(err) {
 		return 0, fmt.Errorf("s3: write %s: head: %w", blobID, err)
 	}
+	if seeker, ok := src.(lengthedReader); ok {
+		return b.writeSeekable(ctx, blobID, seeker)
+	}
+	return b.writeSpooled(ctx, blobID, src)
+}
+
+// lengthedReader is a source that streams and seeks, so the put can
+// learn its length without copying it.
+type lengthedReader interface {
+	io.Reader
+	io.Seeker
+}
+
+// writeSeekable puts a source whose seek names its length. The seek
+// records where the source stands, because a caller may hand over a
+// reader positioned part way through. The put must stream the same
+// window the direct path always streamed.
+func (b *Backend) writeSeekable(ctx context.Context, blobID string, src lengthedReader) (int64, error) {
+	pos, err := src.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return 0, fmt.Errorf("s3: write %s: length: %w", blobID, err)
+	}
+	size, err := src.Seek(0, io.SeekEnd)
+	if err != nil {
+		return 0, fmt.Errorf("s3: write %s: length: %w", blobID, err)
+	}
+	if _, err := src.Seek(pos, io.SeekStart); err != nil {
+		return 0, fmt.Errorf("s3: write %s: length: %w", blobID, err)
+	}
 	counted := &countingReader{r: src}
 	if _, err := b.client.PutObject(ctx, &s3sdk.PutObjectInput{
-		Bucket: aws.String(b.bucket),
-		Key:    aws.String(blobID),
-		Body:   counted,
+		Bucket:        aws.String(b.bucket),
+		Key:           aws.String(blobID),
+		Body:          counted,
+		ContentLength: aws.Int64(max(size-pos, 0)),
 	}); err != nil {
 		return 0, fmt.Errorf("s3: write %s: put: %w", blobID, err)
 	}
 	return counted.n, nil
+}
+
+// writeSpooled puts a source that cannot name its own length. The
+// source lands in one temporary file, so the put carries the spooled
+// size, and every path out removes the file.
+func (b *Backend) writeSpooled(ctx context.Context, blobID string, src io.Reader) (int64, error) {
+	f, err := os.CreateTemp("", "s3-")
+	if err != nil {
+		return 0, fmt.Errorf("s3: write %s: spool: %w", blobID, err)
+	}
+	path := f.Name()
+	defer func() {
+		f.Close()           // best effort, the file is about to be removed anyway
+		_ = os.Remove(path) // best effort, nobody is left to report a failed cleanup to
+	}()
+	n, err := io.Copy(f, src)
+	if err != nil {
+		return 0, fmt.Errorf("s3: write %s: spool: %w", blobID, err)
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return 0, fmt.Errorf("s3: write %s: spool: %w", blobID, err)
+	}
+	if _, err := b.client.PutObject(ctx, &s3sdk.PutObjectInput{
+		Bucket:        aws.String(b.bucket),
+		Key:           aws.String(blobID),
+		Body:          f,
+		ContentLength: aws.Int64(n),
+	}); err != nil {
+		return 0, fmt.Errorf("s3: write %s: put: %w", blobID, err)
+	}
+	return n, nil
 }
 
 // Delete removes the stored bytes of id. An error matching
