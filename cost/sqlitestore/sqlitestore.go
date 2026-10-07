@@ -67,7 +67,9 @@
 // as a reservation hold, so a runner that vanishes stops holding the
 // quote when the hold lapses. A finished run records its outcome on the
 // quote row, so every later Run of the same id returns that outcome and
-// charges nothing. Run re-checks the price against the configured Reprice
+// charges nothing. The settle runs detached from the caller's
+// cancellation once the work succeeds, so a late cancel books the charge
+// anyway. Run re-checks the price against the configured Reprice
 // callback before it claims, and refuses with a fresh quote when the
 // price moved past the tolerance. An expired quote refuses the same way.
 // Expired quotes are swept beside the expired reservations, at open and

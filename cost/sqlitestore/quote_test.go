@@ -76,6 +76,18 @@ func freshCharge(t *testing.T, path, ref string) (kind string, unitPrice int64, 
 	return kind, unitPrice, denom
 }
 
+// freshOwnerSpent reads the spend booked on one owner's account over a
+// fresh connection.
+func freshOwnerSpent(t *testing.T, path, owner string) cost.Price {
+	t.Helper()
+	var spent int64
+	if err := openFresh(t, path).QueryRow(
+		`SELECT spent_nd FROM cost_owner_budget WHERE owner = ?`, owner).Scan(&spent); err != nil {
+		t.Fatalf("read owner spend %q: %v", owner, err)
+	}
+	return cost.Price(spent)
+}
+
 // refusalOf fails the test unless err is a quote refusal, and returns it.
 func refusalOf(t *testing.T, err error) *cost.QuoteRefusal {
 	t.Helper()
@@ -686,5 +698,50 @@ func TestRunPanicFreesClaimAndAlertsWaiters(t *testing.T) {
 	}
 	if usage != (cost.Usage{Price: 5 * cost.Cent, Measured: true}) {
 		t.Fatalf("usage = %+v", usage)
+	}
+}
+
+// TestRunBooksWhenCallerCancelsAfterWork pins that a cancellation after
+// the work succeeded cannot leave the action unbooked. The work signals
+// success and the caller cancels in the same instant, so the settle starts
+// on a context that is already gone. Run reports the settled outcome with
+// a nil error, the quote reads as done over a fresh connection, the ledger
+// holds the charge, the owner's spend is recorded, and the hold is freed.
+func TestRunBooksWhenCallerCancelsAfterWork(t *testing.T) {
+	clock := &testClock{at: base}
+	path := filepath.Join(t.TempDir(), "cost.db")
+	store := openStore(t, path, withClock(clock.now), withLimit(100*cost.Dollar))
+	ctx := t.Context()
+	setOwnerLimit(t, sqlitestore.NewKeyedBudget(store), "alice", 10*cost.Dollar)
+	quote, err := store.Quote(ctx, "alice", 5*cost.Cent, time.Hour)
+	if err != nil {
+		t.Fatalf("quote: %v", err)
+	}
+
+	callerCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	const charged = 4 * cost.Cent
+	usage, err := store.Run(callerCtx, quote.ID, func(context.Context) (cost.Usage, error) {
+		cancel() // the caller gives up the moment the work has succeeded
+		return cost.Usage{Price: charged, Measured: true}, nil
+	})
+	if err != nil {
+		t.Fatalf("run quote past the cancellation: %v", err)
+	}
+	if usage != (cost.Usage{Price: charged, Measured: true}) {
+		t.Fatalf("usage = %+v, want the measured price", usage)
+	}
+	if state := freshQuoteState(t, path, quote.ID); state != "done" {
+		t.Fatalf("quote state = %q, want done", state)
+	}
+	kind, unitPrice, denom := freshCharge(t, path, quote.ID)
+	if kind != "quoted" || unitPrice != int64(charged) || denom != "" {
+		t.Fatalf("charge = (%q, %d, %q)", kind, unitPrice, denom)
+	}
+	if spent := freshOwnerSpent(t, path, "alice"); spent != charged {
+		t.Fatalf("owner spend = %s, want %s", spent, charged)
+	}
+	if n := freshCount(t, path, "cost_reservation"); n != 0 {
+		t.Fatalf("reservations = %d, want the settle to free the hold", n)
 	}
 }
