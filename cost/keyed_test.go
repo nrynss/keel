@@ -263,3 +263,128 @@ func TestKeyedBudgetConcurrentReservationsNeverOverspend(t *testing.T) {
 		}
 	}
 }
+
+// TestOwnerAccountSettleOnceBooksAReferenceOnce pins the settle-once
+// contract on the per-owner accounts behind a keyed budget. The first
+// settle of a pair books on the owner ceiling and on the global one. A
+// repeat frees the holds the reserve took on both ceilings and books
+// nothing, so the owner and the pool keep the headroom the first booking
+// left.
+func TestOwnerAccountSettleOnceBooksAReferenceOnce(t *testing.T) {
+	k := mustKeyed(t, 100*Cent)
+	mustOwnerLimit(t, k, "a", 40*Cent)
+	mustOwnerLimit(t, k, "b", 100*Cent)
+	a, err := k.Owner("a")
+	if err != nil {
+		t.Fatalf("Owner(a): %v", err)
+	}
+
+	booked, err := a.SettleOnce(30*Cent, 12*Cent, "transcribe", "job-9")
+	if err != nil {
+		t.Fatalf("SettleOnce: %v", err)
+	}
+	if !booked {
+		t.Fatalf("first SettleOnce booked = false, want true")
+	}
+	if got := mustKeyedRemaining(t, k, "a"); got != 28*Cent {
+		t.Errorf("owner a headroom = %d, want %d", got, 28*Cent)
+	}
+
+	// The repeat frees the owner hold and the global hold the reserve took,
+	// and books nothing on either ceiling. The global check is the reserve
+	// owner b can still make against the pool the first booking left.
+	if err := a.Reserve(20 * Cent); err != nil {
+		t.Fatalf("Reserve for the repeat: %v", err)
+	}
+	booked, err = a.SettleOnce(20*Cent, 12*Cent, "transcribe", "job-9")
+	if err != nil {
+		t.Fatalf("repeat SettleOnce: %v", err)
+	}
+	if booked {
+		t.Errorf("repeat SettleOnce booked = true, want false")
+	}
+	if got := mustKeyedRemaining(t, k, "a"); got != 28*Cent {
+		t.Errorf("owner a headroom after the repeat = %d, want %d", got, 28*Cent)
+	}
+	if err := k.Reserve("b", 88*Cent); err != nil {
+		t.Errorf("reserve against the global pool after the repeat: %v", err)
+	}
+}
+
+// TestKeyedSetLimitCarriesThePairSet pins that a limit change keeps the
+// owner's settle-once history. SetLimit replaces the owner's budget value.
+// The replacement carries the booked spend, the outstanding holds and the
+// settled pairs, so a repeat of a settled pair still books nothing on the
+// new ceiling.
+func TestKeyedSetLimitCarriesThePairSet(t *testing.T) {
+	k := mustKeyed(t, 100*Cent)
+	mustOwnerLimit(t, k, "a", 50*Cent)
+	a, err := k.Owner("a")
+	if err != nil {
+		t.Fatalf("Owner(a): %v", err)
+	}
+	if err := a.Reserve(10 * Cent); err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+	booked, err := a.SettleOnce(10*Cent, 10*Cent, "transcribe", "job-1")
+	if err != nil || !booked {
+		t.Fatalf("first SettleOnce booked = %v, %v, want true", booked, err)
+	}
+
+	// The documented limit change keeps the booked spend and drops nothing
+	// the owner's account still owes.
+	if err := k.SetLimit("a", 100*Cent); err != nil {
+		t.Fatalf("SetLimit: %v", err)
+	}
+	if got := mustKeyedRemaining(t, k, "a"); got != 90*Cent {
+		t.Fatalf("remaining after the raise = %d, want %d, the booking survived", got, 90*Cent)
+	}
+	if err := a.Reserve(10 * Cent); err != nil {
+		t.Fatalf("Reserve for the repeat: %v", err)
+	}
+	booked, err = a.SettleOnce(10*Cent, 10*Cent, "transcribe", "job-1")
+	if err != nil {
+		t.Fatalf("repeat SettleOnce: %v", err)
+	}
+	if booked {
+		t.Errorf("repeat SettleOnce after the limit change booked = true, want false")
+	}
+	if got := mustKeyedRemaining(t, k, "a"); got != 90*Cent {
+		t.Errorf("remaining after the repeat = %d, want %d, one booking on the raised ceiling", got, 90*Cent)
+	}
+	if err := a.Reserve(10 * Cent); err != nil {
+		t.Errorf("Reserve after the repeat: %v", err)
+	}
+}
+
+// TestOwnerAccountSettleOnceRefusesAnEmptyReference pins the refusal on the
+// per-owner accounts, the same sentinel the plain budget and the durable
+// store refuse with. No ceiling books, and no pair is marked, so the
+// account behaves exactly as a plain budget does.
+func TestOwnerAccountSettleOnceRefusesAnEmptyReference(t *testing.T) {
+	k := mustKeyed(t, 100*Cent)
+	mustOwnerLimit(t, k, "a", 40*Cent)
+	a, err := k.Owner("a")
+	if err != nil {
+		t.Fatalf("Owner(a): %v", err)
+	}
+	if err := a.Reserve(20 * Cent); err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+	booked, err := a.SettleOnce(20*Cent, 12*Cent, "transcribe", "")
+	if !errors.Is(err, ErrEmptyReference) {
+		t.Fatalf("SettleOnce with an empty reference error = %v, want ErrEmptyReference", err)
+	}
+	if booked {
+		t.Fatalf("SettleOnce with an empty reference booked = true, want false")
+	}
+	// The refusal commits nothing and consumes no hold, so the hold stays
+	// the caller's to release, exactly as it does on an overflow refusal.
+	if got := mustKeyedRemaining(t, k, "a"); got != 20*Cent {
+		t.Errorf("owner headroom = %d, want %d, the refusal books nothing and frees nothing", got, 20*Cent)
+	}
+	a.Release(20 * Cent)
+	if got := mustKeyedRemaining(t, k, "a"); got != 40*Cent {
+		t.Errorf("owner headroom after the release = %d, want %d", got, 40*Cent)
+	}
+}

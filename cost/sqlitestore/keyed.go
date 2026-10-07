@@ -141,56 +141,128 @@ func (k *KeyedBudget) Settle(ctx context.Context, owner string, r Reservation, a
 	if owner == "" {
 		return emptyOwner("settle")
 	}
-	now := k.store.now()
 	tx, err := k.store.db.Writer().BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("sqlitestore: settle: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }() // a committed transaction rolls back to a no-op
+	if err := settleOwnerBooks(ctx, tx, k.store.now(), owner, actual, r.ID); err != nil {
+		return fmt.Errorf("sqlitestore: settle: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("sqlitestore: settle: %w", err)
+	}
+	return nil
+}
+
+// SettleOnce books the price owner's call actually cost at most once per
+// kind and reference pair, and frees its hold. It reports ErrInvalid when
+// owner is empty, an error matching both ErrInvalid and
+// cost.ErrEmptyReference when the reference is empty, and an error
+// matching cost.ErrUnknownOwner when no ceiling was set for owner. The
+// first settle of a pair behaves exactly as Settle does and reports booked
+// true. A pair
+// that has settled before frees this call's hold, books nothing, and
+// reports booked false, so a resume or a retry of the same work never
+// charges the books twice. The pair row and the booking share one
+// transaction with the budget updates, so concurrent settles of one pair
+// across processes report exactly one true. The pair table is keyed by kind
+// and reference alone, so the pair an owner settled also stops another
+// owner from booking it again. A cancelled context stops the settle, so
+// nothing is booked.
+func (k *KeyedBudget) SettleOnce(ctx context.Context, owner string, r Reservation, actual cost.Price, kind, ref string) (bool, error) {
+	if owner == "" {
+		return false, emptyOwner("settle once")
+	}
+	tx, err := k.store.db.Writer().BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("sqlitestore: settle once: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }() // a committed transaction rolls back to a no-op
+	inserted, err := insertSettleOnce(ctx, tx, k.store.now(), kind, ref)
+	if err != nil {
+		return false, fmt.Errorf("sqlitestore: settle once: %w", err)
+	}
+	if !inserted {
+		// The pair settled before, so this call books nothing and its hold
+		// goes back. The owner check stays ahead of the release, so a
+		// mistyped owner is named instead of silently freed.
+		var one int
+		err := tx.QueryRowContext(ctx,
+			`SELECT 1 FROM cost_owner_budget WHERE owner = ?`, owner).Scan(&one)
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, fmt.Errorf("sqlitestore: settle once: owner %q: %w", owner, cost.ErrUnknownOwner)
+		}
+		if err != nil {
+			return false, fmt.Errorf("sqlitestore: settle once: %w", err)
+		}
+		if r.ID != "" {
+			if _, err := tx.ExecContext(ctx,
+				`DELETE FROM cost_reservation WHERE id = ? AND owner = ?`, r.ID, owner); err != nil {
+				return false, fmt.Errorf("sqlitestore: settle once: %w", err)
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			return false, fmt.Errorf("sqlitestore: settle once: %w", err)
+		}
+		return false, nil
+	}
+	if err := settleOwnerBooks(ctx, tx, k.store.now(), owner, actual, r.ID); err != nil {
+		return false, fmt.Errorf("sqlitestore: settle once: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("sqlitestore: settle once: %w", err)
+	}
+	return true, nil
+}
+
+// settleOwnerBooks applies the booking the keyed settles share inside the
+// caller's transaction: both spent totals, the settle history row under the
+// owner's name, the grant draw and the hold release. It reads both spent
+// totals first, so an unknown owner or an overflow refuses before any write
+// lands. The caller owns the transaction and the commit.
+func settleOwnerBooks(ctx context.Context, tx *sql.Tx, now time.Time, owner string, actual cost.Price, holdID string) error {
 	var spent, ownerSpent int64
 	if err := tx.QueryRowContext(ctx,
 		`SELECT spent_nd FROM cost_budget WHERE id = 1`).Scan(&spent); err != nil {
-		return fmt.Errorf("sqlitestore: settle: %w", err)
+		return err
 	}
 	if err := tx.QueryRowContext(ctx,
 		`SELECT spent_nd FROM cost_owner_budget WHERE owner = ?`, owner).Scan(&ownerSpent); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("sqlitestore: settle: owner %q: %w", owner, cost.ErrUnknownOwner)
+			return fmt.Errorf("owner %q: %w", owner, cost.ErrUnknownOwner)
 		}
-		return fmt.Errorf("sqlitestore: settle: %w", err)
+		return err
 	}
 	nextSpent, err := addPrice(cost.Price(spent), actual)
 	if err != nil {
-		return fmt.Errorf("sqlitestore: settle: %w", err)
+		return err
 	}
 	nextOwnerSpent, err := addPrice(cost.Price(ownerSpent), actual)
 	if err != nil {
-		return fmt.Errorf("sqlitestore: settle: %w", err)
+		return err
 	}
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE cost_budget SET spent_nd = ? WHERE id = 1`, int64(nextSpent)); err != nil {
-		return fmt.Errorf("sqlitestore: settle: %w", err)
+		return err
 	}
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE cost_owner_budget SET spent_nd = ? WHERE owner = ?`, int64(nextOwnerSpent), owner); err != nil {
-		return fmt.Errorf("sqlitestore: settle: %w", err)
+		return err
 	}
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO cost_settle (owner, amount_nd, created_at) VALUES (?, ?, ?)`,
 		owner, int64(actual), now.UnixMilli()); err != nil {
-		return fmt.Errorf("sqlitestore: settle: %w", err)
+		return err
 	}
 	if err := drawGrants(ctx, tx, now, actual); err != nil {
-		return fmt.Errorf("sqlitestore: settle: %w", err)
+		return err
 	}
-	if r.ID != "" {
+	if holdID != "" {
 		if _, err := tx.ExecContext(ctx,
-			`DELETE FROM cost_reservation WHERE id = ? AND owner = ?`, r.ID, owner); err != nil {
-			return fmt.Errorf("sqlitestore: settle: %w", err)
+			`DELETE FROM cost_reservation WHERE id = ? AND owner = ?`, holdID, owner); err != nil {
+			return err
 		}
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("sqlitestore: settle: %w", err)
 	}
 	return nil
 }

@@ -646,3 +646,133 @@ func reverseCharges(charges []Charge) []Charge {
 	}
 	return out
 }
+
+// TestBudgetSettleOnceBooksAReferenceOnce pins the settle-once contract on
+// the in-memory budget. The first settle of a kind and reference pair books
+// exactly as Settle does. A repeat frees the reservation it was handed,
+// books nothing, and reports booked false. A pair that differs in the kind
+// or in the reference is a different pair and books again.
+func TestBudgetSettleOnceBooksAReferenceOnce(t *testing.T) {
+	b := mustBudget(t, 100*Cent)
+
+	booked, err := b.SettleOnce(30*Cent, 12*Cent, "transcribe", "job-9")
+	if err != nil {
+		t.Fatalf("SettleOnce: %v", err)
+	}
+	if !booked {
+		t.Fatalf("first SettleOnce booked = false, want true")
+	}
+	if got := b.Spent(); got != 12*Cent {
+		t.Errorf("Spent() = %d, want %d", got, 12*Cent)
+	}
+	if got := b.Reserved(); got != 0 {
+		t.Errorf("Reserved() = %d, want 0", got)
+	}
+	if got := mustRemaining(t, b); got != 88*Cent {
+		t.Errorf("Remaining() = %d, want %d", got, 88*Cent)
+	}
+
+	// The repeat books nothing, and the reservation it frees is spendable
+	// again rather than merely invisible.
+	if err := b.Reserve(30 * Cent); err != nil {
+		t.Fatalf("Reserve for the repeat: %v", err)
+	}
+	booked, err = b.SettleOnce(30*Cent, 12*Cent, "transcribe", "job-9")
+	if err != nil {
+		t.Fatalf("repeat SettleOnce: %v", err)
+	}
+	if booked {
+		t.Errorf("repeat SettleOnce booked = true, want false")
+	}
+	if got := b.Spent(); got != 12*Cent {
+		t.Errorf("Spent() after the repeat = %d, want %d", got, 12*Cent)
+	}
+	if got := b.Reserved(); got != 0 {
+		t.Errorf("Reserved() after the repeat = %d, want 0, the repeat frees its hold", got)
+	}
+	if got := mustRemaining(t, b); got != 88*Cent {
+		t.Errorf("Remaining() after the repeat = %d, want %d", got, 88*Cent)
+	}
+
+	// A new kind under the same reference, and a new reference under the
+	// same kind, are different pairs and each books once.
+	booked, err = b.SettleOnce(30*Cent, 12*Cent, "render", "job-9")
+	if err != nil || !booked {
+		t.Fatalf("SettleOnce for a new kind booked = %v, %v, want true", booked, err)
+	}
+	booked, err = b.SettleOnce(30*Cent, 12*Cent, "transcribe", "job-10")
+	if err != nil || !booked {
+		t.Fatalf("SettleOnce for a new reference booked = %v, %v, want true", booked, err)
+	}
+	if got := b.Spent(); got != 36*Cent {
+		t.Errorf("Spent() = %d, want %d", got, 36*Cent)
+	}
+}
+
+// TestBudgetSettleOnceAnswersOneBookedUnderConcurrency drives concurrent
+// settles of one pair through one budget and pins that exactly one books.
+// Every caller holds a reservation of its own, so the losers must come out
+// with nothing booked and nothing held, and the winners' spend must equal
+// one booking.
+func TestBudgetSettleOnceAnswersOneBookedUnderConcurrency(t *testing.T) {
+	const callers = 64
+	b := mustBudget(t, callers*Cent)
+	var (
+		mu     sync.Mutex
+		booked int
+	)
+	var wg sync.WaitGroup
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := b.Reserve(Cent); err != nil {
+				t.Errorf("Reserve: %v", err)
+				return
+			}
+			ok, err := b.SettleOnce(Cent, Cent, "transcribe", "job-9")
+			if err != nil {
+				t.Errorf("SettleOnce: %v", err)
+				return
+			}
+			if ok {
+				mu.Lock()
+				booked++
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	if booked != 1 {
+		t.Errorf("settles that booked = %d, want exactly 1", booked)
+	}
+	if got := b.Spent(); got != Cent {
+		t.Errorf("Spent() = %d, want %d", got, Cent)
+	}
+	if got := b.Reserved(); got != 0 {
+		t.Errorf("Reserved() = %d, want 0, every loser freed its hold", got)
+	}
+}
+
+// TestBudgetSettleOnceRefusesAnEmptyReference pins the one refusal every
+// SettleOnce implementation carries. An empty reference would collapse
+// every once settle of a kind onto one pair and drop every later charge.
+// The budget refuses before anything is marked, and a later settle of the
+// same kind under a real reference still books.
+func TestBudgetSettleOnceRefusesAnEmptyReference(t *testing.T) {
+	b := mustBudget(t, 100*Cent)
+	booked, err := b.SettleOnce(30*Cent, 12*Cent, "transcribe", "")
+	if !errors.Is(err, ErrEmptyReference) {
+		t.Fatalf("SettleOnce with an empty reference error = %v, want ErrEmptyReference", err)
+	}
+	if booked {
+		t.Fatalf("SettleOnce with an empty reference booked = true, want false")
+	}
+	if got := b.Spent(); got != 0 {
+		t.Errorf("Spent() = %d, want 0, the refusal commits nothing", got)
+	}
+	booked, err = b.SettleOnce(30*Cent, 12*Cent, "transcribe", "job-1")
+	if err != nil || !booked {
+		t.Fatalf("SettleOnce after the refusal booked = %v, %v, want true", booked, err)
+	}
+}

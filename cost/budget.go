@@ -16,19 +16,36 @@ var ErrNegativeLimit = errors.New("cost: negative budget limit")
 // ErrNegativeEstimate reports a reservation with an estimate below zero.
 var ErrNegativeEstimate = errors.New("cost: negative reservation estimate")
 
+// ErrEmptyReference reports a settle once without a reference. A once
+// settle dedupes on the kind and reference pair. An empty reference would
+// collapse every once settle of a kind onto one pair and drop every later
+// charge, so every account refuses it and books nothing.
+var ErrEmptyReference = errors.New("cost: empty settle-once reference")
+
 // Budget bounds the total spend of a sequence of paid calls in one
 // denomination. Reserve commits an estimate before a call and fails when the
 // estimate would pass the limit. Settle books the price the call actually
-// cost and frees its reservation. Release frees a reservation the caller
-// never spent. Build one with NewBudget for USD nanodollars or NewBudgetIn
-// for a named denomination such as a provider's credit. Every method is safe
-// for concurrent use.
+// cost and frees its reservation. SettleOnce books a price at most once per
+// kind and reference pair, for a call another settle may have already
+// booked. Release frees a reservation the caller never spent. Build one
+// with NewBudget for USD nanodollars or NewBudgetIn for a named
+// denomination such as a provider's credit. Every method is safe for
+// concurrent use.
 type Budget struct {
 	mu       sync.Mutex
 	denom    Denomination
 	limit    Price
 	spent    Price
 	reserved Price
+	once     map[settleRef]struct{}
+}
+
+// settleRef names one kind and reference pair a SettleOnce booked. The
+// budget keeps the pairs it has settled, so a repeat of a pair never books
+// twice.
+type settleRef struct {
+	kind string
+	ref  string
 }
 
 // NewBudget returns a Budget that never lets a reservation push spend past
@@ -149,6 +166,49 @@ func (b *Budget) Settle(reserved, actual Price) error {
 	b.releaseLocked(reserved)
 	b.spent = spent
 	return nil
+}
+
+// SettleOnce books the price a paid call actually cost at most once per
+// kind and reference pair, and releases the reservation the caller made
+// for it. The first call for a pair behaves exactly as Settle does and
+// reports booked true. A pair that has settled before books nothing and
+// reports booked false, because a resume or a retry of the same work must
+// not charge the books twice. The repeat still frees its reservation, so a
+// deduplicated call holds no budget. A settle without a reference reports
+// an error matching ErrEmptyReference and books nothing, because an empty
+// reference would collapse every once settle of a kind onto one pair. It
+// reports ErrOverflow and commits nothing, not even the pair, when actual
+// would push spent outside the int64 range.
+func (b *Budget) SettleOnce(reserved, actual Price, kind, ref string) (booked bool, err error) {
+	if ref == "" {
+		return false, fmt.Errorf("cost: settle once: %w", ErrEmptyReference)
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.settledLocked(kind, ref) {
+		b.releaseLocked(reserved)
+		return false, nil
+	}
+	spent, err := add(b.spent, actual)
+	if err != nil {
+		return false, err
+	}
+	if b.once == nil {
+		b.once = make(map[settleRef]struct{})
+	}
+	b.once[settleRef{kind: kind, ref: ref}] = struct{}{}
+	b.releaseLocked(reserved)
+	b.spent = spent
+	return true, nil
+}
+
+// settledLocked reports whether the kind and reference pair already
+// settled. The caller holds the lock that guards the set, which is b.mu
+// for a standalone budget and the keyed budget's own mutex for an owner
+// account, because every path to an owner account holds that mutex first.
+func (b *Budget) settledLocked(kind, ref string) bool {
+	_, dup := b.once[settleRef{kind: kind, ref: ref}]
+	return dup
 }
 
 // Release returns a reservation the caller never spent. A value larger than

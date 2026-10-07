@@ -22,6 +22,13 @@
 // failure wraps context.Canceled or context.DeadlineExceeded unless the
 // database refused the statement for a reason of its own first.
 //
+// A settle can be booked at most once per kind and reference pair.
+// SettleOnce claims the pair in its own table, which is unique on the pair,
+// inside the one transaction that also writes the budget. Concurrent
+// settles of one pair across processes therefore report exactly one
+// booking. A repeat frees its hold and books nothing, so a resume or a
+// retry of the same work never charges the books twice.
+//
 // The store enforces the ceiling when it reserves, so concurrent callers never
 // hold more than the headroom. It does not enforce it when it settles,
 // because a booking records what a call actually cost. A booking that
@@ -571,41 +578,122 @@ func (s *Store) Reserve(ctx context.Context, estimate cost.Price) (Reservation, 
 // booked spend past the int64 range. A cancelled context stops the settle,
 // so nothing is booked.
 func (s *Store) Settle(ctx context.Context, r Reservation, actual cost.Price) error {
-	now := s.now()
 	tx, err := s.db.Writer().BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("sqlitestore: settle: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }() // a committed transaction rolls back to a no-op
-	var spent int64
-	if err := tx.QueryRowContext(ctx,
-		`SELECT spent_nd FROM cost_budget WHERE id = 1`).Scan(&spent); err != nil {
+	if err := settleBooks(ctx, tx, s.now(), "", actual, r.ID); err != nil {
 		return fmt.Errorf("sqlitestore: settle: %w", err)
-	}
-	next, err := addPrice(cost.Price(spent), actual)
-	if err != nil {
-		return fmt.Errorf("sqlitestore: settle: %w", err)
-	}
-	if _, err := tx.ExecContext(ctx,
-		`UPDATE cost_budget SET spent_nd = ? WHERE id = 1`, int64(next)); err != nil {
-		return fmt.Errorf("sqlitestore: settle: %w", err)
-	}
-	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO cost_settle (owner, amount_nd, created_at) VALUES (?, ?, ?)`,
-		"", int64(actual), now.UnixMilli()); err != nil {
-		return fmt.Errorf("sqlitestore: settle: %w", err)
-	}
-	if err := drawGrants(ctx, tx, now, actual); err != nil {
-		return fmt.Errorf("sqlitestore: settle: %w", err)
-	}
-	if r.ID != "" {
-		if _, err := tx.ExecContext(ctx,
-			`DELETE FROM cost_reservation WHERE id = ?`, r.ID); err != nil {
-			return fmt.Errorf("sqlitestore: settle: %w", err)
-		}
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("sqlitestore: settle: %w", err)
+	}
+	return nil
+}
+
+// SettleOnce books the price a paid call actually cost at most once per kind
+// and reference pair, and releases the hold. The first settle of a pair
+// behaves exactly as Settle does and reports booked true. A pair that has
+// settled before frees this call's hold, books nothing, and reports booked
+// false, so a resume or a retry of the same work never charges the books
+// twice. The pair row and the booking share one transaction with the budget
+// update, so concurrent settles of one pair across processes report exactly
+// one true. A settle without a reference reports an error matching both
+// ErrInvalid and cost.ErrEmptyReference and books nothing. It reports an
+// error matching cost.ErrOverflow and commits nothing, not even the pair,
+// when actual would push the booked spend past the int64 range. A cancelled
+// context stops the settle, so nothing is booked.
+func (s *Store) SettleOnce(ctx context.Context, r Reservation, actual cost.Price, kind, ref string) (bool, error) {
+	tx, err := s.db.Writer().BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("sqlitestore: settle once: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }() // a committed transaction rolls back to a no-op
+	// The pair row decides the booking, so it lands first. A conflict
+	// leaves the transaction untouched, and the hold below still goes
+	// back, because a deduplicated call must not keep budget.
+	inserted, err := insertSettleOnce(ctx, tx, s.now(), kind, ref)
+	if err != nil {
+		return false, fmt.Errorf("sqlitestore: settle once: %w", err)
+	}
+	if !inserted {
+		if r.ID != "" {
+			if _, err := tx.ExecContext(ctx,
+				`DELETE FROM cost_reservation WHERE id = ?`, r.ID); err != nil {
+				return false, fmt.Errorf("sqlitestore: settle once: %w", err)
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			return false, fmt.Errorf("sqlitestore: settle once: %w", err)
+		}
+		return false, nil
+	}
+	if err := settleBooks(ctx, tx, s.now(), "", actual, r.ID); err != nil {
+		return false, fmt.Errorf("sqlitestore: settle once: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("sqlitestore: settle once: %w", err)
+	}
+	return true, nil
+}
+
+// insertSettleOnce claims the kind and reference pair inside the caller's
+// transaction. It reports whether this call inserted the pair, which makes
+// it the one settle that may book. An empty ref is refused with an error
+// matching both ErrInvalid and cost.ErrEmptyReference, the same sentinel
+// the in-memory accounts refuse with. The pair key must name its work to
+// stay unique.
+func insertSettleOnce(ctx context.Context, tx *sql.Tx, now time.Time, kind, ref string) (bool, error) {
+	if ref == "" {
+		return false, fmt.Errorf("%w: the reference must not be empty: %w", ErrInvalid, cost.ErrEmptyReference)
+	}
+	result, err := tx.ExecContext(ctx,
+		`INSERT INTO cost_settle_once (kind, ref, created_at) VALUES (?, ?, ?)
+			ON CONFLICT (kind, ref) DO NOTHING`,
+		kind, ref, now.UnixMilli())
+	if err != nil {
+		return false, err
+	}
+	inserted, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return inserted == 1, nil
+}
+
+// settleBooks applies the booking every settle shares inside the caller's
+// transaction: the new spent total, the settle history row under owner, the
+// grant draw and the hold release. It reads the spent total first, so an
+// overflow refuses before any write lands. The caller owns the transaction
+// and the commit.
+func settleBooks(ctx context.Context, tx *sql.Tx, now time.Time, owner string, actual cost.Price, holdID string) error {
+	var spent int64
+	if err := tx.QueryRowContext(ctx,
+		`SELECT spent_nd FROM cost_budget WHERE id = 1`).Scan(&spent); err != nil {
+		return err
+	}
+	next, err := addPrice(cost.Price(spent), actual)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE cost_budget SET spent_nd = ? WHERE id = 1`, int64(next)); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO cost_settle (owner, amount_nd, created_at) VALUES (?, ?, ?)`,
+		owner, int64(actual), now.UnixMilli()); err != nil {
+		return err
+	}
+	if err := drawGrants(ctx, tx, now, actual); err != nil {
+		return err
+	}
+	if holdID != "" {
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM cost_reservation WHERE id = ?`, holdID); err != nil {
+			return err
+		}
 	}
 	return nil
 }

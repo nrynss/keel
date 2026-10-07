@@ -235,7 +235,12 @@ settle lands in a `cost.ChargeSink`. The in-memory `cost.Ledger` is one sink, an
 `cost/sqlitestore` store is another. An application with its own spend store writes the
 one-method sink itself. A charge the sink cannot record is the one failure past the settle.
 `Meter.Call` reports it as `cost.ErrUnrecordedCharge`, with a zero `Usage`, so a figure no
-store backs is never shown as booked. `KeyedBudget.ForgetOwner`
+store backs is never shown as booked. A call that must settle once per reference passes
+`cost.Once` to `Meter.Call`. The account then books at most once per kind and reference pair,
+and the sink sees only the charge that booked. A resume or a retry of the same work leaves the
+books exactly as the first run wrote them. A reference that legitimately carries several charges
+calls `Call` without it.
+`KeyedBudget.ForgetOwner`
 removes an owner's budget, reservations and settle history after its live reservations finish.
 
 `cost/sqlitestore` also quotes a paid action, then runs it once on confirm. `Store.Quote`
@@ -346,10 +351,11 @@ With a `Meter` configured, the Run that creates the task reserves the `Estimate`
 success, and frees it on failure. `Spec.Price` settles a measured price instead of the estimate, and
 `ChargesOnFailure` books the estimate for a provider that charges for failures. A refused
 reservation releases the still empty claim, so the key stays usable. Every settle lands in the
-charge sink under the key as its reference. Concurrent Runs of one key share one flight through a
-shared `Coordinator`, so one task settles once and the joiners collect the recorded outcome. The
-settle and the terminal record are two writes, and a crash between them books the charge again on
-the resume, so the books over-count spend rather than under-count it.
+charge sink under the key as its reference, and settles through the meter's once option, so a key
+books at most once. Concurrent Runs of one key share one flight through a shared `Coordinator`, so
+one task settles once and the joiners collect the recorded outcome. The settle and the terminal
+record are two writes. A crash between them books nothing on the resume, and the charge the first
+settle booked stands.
 
 `Run` publishes progress into the `job` it sits inside, so the browser sees the created stage and
 the provider's report over `stream`. Provider webhooks are out of scope, and a later Spec field
