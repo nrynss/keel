@@ -42,7 +42,7 @@ else is pure Go, and `CGO_ENABLED=0` builds the whole module.
 | `duration` | WAV and MP3 length read from the bytes themselves, for a runtime that ships ffmpeg without ffprobe |
 | `cost` | Prices in the minor units of one denomination, USD nanodollars by default or a provider's credit, a ledger of charges that name their unit, budgets that refuse before a call, keyed budgets that divide one pool by owner, grants that lapse, and a meter that records each settle in an app-chosen charge sink |
 | `cache` | Content-addressed reuse of paid generations, keyed on a canonical hash of the request, with one make per key across concurrent callers, age expiry, and optional caching of permanent refusals |
-| `throttle` | Retry of a paid call that failed for a reason a wait can clear, with full-jitter backoff and an optional cap on how many calls run at once |
+| `throttle` | Retry of a paid call that failed for a reason a wait can clear, with full-jitter backoff, provider retry-after hints, separate attempt budgets, pacing of call starts under a per-minute cap shared by name, and an optional cap on how many calls run at once |
 | `flag` | Runtime flags an operator flips without a restart, read through to the store with a declared default for a missing row |
 | `caption` | Word timings to SRT and WebVTT subtitle files as a pure function, with cues grouped by line length and duration |
 | `film` | A title card, captioned stills, and an end card joined by a stream copy, with the length computed in Go |
@@ -278,12 +278,42 @@ err := throttle.Retry(ctx, throttle.Config{}, func(err error) bool {
 `throttle` retries only the errors the caller classifies as worth a wait. The
 wait is full jitter across the upper half of each backoff, starting at 20
 seconds and doubling up to 90, so a fan-out refused together does not retry in
-lockstep. The call's own error comes back untouched. A cancelled context ends
-the wait and still returns that error. `throttle.New` caps how many calls run
-at once. The cap is held only while a call runs, and the backoff waits outside
-it. `cost.Meter` still reserves and settles. This package only paces the call.
+lockstep. Set `RetryAfter` to a func that reads the wait a provider named in a
+refusal, and the wait follows the hint plus a small spread instead. A hint
+above `Max` is clamped to it before the spread is added. A hint that is not
+positive is ignored, so a garbled value can never shorten a wait. The
+package never reads a provider's body.
 `throttle.Note` is how a caller marks an error that used up the attempts,
 with the same config the call used. One spent attempt reads "1 attempt".
+
+Rate-limit refusals and transient faults draw on separate attempt budgets.
+Set `Transient` to a func that claims the transient class, and those errors
+retry `TransientAttempts` times, 2 by default, because every further try is
+another paid submission. Errors the classifier claims get `Attempts`, 3 by
+default. Set `WaitBudget` to bound the total waiting of one call, whatever
+the attempt counts allow. `DefaultWaitBudget` is a value the default
+schedule's worst case fits.
+
+A cancelled context ends the wait and the error wraps the context error
+together with the call's last error, so `errors.Is` matches either. A job
+runner reads the cancellation from the context error and still sees what the
+provider said. Permanent errors and exhausted attempts return the provider's
+error untouched.
+
+Pacing is the layer before retrying. Set `PerMinute` to a provider's
+requests-per-minute cap, and call starts are spaced one interval apart, with
+a margin so a late wake-up cannot land two submissions in one window. A
+waiter cancelled before its slot arrives gives the slot back, so a
+dead call does not delay the next one. A slot that has arrived stays spent.
+A per-minute cap is usually account-wide, so calls that name the same window
+in `Name` at the same rate share one pacer for the life of the process. An
+unnamed rate, or an injected `Now` or `Sleep`, paces on its own, so a test's
+clock never leaks into production's. The clock and sleep are injectable
+through the config, which is what makes the pacing tests virtual.
+
+`throttle.New` caps how many calls run
+at once. The cap is held only while a call runs, and the backoff waits outside
+it. `cost.Meter` still reserves and settles. This package only paces the call.
 
 ### Run a provider task that survives a restart
 
