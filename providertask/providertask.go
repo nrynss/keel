@@ -41,9 +41,10 @@
 // Config.Estimate before it creates, settles when the task succeeds, and
 // frees the reservation when it fails. A provider that charges for
 // failures settles the estimate on failure instead. The settle and the
-// terminal record are two writes. A crash between them books the charge
-// again on the next resume, so the books over-count spend rather than
-// under-count it. The provider billed once either way.
+// terminal record are two writes. Run settles each key at most once
+// through the meter's once option, so a resume after a crash between them
+// books nothing, and the charge the first settle booked stands. The
+// provider billed once either way.
 //
 // The result link expires, so Run hands the result to Spec.Keep the
 // moment it has it, before Run returns. Keep may run once per Run that
@@ -284,11 +285,14 @@ func (c *Coordinator) leave(key string) {
 }
 
 // Meter is the paid call seam a Run settles through. It matches the shape
-// the cost package publishes, so a cost.Meter drives it directly.
+// the cost package publishes, so a cost.Meter drives it directly. Run
+// always passes the once option, so a meter backed by a cost.Meter settles
+// a key at most once per kind and reference.
 type Meter interface {
 	// Call runs work as one paid call. It reserves the estimate before the
-	// work runs and settles what the work reports.
-	Call(ctx context.Context, estimate cost.Price, kind, ref string, work cost.Work) (cost.Usage, error)
+	// work runs and settles what the work reports. The options carry the
+	// cost package's call options, and Run passes them through.
+	Call(ctx context.Context, estimate cost.Price, kind, ref string, work cost.Work, opts ...cost.CallOption) (cost.Usage, error)
 }
 
 // meterMatches pins Meter to the seam the cost package publishes, so a
@@ -599,11 +603,13 @@ func (t *task[T]) resume(claim Claim) (Outcome[T], error) {
 
 // metered drives work through the meter when one is configured. The meter
 // reserves the estimate before the work runs and settles what it reports.
-// A provider verdict of failed settles at the estimate instead of freeing
-// the reservation when ChargesOnFailure holds, and the verdict surfaces
-// once the meter is done. A fault before the work ran is a refused
-// reservation, and the still empty claim is released, so the key stays
-// usable. The settled usage is what the outcome carries.
+// The settle carries the once option under the key as the reference, so a
+// resume of a settled key books nothing. A provider verdict of failed
+// settles at the estimate instead of freeing the reservation when
+// ChargesOnFailure holds, and the verdict surfaces once the meter is done.
+// A fault before the work ran is a refused reservation, and the still empty
+// claim is released, so the key stays usable. The settled usage is what the
+// outcome carries.
 func (t *task[T]) metered(work func() (string, T, cost.Usage, error)) (string, T, cost.Usage, error) {
 	if isNilValue(t.cfg.Meter) {
 		return work()
@@ -625,7 +631,7 @@ func (t *task[T]) metered(work func() (string, T, cost.Usage, error)) (string, T
 			return cost.Usage{Measured: false}, nil
 		}
 		return cost.Usage{}, werr
-	})
+	}, cost.Once())
 	if err != nil {
 		if !entered {
 			// The reservation was refused, so nothing was created and the

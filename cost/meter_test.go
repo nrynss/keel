@@ -590,3 +590,121 @@ func TestOwnerAccountsConcurrentCallsSettleExactly(t *testing.T) {
 		t.Errorf("Charges() = %d rows, want %d", len(charges), 2*perOwner)
 	}
 }
+
+// TestMeterOnceBooksARepeatedReferenceOnce pins the once option end to end.
+// Two calls run the same kind and reference, the way a resume runs the work
+// a crashed run already settled. The first call books and records as any
+// call does. The second call runs the work, frees its reservation, books
+// nothing, reaches no sink, and returns the zero usage with no error.
+func TestMeterOnceBooksARepeatedReferenceOnce(t *testing.T) {
+	meter, budget, ledger := mustMeter(t, 100*Cent)
+	work := func(context.Context) (Usage, error) {
+		return Usage{Price: 12 * Cent, Measured: true}, nil
+	}
+	first, err := meter.Call(context.Background(), 30*Cent, "transcribe", "job-9", work, Once())
+	if err != nil {
+		t.Fatalf("first Call: %v", err)
+	}
+	if want := (Usage{Price: 12 * Cent, Measured: true}); first != want {
+		t.Fatalf("first Call usage = %+v, want %+v", first, want)
+	}
+	second, err := meter.Call(context.Background(), 30*Cent, "transcribe", "job-9", work, Once())
+	if err != nil {
+		t.Fatalf("repeat Call: %v", err)
+	}
+	if second != (Usage{}) {
+		t.Errorf("repeat Call usage = %+v, want the zero usage, the repeat booked nothing", second)
+	}
+	if got := budget.Spent(); got != 12*Cent {
+		t.Errorf("Spent() = %d, want %d, the single first booking", got, 12*Cent)
+	}
+	if got := budget.Reserved(); got != 0 {
+		t.Errorf("Reserved() = %d, want 0, the repeat frees its hold", got)
+	}
+	if got, err := budget.Remaining(); err != nil || got != 88*Cent {
+		t.Errorf("Remaining() = %d, %v, want %d", got, err, 88*Cent)
+	}
+	if charges := ledger.Charges(); len(charges) != 1 {
+		t.Fatalf("Charges() = %d rows, want 1, the sink never sees the repeat", len(charges))
+	}
+	// The freed reservation is spendable again, so a deduplicated call
+	// leaves the ceiling exactly where the first booking left it.
+	if err := budget.Reserve(88 * Cent); err != nil {
+		t.Errorf("Reserve after the repeat: %v", err)
+	}
+}
+
+// TestMeterWithoutOnceBooksEveryRepeatedReference pins the default Call as
+// the counterpart of the once option. A reference that legitimately carries
+// several charges books every settle, whatever its reference already
+// booked.
+func TestMeterWithoutOnceBooksEveryRepeatedReference(t *testing.T) {
+	meter, budget, ledger := mustMeter(t, 100*Cent)
+	work := func(context.Context) (Usage, error) {
+		return Usage{Price: 12 * Cent, Measured: true}, nil
+	}
+	for i := 0; i < 3; i++ {
+		usage, err := meter.Call(context.Background(), 30*Cent, "transcribe", "job-9", work)
+		if err != nil {
+			t.Fatalf("Call %d: %v", i, err)
+		}
+		if want := (Usage{Price: 12 * Cent, Measured: true}); usage != want {
+			t.Fatalf("Call %d usage = %+v, want %+v", i, usage, want)
+		}
+	}
+	if got := budget.Spent(); got != 36*Cent {
+		t.Errorf("Spent() = %d, want %d, every charge books", got, 36*Cent)
+	}
+	if charges := ledger.Charges(); len(charges) != 3 {
+		t.Fatalf("Charges() = %d rows, want 3", len(charges))
+	}
+}
+
+// TestMeterOnceAnswersOneBookedUnderConcurrency drives concurrent calls of
+// one kind and reference through one meter and pins that exactly one books
+// and records. Every caller runs the work, so the losers return the zero
+// usage without an error, and the ledger ends with one row.
+func TestMeterOnceAnswersOneBookedUnderConcurrency(t *testing.T) {
+	const calls = 64
+	meter, budget, ledger := mustMeter(t, 100*Cent)
+	var (
+		mu      sync.Mutex
+		booked  int
+		zeroUse int
+	)
+	var wg sync.WaitGroup
+	for i := 0; i < calls; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			usage, err := meter.Call(context.Background(), Cent, "transcribe", "job-9",
+				func(context.Context) (Usage, error) {
+					return Usage{Price: Cent, Measured: true}, nil
+				}, Once())
+			if err != nil {
+				t.Errorf("Call: %v", err)
+				return
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if usage == (Usage{}) {
+				zeroUse++
+				return
+			}
+			booked++
+		}()
+	}
+	wg.Wait()
+	if booked != 1 {
+		t.Errorf("calls that booked = %d, want exactly 1", booked)
+	}
+	if zeroUse != calls-1 {
+		t.Errorf("calls that booked nothing = %d, want %d", zeroUse, calls-1)
+	}
+	if got := budget.Spent(); got != Cent {
+		t.Errorf("Spent() = %d, want %d", got, Cent)
+	}
+	if charges := ledger.Charges(); len(charges) != 1 {
+		t.Errorf("Charges() = %d rows, want 1", len(charges))
+	}
+}

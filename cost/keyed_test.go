@@ -263,3 +263,50 @@ func TestKeyedBudgetConcurrentReservationsNeverOverspend(t *testing.T) {
 		}
 	}
 }
+
+// TestOwnerAccountSettleOnceBooksAReferenceOnce pins the settle-once
+// contract on the per-owner accounts behind a keyed budget. The first
+// settle of a pair books on the owner ceiling and on the global one. A
+// repeat frees the holds the reserve took on both ceilings and books
+// nothing, so the owner and the pool keep the headroom the first booking
+// left.
+func TestOwnerAccountSettleOnceBooksAReferenceOnce(t *testing.T) {
+	k := mustKeyed(t, 100*Cent)
+	mustOwnerLimit(t, k, "a", 40*Cent)
+	mustOwnerLimit(t, k, "b", 100*Cent)
+	a, err := k.Owner("a")
+	if err != nil {
+		t.Fatalf("Owner(a): %v", err)
+	}
+
+	booked, err := a.SettleOnce(30*Cent, 12*Cent, "transcribe", "job-9")
+	if err != nil {
+		t.Fatalf("SettleOnce: %v", err)
+	}
+	if !booked {
+		t.Fatalf("first SettleOnce booked = false, want true")
+	}
+	if got := mustKeyedRemaining(t, k, "a"); got != 28*Cent {
+		t.Errorf("owner a headroom = %d, want %d", got, 28*Cent)
+	}
+
+	// The repeat frees the owner hold and the global hold the reserve took,
+	// and books nothing on either ceiling. The global check is the reserve
+	// owner b can still make against the pool the first booking left.
+	if err := a.Reserve(20 * Cent); err != nil {
+		t.Fatalf("Reserve for the repeat: %v", err)
+	}
+	booked, err = a.SettleOnce(20*Cent, 12*Cent, "transcribe", "job-9")
+	if err != nil {
+		t.Fatalf("repeat SettleOnce: %v", err)
+	}
+	if booked {
+		t.Errorf("repeat SettleOnce booked = true, want false")
+	}
+	if got := mustKeyedRemaining(t, k, "a"); got != 28*Cent {
+		t.Errorf("owner a headroom after the repeat = %d, want %d", got, 28*Cent)
+	}
+	if err := k.Reserve("b", 88*Cent); err != nil {
+		t.Errorf("reserve against the global pool after the repeat: %v", err)
+	}
+}

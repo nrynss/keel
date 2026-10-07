@@ -128,6 +128,42 @@ func (k *KeyedBudget) Settle(owner string, reserved, actual Price) error {
 	return o.Settle(reserved, actual)
 }
 
+// settleOnce books the price owner's call actually cost at most once per
+// kind and reference pair, and frees its reservation. It backs the owner
+// accounts' SettleOnce, so a meter driving one owner stops a repeated
+// reference from booking twice. A pair that settled before frees both
+// holds the reserve took, the owner's and the global one, and books
+// nothing. The pair check and the bookings share the keyed mutex, so
+// concurrent settles of one pair answer exactly one booked true. It
+// reports ErrUnknownOwner when no ceiling was set for owner, and behaves
+// as KeyedBudget.Settle otherwise.
+func (k *KeyedBudget) settleOnce(owner string, reserved, actual Price, kind, ref string) (bool, error) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	o, ok := k.owners[owner]
+	if !ok {
+		return false, fmt.Errorf("cost: settle once for owner %q: %w", owner, ErrUnknownOwner)
+	}
+	// Every path to an owner account holds k.mu first, so the pair check
+	// below and the booking that follows it are one atomic step against
+	// every other reserve, settle and release of this budget.
+	if o.settledLocked(kind, ref) {
+		o.Release(reserved)
+		k.global.Release(reserved)
+		return false, nil
+	}
+	// The global pool books first, as Settle books it, because an owner's
+	// booked spend never exceeds the global one, so once the global settle
+	// has committed the owner settle cannot overflow.
+	if err := k.global.Settle(reserved, actual); err != nil {
+		return false, err
+	}
+	if _, err := o.SettleOnce(reserved, actual, kind, ref); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // Release returns a reservation owner never spent. It reports ErrUnknownOwner
 // when no ceiling was set for owner. A value larger than the outstanding
 // total frees only what remains, as Budget.Release does.
@@ -193,6 +229,14 @@ func (a ownerAccount) Reserve(estimate Price) error {
 
 func (a ownerAccount) Settle(reserved, actual Price) error {
 	return a.keyed.Settle(a.owner, reserved, actual)
+}
+
+// SettleOnce books the price the call actually cost at most once per kind
+// and reference pair, and frees the reservation. A pair that settled
+// before books nothing, frees this call's hold from both ceilings, and
+// reports booked false, exactly as the keyed budget's own accounts settle.
+func (a ownerAccount) SettleOnce(reserved, actual Price, kind, ref string) (bool, error) {
+	return a.keyed.settleOnce(a.owner, reserved, actual, kind, ref)
 }
 
 func (a ownerAccount) Release(reserved Price) {

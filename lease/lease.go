@@ -141,8 +141,10 @@ func (q *Quota) count() int {
 // closes through the real seam.
 type Meter interface {
 	// Call runs work as one paid call. It reserves the estimate before
-	// the work runs and settles what the work reports.
-	Call(ctx context.Context, estimate cost.Price, kind, ref string, work cost.Work) (cost.Usage, error)
+	// the work runs and settles what the work reports. The options carry
+	// the cost package's call options, and the lease passes none, because
+	// an open and its close settle different references of their own.
+	Call(ctx context.Context, estimate cost.Price, kind, ref string, work cost.Work, opts ...cost.CallOption) (cost.Usage, error)
 }
 
 // costMeterMatches pins Meter to the seam the cost package publishes,

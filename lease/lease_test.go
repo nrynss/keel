@@ -66,11 +66,11 @@ func newFakeMeter(t *testing.T, limit cost.Price) *fakeMeter {
 }
 
 // Call runs one paid call through the real seam and counts it.
-func (f *fakeMeter) Call(ctx context.Context, estimate cost.Price, kind, ref string, work cost.Work) (cost.Usage, error) {
+func (f *fakeMeter) Call(ctx context.Context, estimate cost.Price, kind, ref string, work cost.Work, opts ...cost.CallOption) (cost.Usage, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++
-	return f.meter.Call(ctx, estimate, kind, ref, work)
+	return f.meter.Call(ctx, estimate, kind, ref, work, opts...)
 }
 
 // meterSpent reads the budget spend under the fake lock.
@@ -793,16 +793,16 @@ type latchMeter struct {
 }
 
 // Call runs the paid call, parking armed closes inside the seam.
-func (l *latchMeter) Call(ctx context.Context, estimate cost.Price, kind, ref string, work cost.Work) (cost.Usage, error) {
+func (l *latchMeter) Call(ctx context.Context, estimate cost.Price, kind, ref string, work cost.Work, opts ...cost.CallOption) (cost.Usage, error) {
 	l.mu.Lock()
 	armed := l.armed
 	l.mu.Unlock()
 	if !armed {
-		return l.inner.Call(ctx, estimate, kind, ref, work)
+		return l.inner.Call(ctx, estimate, kind, ref, work, opts...)
 	}
 	l.entered <- struct{}{}
 	<-l.release
-	return l.inner.Call(ctx, estimate, kind, ref, work)
+	return l.inner.Call(ctx, estimate, kind, ref, work, opts...)
 }
 
 // blockExpire parks the sweep inside its expire write until the test opens
@@ -1071,7 +1071,7 @@ type failingMeter struct {
 
 // Call parks one close inside the seam, then refuses the settle without
 // booking anything, so the sweep expiry stands alone.
-func (f *failingMeter) Call(_ context.Context, _ cost.Price, _, _ string, _ cost.Work) (cost.Usage, error) {
+func (f *failingMeter) Call(_ context.Context, _ cost.Price, _, _ string, _ cost.Work, _ ...cost.CallOption) (cost.Usage, error) {
 	f.entered <- struct{}{}
 	<-f.release
 	return cost.Usage{}, errors.New("lease: probe refused settle")

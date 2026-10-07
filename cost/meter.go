@@ -23,8 +23,8 @@ var ErrUnrecordedCharge = errors.New("cost: unrecorded charge")
 
 // Account is the budget side a meter drives. A Budget is an account on its
 // own, and a KeyedBudget hands out one account per owner through Owner. The
-// three spending methods mean exactly what they mean on Budget, so both
-// kinds of budget drive a meter identically.
+// spending methods mean exactly what they mean on Budget, so both kinds of
+// budget drive a meter identically.
 type Account interface {
 	// Denomination reports the unit the account's prices count. The meter
 	// stamps every charge it records with it, so a report never shows a
@@ -36,6 +36,11 @@ type Account interface {
 	// Settle books the price the call actually cost and frees its
 	// reservation.
 	Settle(reserved, actual Price) error
+	// SettleOnce books the price the call actually cost at most once per
+	// kind and reference pair, and frees its reservation. A pair that
+	// settled before books nothing, frees the reservation, and reports
+	// booked false.
+	SettleOnce(reserved, actual Price, kind, ref string) (booked bool, err error)
 	// Release frees a reservation the call never spent.
 	Release(reserved Price)
 }
@@ -74,6 +79,27 @@ type Usage struct {
 // work that fails returns the zero usage beside its error.
 type Work func(context.Context) (Usage, error)
 
+// callSettings carries the options one Call received.
+type callSettings struct {
+	// once settles the call at most once per kind and reference.
+	once bool
+}
+
+// CallOption tunes one Call. The empty option list keeps Call's default
+// behaviour, which settles every call.
+type CallOption func(*callSettings)
+
+// Once settles the call at most once per kind and reference pair. The
+// account settles through SettleOnce, and the charge reaches the sink only
+// when the account booked this settle. A call whose pair a previous settle
+// already booked returns the zero usage and records nothing, so a resume
+// or a retry of the same work never books it twice. Pass it for a
+// reference that names one charge, such as an idempotency key. A reference
+// that legitimately carries several charges calls Call without Once.
+func Once() CallOption {
+	return func(s *callSettings) { s.once = true }
+}
+
 // Meter runs paid calls against one account and records what each call
 // settles at in its sink. It reserves the estimate before the call runs and
 // settles the measured price after it. It frees the reservation on every
@@ -81,7 +107,9 @@ type Work func(context.Context) (Usage, error)
 // panicking call never holds budget. Every charge it records carries the
 // account's denomination, so a credit pool never lands in a report as
 // dollars. A charge the sink cannot record is the one failure past the
-// settle, and Call reports it as ErrUnrecordedCharge. Build one with
+// settle, and Call reports it as ErrUnrecordedCharge. A Call that passes
+// Once settles at most once per kind and reference pair, which is how a
+// resume of settled work books nothing again. Build one with
 // NewMeter. Call is safe for concurrent use, because every method it drives
 // is.
 type Meter struct {
@@ -126,6 +154,15 @@ func NewMeter(account Account, sink ChargeSink) (*Meter, error) {
 // measured price below zero reports ErrNegativePrice before any booking,
 // because a refund is a separate charge and never a negative booking.
 //
+// With Once among the options, the account settles at most once per kind
+// and reference pair. The first settle behaves exactly as the default one
+// does. A pair that has settled before frees this call's reservation,
+// books nothing, reaches no sink, and returns the zero usage, because this
+// call booked nothing. A resume or a retry that runs the same work under
+// the same reference therefore leaves the books exactly as the first run
+// wrote them. Without Once, Call is unchanged, so a reference that
+// legitimately carries several charges keeps booking every one.
+//
 // Every failure on the way to the settle frees the reservation, so a call
 // that books nothing leaves nothing held. A context that finishes mid-call
 // surfaces as the error the work returns and frees the reservation the
@@ -138,9 +175,15 @@ func NewMeter(account Account, sink ChargeSink) (*Meter, error) {
 // is booked, so the reservation stays consumed. Call reports
 // ErrUnrecordedCharge with the sink's error and the zero usage, because a
 // figure no record backs is not a result.
-func (m *Meter) Call(ctx context.Context, estimate Price, kind, ref string, work Work) (Usage, error) {
+func (m *Meter) Call(ctx context.Context, estimate Price, kind, ref string, work Work, opts ...CallOption) (Usage, error) {
 	if err := ctx.Err(); err != nil {
 		return Usage{}, err
+	}
+	var settings callSettings
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&settings)
+		}
 	}
 	if err := m.account.Reserve(estimate); err != nil {
 		return Usage{}, err
@@ -167,10 +210,26 @@ func (m *Meter) Call(ctx context.Context, estimate Price, kind, ref string, work
 	if usage.Measured && price < 0 {
 		return Usage{}, fmt.Errorf("cost: measured price %d: %w", price, ErrNegativePrice)
 	}
-	if err := m.account.Settle(estimate, price); err != nil {
+	// settled says the account booked this call's spend. A once settle of a
+	// repeated pair answers false and has already freed the reservation, so
+	// the flag below still lifts the deferred release off a consumed hold.
+	var settled bool
+	if settings.once {
+		settled, err = m.account.SettleOnce(estimate, price, kind, ref)
+	} else {
+		err = m.account.Settle(estimate, price)
+		settled = err == nil
+	}
+	if err != nil {
 		return Usage{}, err
 	}
 	booked = true
+	if !settled {
+		// The pair settled before, so this call books nothing and the sink
+		// never sees a second charge for it. The zero usage reports the
+		// fact, the same shape a joiner reports for work it did not settle.
+		return Usage{}, nil
+	}
 	if err := m.sink.Add(ctx, Charge{Kind: kind, Units: 1, UnitPrice: price, Ref: ref, Denomination: m.denom}); err != nil {
 		return Usage{}, fmt.Errorf("%w: %w", ErrUnrecordedCharge, err)
 	}
