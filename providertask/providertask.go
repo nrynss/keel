@@ -21,15 +21,21 @@
 //
 // A key that is claimed but carries no task id yet is a create some Run
 // started and has not recorded. Another Run waits for that record rather
-// than duplicating it. A Run that finds no task id after its deadline
-// refuses with ErrTaskPending. A create that failed mid call leaves the
-// key in that state on purpose, because the provider may have created the
-// task even though the answer was lost.
+// than duplicating it. A Run that finds no outcome inside its deadline
+// refuses with ErrTaskPending, whether the key still carries no task id or
+// a recorded task has not finished. A create that failed mid call leaves
+// the key in that state on purpose, because the provider may have created
+// the task even though the answer was lost. Every later Run of a burned
+// key waits out its own deadline before refusing, thirty minutes by
+// default, and Store.Release removes a still empty claim once nothing is
+// believed to have landed, which is the deliberate recovery.
 //
-// Polling waits on a full jitter backoff from Config.PollBase to
-// Config.PollCeiling, bounded by Config.Deadline. A Status error the
-// configured Retryable classifies as transient is retried on that curve.
-// A failed verdict from the provider is a terminal answer, never a retry.
+// Polling waits on the upper half jitter the throttle package uses, from
+// Config.PollBase to Config.PollCeiling, bounded by Config.Deadline. Each
+// wait spans half the current step to the whole step, so the first wait
+// lands between half PollBase and PollBase. A Status error the configured
+// Retryable classifies as transient is retried on that curve. A failed
+// verdict from the provider is a terminal answer, never a retry.
 //
 // Run composes with a cost meter. The Run that creates the task reserves
 // Config.Estimate before it creates, settles when the task succeeds, and
@@ -74,9 +80,10 @@ const (
 	// CodeWindowExceeded names a task id whose recorded age passed the
 	// provider's query window. The key is never re-created.
 	CodeWindowExceeded = "task_window_exceeded"
-	// CodeTaskPending names a key that is claimed but still carries no
-	// task id. The claim may still land, so the caller asks again rather
-	// than re-runs.
+	// CodeTaskPending names a key whose outcome is not resolved yet: a
+	// claimed key that still carries no task id, or a recorded task that
+	// did not finish inside the caller's deadline. The claim may still
+	// land, so the caller asks again rather than re-runs.
 	CodeTaskPending = "task_pending"
 	// CodeDeadline names a task that did not reach a terminal state inside
 	// Config.Deadline. The task keeps running at the provider.
@@ -234,7 +241,9 @@ type Store interface {
 	// Release removes the key's row while it still carries no task id, and
 	// changes nothing once a task id is recorded. It reports whether it
 	// removed a row. Run calls it when a run fails before Create, so a
-	// refused reservation does not burn the key.
+	// refused reservation does not burn the key. An application calls it
+	// after a create it believes never landed, which is the deliberate
+	// recovery for a burned key.
 	Release(ctx context.Context, key string) (bool, error)
 }
 
@@ -329,8 +338,8 @@ type Config struct {
 	// recorded task. Zero or negative means DefaultDeadline.
 	Deadline time.Duration
 	// PollBase is the wait before the second status poll. Each later wait
-	// doubles it with full jitter, up to PollCeiling. Zero or negative
-	// means DefaultPollBase.
+	// doubles it, up to PollCeiling, and every wait spans half the current
+	// step to the whole step. Zero or negative means DefaultPollBase.
 	PollBase time.Duration
 	// PollCeiling caps one wait between polls. A ceiling below PollBase
 	// reads as PollBase. Zero or negative means DefaultPollCeiling.
@@ -475,7 +484,8 @@ func isNilValue(v any) bool {
 // reservation when it fails. A refused reservation releases the still
 // empty claim, so the key stays usable. A Run that joins a key another Run
 // of the same process is already driving waits for the recorded outcome
-// and settles nothing.
+// and settles nothing. That joiner refuses with ErrTaskPending when its
+// own deadline passes first.
 //
 // The returned error wraps the sentinels of this package, the meter's
 // errors, and the errors the Spec functions returned. A store fault on the
@@ -726,8 +736,9 @@ func (t *task[T]) watch(taskID string) (T, cost.Usage, error) {
 }
 
 // poll asks the provider where the task stands until it reaches a terminal
-// state. The wait is full jitter from the base to the ceiling, and the
-// overall deadline bounds the whole loop. A Status error the classifier
+// state. Each wait spans half the current step to the whole step, on the
+// curve from the base to the ceiling, and the overall deadline bounds the
+// whole loop. A Status error the classifier
 // calls transient is retried on that curve. A failed verdict and a
 // permanent error stop the loop at once.
 func (t *task[T]) poll(taskID string) (Status, error) {

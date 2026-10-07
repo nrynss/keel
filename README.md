@@ -319,15 +319,20 @@ key finds the recorded task, polls it to its verdict, and never calls Create aga
 success is fetched and kept again without a new create, and a recorded failure returns the stored
 provider code without touching the provider.
 
-A task id older than the provider's query window refuses with `ErrWindowExceeded` and the stable
-code `task_window_exceeded`, because the provider may no longer answer for it. A key whose create
-never resolved refuses with `ErrTaskPending` and `task_pending`. A create that failed mid call
-leaves its key in that state on purpose, since the provider may have created the task even though
-the answer was lost.
+A recorded task that still runs when its age passes the provider's query window refuses with
+`ErrWindowExceeded` and the stable code `task_window_exceeded`. The provider may no longer answer
+for it, so polling it would spin. A recorded verdict is honoured at any age, read back from the
+row. A Run that finds no outcome inside its deadline refuses with `ErrTaskPending` and
+`task_pending`, whether the key still carries no task id or a recorded task has not finished. A
+create that failed mid call leaves its key in that state on purpose, since the provider may have
+created the task even though the answer was lost. Every later Run of a burned key waits out its own
+deadline, thirty minutes by default, before refusing. `Store.Release` removes a still empty claim,
+which is the deliberate recovery once nothing is believed to have landed.
 
-Polling waits on a full jitter backoff from `PollBase` to `PollCeiling`, bounded by `Deadline`. A
-Status error the `Retryable` classifier calls transient waits on that curve, and anything else comes
-back at once. The deadline passing refuses with `ErrDeadline` and the code `task_timeout`, and a
+Polling waits on the upper half jitter `throttle` uses, from `PollBase` to `PollCeiling`, bounded
+by `Deadline`. Each wait spans half the current step to the whole step, so the first wait lands
+between half `PollBase` and `PollBase`. A Status error the `Retryable` classifier calls transient
+waits on that curve, and anything else comes back at once. The deadline passing refuses with `ErrDeadline` and the code `task_timeout`, and a
 later Run resumes the task. A failed verdict is a `TaskFailure` carrying the provider's error code,
 and it is never retried.
 
