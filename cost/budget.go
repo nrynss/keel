@@ -16,6 +16,12 @@ var ErrNegativeLimit = errors.New("cost: negative budget limit")
 // ErrNegativeEstimate reports a reservation with an estimate below zero.
 var ErrNegativeEstimate = errors.New("cost: negative reservation estimate")
 
+// ErrEmptyReference reports a settle once without a reference. A once
+// settle dedupes on the kind and reference pair, and an empty reference
+// would collapse every once settle of a kind onto one pair and drop every
+// later charge, so every account refuses it and books nothing.
+var ErrEmptyReference = errors.New("cost: empty settle-once reference")
+
 // Budget bounds the total spend of a sequence of paid calls in one
 // denomination. Reserve commits an estimate before a call and fails when the
 // estimate would pass the limit. Settle books the price the call actually
@@ -168,10 +174,15 @@ func (b *Budget) Settle(reserved, actual Price) error {
 // reports booked true. A pair that has settled before books nothing and
 // reports booked false, because a resume or a retry of the same work must
 // not charge the books twice. The repeat still frees its reservation, so a
-// deduplicated call holds no budget. It reports ErrOverflow and commits
-// nothing, not even the pair, when actual would push spent outside the
-// int64 range.
+// deduplicated call holds no budget. A settle without a reference reports
+// an error matching ErrEmptyReference and books nothing, because an empty
+// reference would collapse every once settle of a kind onto one pair. It
+// reports ErrOverflow and commits nothing, not even the pair, when actual
+// would push spent outside the int64 range.
 func (b *Budget) SettleOnce(reserved, actual Price, kind, ref string) (booked bool, err error) {
+	if ref == "" {
+		return false, fmt.Errorf("cost: settle once: %w", ErrEmptyReference)
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.settledLocked(kind, ref) {

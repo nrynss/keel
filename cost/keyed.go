@@ -141,6 +141,12 @@ func (k *KeyedBudget) Settle(owner string, reserved, actual Price) error {
 // reports ErrUnknownOwner when no ceiling was set for owner, and behaves
 // as KeyedBudget.Settle otherwise.
 func (k *KeyedBudget) settleOnce(owner string, reserved, actual Price, kind, ref string) (bool, error) {
+	if ref == "" {
+		// The refusal runs before any booking, because a guard that fired
+		// after the global settle would leave one ceiling booked and the
+		// other refused.
+		return false, fmt.Errorf("cost: settle once: %w", ErrEmptyReference)
+	}
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	o, ok := k.owners[owner]

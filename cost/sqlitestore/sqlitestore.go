@@ -592,10 +592,11 @@ func (s *Store) Settle(ctx context.Context, r Reservation, actual cost.Price) er
 // false, so a resume or a retry of the same work never charges the books
 // twice. The pair row and the booking share one transaction with the budget
 // update, so concurrent settles of one pair across processes report exactly
-// one true. It reports an error matching cost.ErrOverflow and commits
-// nothing, not even the pair, when actual would push the booked spend past
-// the int64 range. A cancelled context stops the settle, so nothing is
-// booked.
+// one true. A settle without a reference reports an error matching both
+// ErrInvalid and cost.ErrEmptyReference and books nothing. It reports an
+// error matching cost.ErrOverflow and commits nothing, not even the pair,
+// when actual would push the booked spend past the int64 range. A cancelled
+// context stops the settle, so nothing is booked.
 func (s *Store) SettleOnce(ctx context.Context, r Reservation, actual cost.Price, kind, ref string) (bool, error) {
 	tx, err := s.db.Writer().BeginTx(ctx, nil)
 	if err != nil {
@@ -632,11 +633,13 @@ func (s *Store) SettleOnce(ctx context.Context, r Reservation, actual cost.Price
 
 // insertSettleOnce claims the kind and reference pair inside the caller's
 // transaction. It reports whether this call inserted the pair, which makes
-// it the one settle that may book. An empty ref is refused, because the
-// pair key must name its work to stay unique.
+// it the one settle that may book. An empty ref is refused with an error
+// matching both ErrInvalid and cost.ErrEmptyReference, the same sentinel
+// the in-memory accounts refuse with, because the pair key must name its
+// work to stay unique.
 func insertSettleOnce(ctx context.Context, tx *sql.Tx, now time.Time, kind, ref string) (bool, error) {
 	if ref == "" {
-		return false, fmt.Errorf("%w: the reference must not be empty", ErrInvalid)
+		return false, fmt.Errorf("%w: the reference must not be empty: %w", ErrInvalid, cost.ErrEmptyReference)
 	}
 	result, err := tx.ExecContext(ctx,
 		`INSERT INTO cost_settle_once (kind, ref, created_at) VALUES (?, ?, ?)

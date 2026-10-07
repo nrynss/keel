@@ -39,7 +39,9 @@ type Account interface {
 	// SettleOnce books the price the call actually cost at most once per
 	// kind and reference pair, and frees its reservation. A pair that
 	// settled before books nothing, frees the reservation, and reports
-	// booked false.
+	// booked false. A settle without a reference reports an error matching
+	// ErrEmptyReference on every account, because an empty reference would
+	// collapse a kind's once settles onto one pair.
 	SettleOnce(reserved, actual Price, kind, ref string) (booked bool, err error)
 	// Release frees a reservation the call never spent.
 	Release(reserved Price)

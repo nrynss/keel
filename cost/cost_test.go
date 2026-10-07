@@ -753,3 +753,26 @@ func TestBudgetSettleOnceAnswersOneBookedUnderConcurrency(t *testing.T) {
 		t.Errorf("Reserved() = %d, want 0, every loser freed its hold", got)
 	}
 }
+
+// TestBudgetSettleOnceRefusesAnEmptyReference pins the one refusal every
+// SettleOnce implementation carries. An empty reference would collapse
+// every once settle of a kind onto one pair and drop every later charge,
+// so the budget refuses before anything is marked, and a later settle of
+// the same kind under a real reference still books.
+func TestBudgetSettleOnceRefusesAnEmptyReference(t *testing.T) {
+	b := mustBudget(t, 100*Cent)
+	booked, err := b.SettleOnce(30*Cent, 12*Cent, "transcribe", "")
+	if !errors.Is(err, ErrEmptyReference) {
+		t.Fatalf("SettleOnce with an empty reference error = %v, want ErrEmptyReference", err)
+	}
+	if booked {
+		t.Fatalf("SettleOnce with an empty reference booked = true, want false")
+	}
+	if got := b.Spent(); got != 0 {
+		t.Errorf("Spent() = %d, want 0, the refusal commits nothing", got)
+	}
+	booked, err = b.SettleOnce(30*Cent, 12*Cent, "transcribe", "job-1")
+	if err != nil || !booked {
+		t.Fatalf("SettleOnce after the refusal booked = %v, %v, want true", booked, err)
+	}
+}

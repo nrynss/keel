@@ -157,7 +157,8 @@ func (k *KeyedBudget) Settle(ctx context.Context, owner string, r Reservation, a
 
 // SettleOnce books the price owner's call actually cost at most once per
 // kind and reference pair, and frees its hold. It reports ErrInvalid when
-// owner is empty or the reference is empty, and an error matching
+// owner is empty, an error matching both ErrInvalid and
+// cost.ErrEmptyReference when the reference is empty, and an error matching
 // cost.ErrUnknownOwner when no ceiling was set for owner. The first settle
 // of a pair behaves exactly as Settle does and reports booked true. A pair
 // that has settled before frees this call's hold, books nothing, and

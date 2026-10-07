@@ -124,7 +124,9 @@ func TestStoreSettleOnceAnswersOneTrueAcrossHandles(t *testing.T) {
 // TestStoreSettleOnceRefusesAnEmptyReference pins the one refusal the pair
 // key needs. An empty reference would collapse every once settle of a kind
 // onto one durable row forever, so the store refuses it before anything is
-// written, and the hold and the ceiling stay as they were.
+// written, and the hold and the ceiling stay as they were. The refusal
+// matches the same sentinel the in-memory accounts refuse with, beside the
+// store's own.
 func TestStoreSettleOnceRefusesAnEmptyReference(t *testing.T) {
 	store := openStore(t, filepath.Join(t.TempDir(), "cost.db"), withLimit(1000))
 	ctx := t.Context()
@@ -132,8 +134,12 @@ func TestStoreSettleOnceRefusesAnEmptyReference(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Reserve: %v", err)
 	}
-	if _, err := store.SettleOnce(ctx, hold, 12, "gen", ""); !errors.Is(err, sqlitestore.ErrInvalid) {
+	_, err = store.SettleOnce(ctx, hold, 12, "gen", "")
+	if !errors.Is(err, sqlitestore.ErrInvalid) {
 		t.Fatalf("SettleOnce with an empty reference error = %v, want ErrInvalid", err)
+	}
+	if !errors.Is(err, cost.ErrEmptyReference) {
+		t.Fatalf("SettleOnce with an empty reference error = %v, want ErrEmptyReference", err)
 	}
 	if got, err := store.Spent(ctx); err != nil || got != 0 {
 		t.Errorf("Spent() = %d, %v, want 0, the refusal commits nothing", got, err)
@@ -217,8 +223,12 @@ func TestKeyedSettleOnceRefusesUnknownOwnerAndEmptyRef(t *testing.T) {
 	if _, err := keyed.SettleOnce(ctx, "ghost", hold, 12, "gen", "job-9"); !errors.Is(err, cost.ErrUnknownOwner) {
 		t.Errorf("SettleOnce for an unknown owner error = %v, want ErrUnknownOwner", err)
 	}
-	if _, err := keyed.SettleOnce(ctx, "alice", hold, 12, "gen", ""); !errors.Is(err, sqlitestore.ErrInvalid) {
+	_, err = keyed.SettleOnce(ctx, "alice", hold, 12, "gen", "")
+	if !errors.Is(err, sqlitestore.ErrInvalid) {
 		t.Errorf("SettleOnce with an empty reference error = %v, want ErrInvalid", err)
+	}
+	if !errors.Is(err, cost.ErrEmptyReference) {
+		t.Errorf("SettleOnce with an empty reference error = %v, want ErrEmptyReference", err)
 	}
 	if _, err := keyed.SettleOnce(ctx, "", hold, 12, "gen", "job-9"); !errors.Is(err, sqlitestore.ErrInvalid) {
 		t.Errorf("SettleOnce with an empty owner error = %v, want ErrInvalid", err)

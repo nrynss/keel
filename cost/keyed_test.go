@@ -356,3 +356,35 @@ func TestKeyedSetLimitCarriesThePairSet(t *testing.T) {
 		t.Errorf("Reserve after the repeat: %v", err)
 	}
 }
+
+// TestOwnerAccountSettleOnceRefusesAnEmptyReference pins the refusal on the
+// per-owner accounts, the same sentinel the plain budget and the durable
+// store refuse with. No ceiling books, and no pair is marked, so the
+// account behaves exactly as a plain budget does.
+func TestOwnerAccountSettleOnceRefusesAnEmptyReference(t *testing.T) {
+	k := mustKeyed(t, 100*Cent)
+	mustOwnerLimit(t, k, "a", 40*Cent)
+	a, err := k.Owner("a")
+	if err != nil {
+		t.Fatalf("Owner(a): %v", err)
+	}
+	if err := a.Reserve(20 * Cent); err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+	booked, err := a.SettleOnce(20*Cent, 12*Cent, "transcribe", "")
+	if !errors.Is(err, ErrEmptyReference) {
+		t.Fatalf("SettleOnce with an empty reference error = %v, want ErrEmptyReference", err)
+	}
+	if booked {
+		t.Fatalf("SettleOnce with an empty reference booked = true, want false")
+	}
+	// The refusal commits nothing and consumes no hold, so the hold stays
+	// the caller's to release, exactly as it does on an overflow refusal.
+	if got := mustKeyedRemaining(t, k, "a"); got != 20*Cent {
+		t.Errorf("owner headroom = %d, want %d, the refusal books nothing and frees nothing", got, 20*Cent)
+	}
+	a.Release(20 * Cent)
+	if got := mustKeyedRemaining(t, k, "a"); got != 40*Cent {
+		t.Errorf("owner headroom after the release = %d, want %d", got, 40*Cent)
+	}
+}
