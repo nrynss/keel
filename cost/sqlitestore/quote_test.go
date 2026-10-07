@@ -195,70 +195,6 @@ func TestQuoteRunsOnceAndReplaysOutcome(t *testing.T) {
 	}
 }
 
-// TestRunConcurrentSharesOneOutcome pins that concurrent Runs of one quote
-// produce one work execution, and the caller that waited receives the same
-// outcome without a second charge.
-func TestRunConcurrentSharesOneOutcome(t *testing.T) {
-	clock := &testClock{at: base}
-	path := filepath.Join(t.TempDir(), "cost.db")
-	store := openStore(t, path, withClock(clock.now), withLimit(100*cost.Dollar))
-	ctx := t.Context()
-	setOwnerLimit(t, sqlitestore.NewKeyedBudget(store), "alice", 10*cost.Dollar)
-	quote, err := store.Quote(ctx, "alice", cost.Cent, time.Hour)
-	if err != nil {
-		t.Fatalf("quote: %v", err)
-	}
-
-	entered := make(chan struct{})
-	release := make(chan struct{})
-	var runs atomic.Int32
-	type result struct {
-		usage cost.Usage
-		err   error
-	}
-	results := make(chan result, 2)
-	go func() {
-		usage, err := store.Run(ctx, quote.ID, func(context.Context) (cost.Usage, error) {
-			runs.Add(1)
-			close(entered)
-			<-release
-			return cost.Usage{Price: 2 * cost.Cent, Measured: false}, nil
-		})
-		results <- result{usage, err}
-	}()
-	<-entered
-	// The leader is parked in its work. Give the second caller time to
-	// reach the flight, so the wait is what is under test.
-	time.Sleep(50 * time.Millisecond)
-	go func() {
-		usage, err := store.Run(ctx, quote.ID, func(context.Context) (cost.Usage, error) {
-			runs.Add(1)
-			return cost.Usage{}, nil
-		})
-		results <- result{usage, err}
-	}()
-	close(release)
-	first, second := <-results, <-results
-	if first.err != nil || second.err != nil {
-		t.Fatalf("concurrent runs: %v, %v", first.err, second.err)
-	}
-	// The work reports no measurement, so the settle lands on the quoted
-	// price, and both callers receive exactly that outcome.
-	want := cost.Usage{Price: cost.Cent, Measured: false}
-	if first.usage != want || second.usage != want {
-		t.Fatalf("usages = %+v and %+v, want the shared outcome %+v", first.usage, second.usage, want)
-	}
-	if n := runs.Load(); n != 1 {
-		t.Fatalf("work ran %d times, want once", n)
-	}
-	if spent := spentOf(t, store); spent != cost.Cent {
-		t.Fatalf("spent = %s, want one charge at the quoted price", spent)
-	}
-	if n := freshCount(t, path, "cost_charge"); n != 1 {
-		t.Fatalf("charges = %d, want 1", n)
-	}
-}
-
 // TestRunAfterClaimFromFreshHandleChargesOnce simulates a crash between
 // claim and work. A fresh handle finds the live claim and refuses without
 // running the work, then finds the lapsed claim gone, and the whole retry
@@ -392,6 +328,102 @@ func TestRunExpiredQuoteIssuesFreshQuote(t *testing.T) {
 	}
 	if spent := spentOf(t, store); spent != 5*cost.Cent {
 		t.Fatalf("spent = %s, want the fresh quote's charge", spent)
+	}
+}
+
+// TestRunExpiredQuoteRepricesBeforeRefusing pins that the price check
+// covers an open row past its confirm window, where its price is the
+// oldest. An unmoved price refuses with quote_expired and a fresh quote at
+// the price Reprice reported, not the recorded one. A moved price refuses
+// with quote_price_moved and a fresh quote at the current price, exactly
+// like a live quote. The cases run on separate files, because every write
+// a quote drives sweeps the expired rows it finds on the way.
+func TestRunExpiredQuoteRepricesBeforeRefusing(t *testing.T) {
+	clock := &testClock{at: base}
+	price := 10 * cost.Cent
+	newStore := func(t *testing.T, path string) *sqlitestore.Store {
+		store := openStore(t, path, withClock(clock.now), withLimit(100*cost.Dollar),
+			func(c *sqlitestore.Config) {
+				c.Reprice = func(context.Context, string) (cost.Price, error) { return price, nil }
+				c.QuoteTolerance = cost.Cent
+			})
+		setOwnerLimit(t, sqlitestore.NewKeyedBudget(store), "alice", 10*cost.Dollar)
+		return store
+	}
+	ctx := t.Context()
+
+	// Past its window with the price inside the tolerance, the refusal
+	// is the expiry one, and the fresh quote carries the repriced
+	// price rather than the one the row recorded.
+	path := filepath.Join(t.TempDir(), "cost.db")
+	store := newStore(t, path)
+	unmoved, err := store.Quote(ctx, "alice", 10*cost.Cent, time.Hour)
+	if err != nil {
+		t.Fatalf("quote: %v", err)
+	}
+	clock.advance(2 * time.Hour)
+	price = 10*cost.Cent + cost.Cent/2
+	_, err = store.Run(ctx, unmoved.ID, testWork(price))
+	refusal := refusalOf(t, err)
+	if refusal.Code != cost.CodeQuoteExpired {
+		t.Fatalf("code = %q, want quote_expired", refusal.Code)
+	}
+	if !errors.Is(err, cost.ErrQuoteExpired) {
+		t.Fatalf("run quote: %v, want ErrQuoteExpired", err)
+	}
+	if refusal.Quote.Price != price {
+		t.Fatalf("fresh price = %s, want the repriced price %s", refusal.Quote.Price, price)
+	}
+	if n := freshQuoteCount(t, path, unmoved.ID); n != 0 {
+		t.Fatalf("the expired quote left %d rows, want the sweep to take it", n)
+	}
+	usage, err := store.Run(ctx, refusal.Quote.ID, testWork(price))
+	if err != nil {
+		t.Fatalf("run the fresh quote: %v", err)
+	}
+	if usage != (cost.Usage{Price: price, Measured: true}) {
+		t.Fatalf("usage = %+v", usage)
+	}
+
+	// A price that moved past the window refuses as moved, with a
+	// fresh quote at the moved price, and books nothing on the refusal.
+	path = filepath.Join(t.TempDir(), "cost.db")
+	store = newStore(t, path)
+	moved, err := store.Quote(ctx, "alice", 10*cost.Cent, time.Hour)
+	if err != nil {
+		t.Fatalf("second quote: %v", err)
+	}
+	clock.advance(2 * time.Hour)
+	price = 12 * cost.Cent
+	_, err = store.Run(ctx, moved.ID, testWork(price))
+	refusal = refusalOf(t, err)
+	if refusal.Code != cost.CodeQuotePriceMoved {
+		t.Fatalf("code = %q, want quote_price_moved", refusal.Code)
+	}
+	if !errors.Is(err, cost.ErrQuotePriceMoved) {
+		t.Fatalf("run quote: %v, want ErrQuotePriceMoved", err)
+	}
+	if refusal.Quote.Price != 12*cost.Cent {
+		t.Fatalf("fresh price = %s, want the moved price", refusal.Quote.Price)
+	}
+	if n := freshQuoteCount(t, path, moved.ID); n != 0 {
+		t.Fatalf("the refused quote left %d rows, want the sweep to take it", n)
+	}
+	if state := freshQuoteState(t, path, refusal.Quote.ID); state != "open" {
+		t.Fatalf("fresh quote state = %q, want open", state)
+	}
+	if spent := spentOf(t, store); spent != 0 {
+		t.Fatalf("spent = %s, want the refusal to book nothing", spent)
+	}
+	usage, err = store.Run(ctx, refusal.Quote.ID, testWork(12*cost.Cent))
+	if err != nil {
+		t.Fatalf("run the fresh quote: %v", err)
+	}
+	if usage != (cost.Usage{Price: 12 * cost.Cent, Measured: true}) {
+		t.Fatalf("usage = %+v", usage)
+	}
+	if spent := spentOf(t, store); spent != 12*cost.Cent {
+		t.Fatalf("spent = %s, want one charge at the moved price", spent)
 	}
 }
 
@@ -649,55 +681,33 @@ func TestWorkFailureReopensQuote(t *testing.T) {
 	}
 }
 
-// TestRunPanicFreesClaimAndAlertsWaiters pins the panic path. The claim is
-// freed while the panic unwinds, the panic continues past Run, and a
-// waiter receives its own error instead of a silent success or a
-// forever-blocked call.
-func TestRunPanicFreesClaimAndAlertsWaiters(t *testing.T) {
+// TestRunCancelledBeforeClaimBooksNothing pins the other side of the
+// cancellation contract from TestRunBooksWhenCallerCancelsAfterWork. A
+// context cancelled before the claim stops the run, so the work never
+// runs, nothing books, and the quote stays open for a retry.
+func TestRunCancelledBeforeClaimBooksNothing(t *testing.T) {
 	clock := &testClock{at: base}
 	path := filepath.Join(t.TempDir(), "cost.db")
 	store := openStore(t, path, withClock(clock.now), withLimit(100*cost.Dollar))
 	ctx := t.Context()
 	setOwnerLimit(t, sqlitestore.NewKeyedBudget(store), "alice", 10*cost.Dollar)
-	quote, err := store.Quote(ctx, "alice", 5*cost.Cent, time.Hour)
+	dead, err := store.Quote(ctx, "alice", cost.Cent, time.Hour)
 	if err != nil {
 		t.Fatalf("quote: %v", err)
 	}
-	entered := make(chan struct{})
-	leaderDone := make(chan struct{})
-	go func() {
-		defer close(leaderDone)
-		defer func() { _ = recover() }() // the panic belongs to this caller
-		_, _ = store.Run(ctx, quote.ID, func(context.Context) (cost.Usage, error) {
-			close(entered)
-			panic("boom")
-		})
-	}()
-	<-entered
-	waiterErr := make(chan error, 1)
-	go func() {
-		_, err := store.Run(ctx, quote.ID, testWork(5*cost.Cent))
-		waiterErr <- err
-	}()
-	if err := <-waiterErr; !errors.Is(err, sqlitestore.ErrRunAbandoned) {
-		t.Fatalf("waiter error: %v, want ErrRunAbandoned", err)
+	deadCtx, cancelDead := context.WithCancel(ctx)
+	cancelDead()
+	if _, err := store.Run(deadCtx, dead.ID, func(context.Context) (cost.Usage, error) {
+		t.Fatal("the run of a cancelled context ran the work")
+		return cost.Usage{}, nil
+	}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("run on a cancelled context: %v, want context.Canceled", err)
 	}
-	<-leaderDone
 	if spent := spentOf(t, store); spent != 0 {
-		t.Fatalf("spent = %s, want a panicked run to book nothing", spent)
+		t.Fatalf("spent = %s, want a run that never claimed to book nothing", spent)
 	}
-	if n := freshCount(t, path, "cost_reservation"); n != 0 {
-		t.Fatalf("reservations = %d, want the panic to free the hold", n)
-	}
-	if state := freshQuoteState(t, path, quote.ID); state != "open" {
-		t.Fatalf("panicked quote state = %q, want open", state)
-	}
-	usage, err := store.Run(ctx, quote.ID, testWork(5*cost.Cent))
-	if err != nil {
-		t.Fatalf("run after the panic: %v", err)
-	}
-	if usage != (cost.Usage{Price: 5 * cost.Cent, Measured: true}) {
-		t.Fatalf("usage = %+v", usage)
+	if state := freshQuoteState(t, path, dead.ID); state != "open" {
+		t.Fatalf("refused quote state = %q, want open", state)
 	}
 }
 

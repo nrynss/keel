@@ -160,8 +160,9 @@ type Config struct {
 	ReservationTTL time.Duration
 
 	// Reprice reports the current price of one quoted action for owner.
-	// Run calls it before it claims a live quote, so a price that moved
-	// re-confirms before any spend. The price it reports counts minor
+	// Run calls it before it claims an open quote, live or past its
+	// confirm window, so a price that moved re-confirms before any
+	// spend. The price it reports counts minor
 	// units of the store's denomination, and a negative one is refused.
 	// Nil means the quoted price never moves and no check runs.
 	Reprice func(ctx context.Context, owner string) (cost.Price, error)
@@ -200,6 +201,12 @@ type Store struct {
 	// durable claim covers every other process.
 	flightMu sync.Mutex
 	flights  map[string]*quoteFlight
+
+	// onWaiterJoin, when not nil, runs when a caller joins a flight as
+	// a waiter. The tests set it to make the join deterministic, so a
+	// leader never finishes before the waiter that must share its
+	// outcome is on the flight.
+	onWaiterJoin func(quoteID string)
 }
 
 // A Store satisfies cost.ChargeSink, so a meter can take it as the sink that
