@@ -95,7 +95,9 @@ type CallOption func(*callSettings)
 // account settles through SettleOnce, and the charge reaches the sink only
 // when the account booked this settle. A call whose pair a previous settle
 // already booked returns the zero usage and records nothing, so a resume
-// or a retry of the same work never books it twice. Pass it for a
+// or a retry of the same work never books it twice. A charge the sink
+// refuses after a once settle stays unrecorded, because the pair is booked
+// and no repeat of the reference reaches the sink again. Pass it for a
 // reference that names one charge, such as an idempotency key. A reference
 // that legitimately carries several charges calls Call without Once.
 func Once() CallOption {
@@ -162,7 +164,10 @@ func NewMeter(account Account, sink ChargeSink) (*Meter, error) {
 // books nothing, reaches no sink, and returns the zero usage, because this
 // call booked nothing. A resume or a retry that runs the same work under
 // the same reference therefore leaves the books exactly as the first run
-// wrote them. Without Once, Call is unchanged, so a reference that
+// wrote them. Under Once a charge the sink refuses after the settle stays
+// unrecorded, because the pair is booked and no repeat of the reference
+// reaches the sink. The ErrUnrecordedCharge Call then reports is final for
+// that reference. Without Once, Call is unchanged, so a reference that
 // legitimately carries several charges keeps booking every one.
 //
 // Every failure on the way to the settle frees the reservation, so a call
