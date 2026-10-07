@@ -161,8 +161,15 @@ func splitPath(path string) (bucket, key string, ok bool) {
 	return bucket, rest, true
 }
 
-// put stores the body under key and stamps the double's own clock.
+// put stores the body under key and stamps the double's own clock. It
+// refuses a put that names no Content-Length the way an S3-compatible
+// service is free to, so a write that sends an unknown-length body
+// fails here instead of passing an endpoint the tree cannot serve.
 func (f *fakeS3) put(w http.ResponseWriter, r *http.Request, key string) {
+	if r.Header.Get("Content-Length") == "" {
+		serveXMLError(w, http.StatusLengthRequired, "MissingContentLength", "you must provide the content length")
+		return
+	}
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, "unreadable body", http.StatusBadRequest)

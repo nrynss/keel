@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -123,6 +124,56 @@ func TestWriteRefusesATakenIDAndKeepsTheStoredBytes(t *testing.T) {
 	}
 	if got := f.bodyOf(reserved); !bytes.Equal(got, first) {
 		t.Fatal("the stored bytes changed after a refused retry")
+	}
+}
+
+// TestAnUnseekableSourcePersistsWithALength pins the spool path. A
+// source with no Seek and no length reaches the service as a put with
+// a Content-Length, the reported and stored sizes match the bytes it
+// carried, the row records the same size, and the spool leaves no file
+// behind. The double refuses a put without the header the way an
+// S3-compatible service is free to, so a regression fails here and
+// not only on such a service.
+func TestAnUnseekableSourcePersistsWithALength(t *testing.T) {
+	spool := t.TempDir()
+	t.Setenv("TMPDIR", spool)
+	f, endpoint, client := newFakeS3(t, func() time.Time { return base })
+	b := openBackend(t, endpoint, client)
+	data := deterministic(4096)
+	blobID := strings.Repeat("8", 32)
+
+	n, err := b.Write(t.Context(), blobID, struct{ io.Reader }{bytes.NewReader(data)})
+	if err != nil {
+		t.Fatalf("write of an unseekable source: %v", err)
+	}
+	if n != int64(len(data)) {
+		t.Fatalf("write reported %d bytes, want %d", n, len(data))
+	}
+	if got := f.bodyOf(blobID); !bytes.Equal(got, data) {
+		t.Fatalf("the service holds %d bytes, want the %d written", len(got), len(data))
+	}
+
+	s := openStore(t, b, newMemIndex())
+	rowID, err := s.Persist(t.Context(), struct{ io.Reader }{bytes.NewReader(data)}, mediastore.Put{
+		ContentType: "image/png",
+	})
+	if err != nil {
+		t.Fatalf("persist of an unseekable source: %v", err)
+	}
+	_, row, err := s.Open(t.Context(), rowID)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if row.SizeBytes != int64(len(data)) {
+		t.Fatalf("row records %d bytes, want %d", row.SizeBytes, len(data))
+	}
+
+	leftovers, err := os.ReadDir(spool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(leftovers) != 0 {
+		t.Fatalf("%d spool files survived the write", len(leftovers))
 	}
 }
 
