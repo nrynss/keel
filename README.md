@@ -34,6 +34,7 @@ else is pure Go, and `CGO_ENABLED=0` builds the whole module.
 | `stream` | Topic broker and server-sent events, with heartbeats, a non-blocking slow-subscriber policy, and best-effort replay after Last-Event-ID |
 | `job` | Long work started by a short request, observed over `stream`, durable across restarts |
 | `mediastore` | Blobs under unguessable ids on a storage backend, with the disk store built in, a read path for local tools, Range serving, retention sweeps and a snapshot that restores the same ids |
+| `mediastore/s3` | The blob backend for an S3-compatible object store, with presigned GET serving after the app's own authorizer and a proxy fallback with Range support, compiled only by apps that keep bytes off the box |
 | `upload` | Resumable chunked uploads that land in `mediastore`, resumable by id after a dropped connection |
 | `photo` | Normalises an uploaded photo: EXIF orientation applied to the pixels, metadata stripped, resized under side and pixel caps, re-encoded under a byte cap |
 | `sqlite` | One SQLite file with WAL and synchronous FULL, so an acknowledged write survives a power cut once the file's creation window has passed, plus a writer handle, a read-only reader pool, namespaced migrations and online backup |
@@ -66,7 +67,9 @@ The stores that need SQLite live one directory down, in `cache/sqlitestore`,
 packages import a SQLite driver, so an app that uses `gate` alone never
 compiles one. The TOML parser stays the same way behind `config` and
 `config/source`, so an app that uses `gate` alone never compiles it either.
-The PDF library stays behind `book` the same way.
+The PDF library stays behind `book` the same way. The object storage
+client stays behind `mediastore/s3`, so an app that keeps blobs on disk
+never compiles it.
 
 ## Using it
 
@@ -894,6 +897,53 @@ process and owns the decision. The reader it returns supports `Seek`, and the ca
 `Store.TempCopy` copies a stored blob into a fresh temporary file and returns a remove function
 the caller must call. The ffmpeg based packages take file paths, so stored media reaches them
 through this helper.
+
+### Blob bytes in an S3-compatible store with mediastore/s3
+
+Entry points: `s3.Open`, `Backend.PresignGet`.
+
+`s3.Open` takes an `s3.Config` with the endpoint, one bucket the backend owns alone, the signing
+region, the credential pair, the presign expiry, and whether the service wants the bucket in the
+URL path. The credential is injected, resolved by the app through its own settings, and the
+package reads no environment. The secret signs requests and presigned URLs, and it appears in no
+log line and no error string the package writes. The client is the Go SDK for the S3 REST
+dialect, chosen for its generated one-to-one match with that dialect and its native signed-read
+presigning, and it sits behind this one subpackage.
+
+The backend is installed through `mediastore.Config.Backend`:
+
+```go
+backend, err := s3.Open(ctx, s3.Config{
+	Endpoint:      "https://objects.example.internal",
+	Bucket:        "media",
+	Region:        "eu-test-1",
+	AccessKey:     accessKey,
+	SecretKey:     secretKey,
+	PresignExpiry: 15 * time.Minute,
+	PathStyle:     true,
+})
+store, err := mediastore.Open(ctx, mediastore.Config{Index: index, Backend: backend})
+```
+
+The bucket holds every object at its root named by its blob id, so the listing the orphan sweep
+consumes is the whole bucket. The sweep ages an object with no row by the service's modification
+time. A persist puts the object first and writes the row after the put is acknowledged, which
+keeps the bytes-before-row order over this backend, and what the service promises past that
+acknowledgement is the storage's own durability.
+
+A private blob is served by redirect to a presigned GET. The app authorizes the request the same
+way it would for the handler, then asks the backend for a short-lived URL and answers with a
+redirect:
+
+```go
+url, err := backend.PresignGet(r.Context(), id)
+http.Redirect(w, r, url, http.StatusFound)
+```
+
+The URL carries an expiry from `s3.Config` and a signature the service verifies, and it reads as
+a missing object once it expires. A deployment that cannot redirect serves through the store
+handler instead. That proxy mode streams and seeks through the backend, so Range requests answer
+206 with exactly the requested bytes, as they do on disk.
 
 ### Resumable uploads with upload
 
