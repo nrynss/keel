@@ -21,7 +21,9 @@
 //
 // Migrations are namespaced. Each namespace keeps its own version table, so
 // Keel stores and the embedding application share one database file without
-// colliding.
+// colliding. Concurrent first opens converge on one schema. When an apply
+// collides with a file another open has just applied, the loser re-reads the
+// ledger and proceeds past the winner's files instead of failing.
 //
 // This package is one of the few allowed to import the SQLite driver.
 // Everything else reaches SQLite through it.
@@ -216,6 +218,11 @@ func (db *DB) Close() error {
 // Each file runs in its own transaction together with its version row, so a
 // file that fails partway leaves nothing behind. A file must not contain its
 // own BEGIN or COMMIT.
+//
+// Racing first opens converge instead of failing. When an apply fails because
+// another open applied the same file first, Migrate re-reads the ledger and
+// skips the file the winner recorded. A failed file without a ledger row is a
+// real conflict, and Migrate returns it as ErrMigration.
 func Migrate(ctx context.Context, db *DB, namespace string, fsys fs.FS) error {
 	if !validNamespace(namespace) {
 		return fmt.Errorf("sqlite: migrate: %w: %q", ErrInvalidNamespace, namespace)
@@ -239,11 +246,36 @@ func Migrate(ctx context.Context, db *DB, namespace string, fsys fs.FS) error {
 		if applied[name] {
 			continue
 		}
-		if err := db.applyMigration(ctx, table, namespace, fsys, name); err != nil {
-			return err
+		err := db.applyMigration(ctx, table, namespace, fsys, name)
+		if err == nil {
+			continue
 		}
+		// The version row and schema change of a file commit in one
+		// transaction, so a recorded row vouches for the failed file.
+		// Another open applied it between the ledger read above and this
+		// apply, which is the first-open race. Proceeding past the row
+		// lets the loser observe the finished schema. A file no row
+		// vouches for is a real conflict, and the error surfaces below.
+		if db.migrationRecorded(ctx, table, name) {
+			db.log.InfoContext(ctx, "sqlite: migration applied by a concurrent open",
+				"namespace", namespace, "filename", name)
+			continue
+		}
+		return err
 	}
 	return nil
+}
+
+// migrationRecorded reports whether the namespace ledger now records name as
+// applied. A concurrent open can commit a file between this run's ledger read
+// and its own apply, and the recorded row then vouches for the failed file. A
+// failed check reads as not applied, so the original error surfaces instead
+// of a silent skip.
+func (db *DB) migrationRecorded(ctx context.Context, table, name string) bool {
+	var rows int
+	err := db.writer.QueryRowContext(ctx,
+		"SELECT count(*) FROM "+quoteIdent(table)+" WHERE filename = ?", name).Scan(&rows)
+	return err == nil && rows > 0
 }
 
 // ensureVersionTable creates the namespace ledger table when absent.
