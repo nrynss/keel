@@ -65,8 +65,8 @@ func (k *KeyedBudget) Limit() Price {
 }
 
 // SetLimit gives owner a ceiling of its own, or replaces the ceiling it has.
-// The owner's booked spend and outstanding holds survive the change. It
-// reports ErrNegativeLimit when limit is below zero.
+// The owner's booked spend, outstanding holds and settled once pairs
+// survive the change. It reports ErrNegativeLimit when limit is below zero.
 func (k *KeyedBudget) SetLimit(owner string, limit Price) error {
 	if limit < 0 {
 		return fmt.Errorf("cost: owner %q limit %d: %w", owner, limit, ErrNegativeLimit)
@@ -79,8 +79,11 @@ func (k *KeyedBudget) SetLimit(owner string, limit Price) error {
 		return nil
 	}
 	// Every path to an owner account holds k.mu first, so its accumulators
-	// can be read and carried over without taking the account's own lock.
-	k.owners[owner] = &Budget{limit: limit, spent: current.spent, reserved: current.reserved}
+	// and its settled pair set can be read and carried over without taking
+	// the account's own lock. The denomination is not carried, because an
+	// owner account reports the keyed budget's denomination and the field
+	// is unused here.
+	k.owners[owner] = &Budget{limit: limit, spent: current.spent, reserved: current.reserved, once: current.once}
 	return nil
 }
 

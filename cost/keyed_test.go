@@ -310,3 +310,49 @@ func TestOwnerAccountSettleOnceBooksAReferenceOnce(t *testing.T) {
 		t.Errorf("reserve against the global pool after the repeat: %v", err)
 	}
 }
+
+// TestKeyedSetLimitCarriesThePairSet pins that a limit change keeps the
+// owner's settle-once history. SetLimit replaces the owner's budget value,
+// and the replacement carries the booked spend, the outstanding holds and
+// the settled pairs, so a repeat of a settled pair still books nothing on
+// the new ceiling.
+func TestKeyedSetLimitCarriesThePairSet(t *testing.T) {
+	k := mustKeyed(t, 100*Cent)
+	mustOwnerLimit(t, k, "a", 50*Cent)
+	a, err := k.Owner("a")
+	if err != nil {
+		t.Fatalf("Owner(a): %v", err)
+	}
+	if err := a.Reserve(10 * Cent); err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+	booked, err := a.SettleOnce(10*Cent, 10*Cent, "transcribe", "job-1")
+	if err != nil || !booked {
+		t.Fatalf("first SettleOnce booked = %v, %v, want true", booked, err)
+	}
+
+	// The documented limit change keeps the booked spend and drops nothing
+	// the owner's account still owes.
+	if err := k.SetLimit("a", 100*Cent); err != nil {
+		t.Fatalf("SetLimit: %v", err)
+	}
+	if got := mustKeyedRemaining(t, k, "a"); got != 90*Cent {
+		t.Fatalf("remaining after the raise = %d, want %d, the booking survived", got, 90*Cent)
+	}
+	if err := a.Reserve(10 * Cent); err != nil {
+		t.Fatalf("Reserve for the repeat: %v", err)
+	}
+	booked, err = a.SettleOnce(10*Cent, 10*Cent, "transcribe", "job-1")
+	if err != nil {
+		t.Fatalf("repeat SettleOnce: %v", err)
+	}
+	if booked {
+		t.Errorf("repeat SettleOnce after the limit change booked = true, want false")
+	}
+	if got := mustKeyedRemaining(t, k, "a"); got != 90*Cent {
+		t.Errorf("remaining after the repeat = %d, want %d, one booking on the raised ceiling", got, 90*Cent)
+	}
+	if err := a.Reserve(10 * Cent); err != nil {
+		t.Errorf("Reserve after the repeat: %v", err)
+	}
+}
