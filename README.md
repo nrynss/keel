@@ -59,6 +59,10 @@ else is pure Go, and `CGO_ENABLED=0` builds the whole module.
 | `providertask` | Provider tasks recorded by idempotency key, created once, polled to a verdict, driven by one process at a time under a lease, with a query window refusal and jittered backoff |
 | `identity` | Guest sessions resolved from a signed cookie or a bearer token, sign-in by emailed code or an external provider, guest upgrade with a conflict rule, and account deletion as one resumable job |
 
+The table lists the packages an application imports, and the paragraph below it names the SQLite
+store packages. The one exception is `tools/conventions`, which serves this repository's own
+checks and no consumer, so it takes no row.
+
 The stores that need SQLite live one directory down, in `cache/sqlitestore`,
 `job/sqlitestore`, `mediastore/sqlitestore`, `mediastore/s3/sqlitestore`,
 `cost/sqlitestore`, `flag/sqlitestore`, `lease/sqlitestore`, `outbox/sqlitestore`,
@@ -1173,10 +1177,12 @@ on v0, a minor release may break it. Once v1 lands, a breaking change needs a ma
 ./tools/check.sh
 ```
 
-That runs the same twelve checks CI runs: formatting, vet, staticcheck, a `CGO_ENABLED=0` build,
-the race-enabled tests, two content scans, three dependency-boundary checks that keep SQLite, the
-TOML parser and the PDF library inside their packages, a convention checker, and the frozen-API diff. It needs
-`ffmpeg` and `ffprobe` on `PATH` for the media tests.
+That runs the same fourteen checks CI runs. Five of them walk the dependency edges, keeping SQLite
+and its driver chain, the TOML parser, the PDF library and the object storage client inside their packages.
+The rest cover formatting, vet, staticcheck, a `CGO_ENABLED=0` build, the race-enabled tests, the two
+content scans, the convention checker and the frozen-API diff. It needs
+`ffmpeg` and `ffprobe` on `PATH` for the media tests. The Packages table is verified against
+`go list` package for package at every landing, so the table and the module cannot drift.
 
 ## License
 
