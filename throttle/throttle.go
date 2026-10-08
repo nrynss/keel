@@ -306,7 +306,10 @@ func (g *Gate) Retry(ctx context.Context, cfg Config, retryable Retryable, call 
 			return interrupted(serr, err)
 		}
 		waited += waitFor
-		if backoff *= 2; backoff > ceiling {
+		// A doubling past the top of int64 wraps negative, and jitter on a
+		// negative backoff waits nothing. Either bound answers the ceiling,
+		// as the hint wait's guard below does.
+		if backoff *= 2; backoff <= 0 || backoff > ceiling {
 			backoff = ceiling
 		}
 	}
