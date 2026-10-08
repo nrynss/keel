@@ -15,7 +15,7 @@ nothing logs on its own, and nothing panics.
 ## Install
 
 ```bash
-go get github.com/nrynss/keel@v0.6.0
+go get github.com/nrynss/keel@v0.7.0
 ```
 
 Go 1.27 or newer. The `ffmpeg` package runs the `ffmpeg` and `ffprobe` binaries, so install those
