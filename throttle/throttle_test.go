@@ -558,6 +558,38 @@ func TestRetryHintOverflowStillWaitsTheCap(t *testing.T) {
 	}
 }
 
+// TestRetryBackoffOverflowStillPaces pins the guard on the doubling. A
+// Backoff above half the top of int64 wraps negative on the first double,
+// and a negative backoff would jitter every later wait to zero. The first
+// wait rides the cap clamp, and every later wait must pace at the ceiling
+// instead of collapsing.
+func TestRetryBackoffOverflowStillPaces(t *testing.T) {
+	rec := &sleepRecorder{}
+	ceiling := time.Minute
+	backoff := time.Duration(math.MaxInt64/2) + 1 // the wrap happens on the first double
+	cfg := Config{
+		Attempts: 4,
+		Backoff:  backoff,
+		Max:      ceiling,
+		randN:    zero, // every wait sits at the bottom of its jitter range
+		Sleep:    rec.sleep,
+	}
+	calls := 0
+	if err := Retry(context.Background(), cfg, retryable, func() error {
+		calls++
+		return errLimited
+	}); !errors.Is(err, errLimited) {
+		t.Fatalf("err = %v, want it to wrap %v", err, errLimited)
+	}
+	if calls != 4 {
+		t.Fatalf("calls = %d, want 4", calls)
+	}
+	w := rec.waits()
+	if len(w) != 3 || w[0] != ceiling || w[1] != ceiling/2 || w[2] != ceiling/2 {
+		t.Fatalf("waits = %v, want [%d %d %d]: the ceiling pace after the wrap, never zero", w, ceiling, ceiling/2, ceiling/2)
+	}
+}
+
 // TestRetryGarbledHintFallsBack pins that a hint which is not positive is no
 // hint. A caller can overflow a huge value into a negative duration, and
 // waiting nothing at all would be a retry hammer.
