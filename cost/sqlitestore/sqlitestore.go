@@ -55,10 +55,11 @@
 // two isolated stores, which is how a dollar budget and a provider-credit
 // budget stay apart in one file. The empty namespace keeps the historical
 // table names, cost_charge and the rest, so a file an earlier version wrote
-// under the default namespace reads its rows with no migration. Open clears
+// under the default namespace reads its rows with no migration. Open sweeps
 // a ledger whose tables are all absent and applies the schema again, so
-// such a file opens as the fresh store its tables describe. A table set
-// that is only partly present is corruption, and the open refuses it.
+// such a file opens as the fresh store its tables describe. A partly
+// present table set beside a complete ledger is corruption, and the open
+// refuses it.
 //
 // A store speaks one Denomination for its whole life: its ceiling, its
 // owners, its grants and its ledger. The zero denomination is USD
@@ -309,15 +310,23 @@ type Reservation struct {
 // configured ceiling and purges reservations that already expired, so a restart
 // frees the budget a dead process was holding. It refuses a file whose stored
 // denomination differs from cfg.Denomination, because a reopen under another
-// name would silently reprice every recorded amount. Open also reconciles the
-// migration ledger with the tables it names. A ledger whose tables are all
-// absent is cleared and applied again, so the file opens as the fresh store
-// its tables describe. The rows under any other names stay on disk unread.
-// A table set that is only partly present refuses the open with ErrInvalid,
-// because no ordinary path leaves part of a schema behind. A cancelled context
-// stops the open and no store comes back, but the schema, its migration ledger
-// row and the ceiling may already have landed. Those bytes are inert, so a
-// caller may retry the open and a second open on the same file is unaffected.
+// name would silently reprice every recorded amount. Open also reconciles
+// the migration ledger with the tables it names. The reconciliation covers
+// the states this package's own paths can produce. A ledger whose tables
+// are all absent is swept and the schema is applied again, so the file
+// opens as the fresh store its tables describe. The rows under any other
+// names stay on disk unread. The sweep is one guarded statement, so a
+// concurrent open of the same file can never erase ledger rows whose
+// tables already exist. A partly present table set beside a complete
+// ledger refuses the open with ErrInvalid, because no path in this package
+// leaves it behind on its own. A ledger short beside a full table set is a
+// state the reconciliation does not cover. Open runs the migration runner
+// before it reconciles, so such a file fails in the runner first, and the
+// guard is what keeps that state from ever forming. A cancelled context
+// stops the open and no store comes back, but the schema, its migration
+// ledger row and the ceiling may already have landed. Those bytes are
+// inert, so a caller may retry the open and a second open on the same file
+// is unaffected.
 func Open(ctx context.Context, cfg Config) (*Store, error) {
 	if cfg.DB == nil {
 		return nil, fmt.Errorf("sqlitestore: open: %w: DB must not be nil", ErrInvalid)
@@ -400,24 +409,24 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 // the namespace prefix and serves the result as a small in-memory tree. The
 // migration runner sees the original file names, so the ledger records them
 // unchanged.
-func qualifiedSchema(source fs.FS, namespace string) (fs.FS, error) {
+func qualifiedSchema(source fs.FS, namespace string) (schemaTree, error) {
 	names, err := fs.Glob(source, "*.sql")
 	if err != nil {
-		return nil, fmt.Errorf("sqlitestore: open: %w", err)
+		return schemaTree{}, fmt.Errorf("sqlitestore: open: %w", err)
 	}
 	files := make(map[string][]byte, len(names))
 	for _, name := range names {
 		body, err := fs.ReadFile(source, name)
 		if err != nil {
-			return nil, fmt.Errorf("sqlitestore: open: %w", err)
+			return schemaTree{}, fmt.Errorf("sqlitestore: open: %w", err)
 		}
 		if !bytes.Contains(body, []byte(schemaTable)) {
-			return nil, fmt.Errorf("sqlitestore: open: %s carries no %s token", name, schemaTable)
+			return schemaTree{}, fmt.Errorf("sqlitestore: open: %s carries no %s token", name, schemaTable)
 		}
 		files[name] = bytes.ReplaceAll(body, []byte(schemaTable), []byte(namespace))
 	}
 	if len(files) == 0 {
-		return nil, fmt.Errorf("sqlitestore: open: %w: no migration files", ErrInvalid)
+		return schemaTree{}, fmt.Errorf("sqlitestore: open: %w: no migration files", ErrInvalid)
 	}
 	return schemaTree{files: files}, nil
 }
@@ -428,6 +437,12 @@ func qualifiedSchema(source fs.FS, namespace string) (fs.FS, error) {
 type schemaTree struct {
 	files map[string][]byte
 }
+
+// fileCount returns how many migration files the tree serves. The
+// reconciliation compares it with the ledger's row count, so a ledger that
+// vouches for a complete schema is recognised even while its tables are
+// partly gone.
+func (t schemaTree) fileCount() int { return len(t.files) }
 
 // Open returns one migration file of the tree as an fs.File.
 func (t schemaTree) Open(name string) (fs.File, error) {
@@ -514,12 +529,16 @@ func (e schemaEntry) Info() (fs.FileInfo, error) { return e, nil }
 
 // reconcileSchema aligns the migration ledger with the qualified tables on
 // disk. A ledger whose tables are all absent vouches for a schema this
-// prefix cannot see. Clearing the ledger and applying the files again opens
-// the file as the fresh store its tables describe, and the rows under other
-// names stay on disk unread. A partly present table set is corruption,
-// because every migration commits whole or not at all, so the open refuses
-// it instead of healing it.
-func (s *Store) reconcileSchema(ctx context.Context, namespace string, schema fs.FS) error {
+// prefix cannot see, so the sweep clears it and the runner applies the
+// files again. The file then opens as the fresh store its tables describe,
+// and the rows under other names stay on disk unread. A partly present
+// table set beside a complete ledger is dropped-table corruption, so the
+// open refuses it instead of healing it. The sweep is one guarded
+// statement. The guard re-counts the qualified tables inside the write
+// lock the delete itself takes. The ledger therefore only ever loses rows
+// while no table of this store exists. Concurrent opens of one file
+// converge through the runner's per-file records.
+func (s *Store) reconcileSchema(ctx context.Context, namespace string, schema schemaTree) error {
 	names := s.tables.names()
 	present, err := s.countPresentTables(ctx, names)
 	if err != nil {
@@ -528,27 +547,57 @@ func (s *Store) reconcileSchema(ctx context.Context, namespace string, schema fs
 	switch {
 	case present == len(names):
 		return nil
-	case present == 0:
-		// The delete lands before the runner re-applies, so a crash
-		// between the two leaves an empty ledger and absent tables, a
-		// state the next open applies cleanly. Two processes resetting
-		// one stranded file converge through the runner's own
-		// concurrent-open handling.
-		if _, err := s.db.Writer().ExecContext(ctx,
-			`DELETE FROM `+namespace+schemaLedgerSuffix); err != nil {
-			return fmt.Errorf("sqlitestore: clear the migration ledger: %w", err)
+	case present > 0:
+		// A partly present set with a full ledger means tables of a
+		// recorded schema are gone. Nothing in this package deletes a
+		// table, so healing would bury outside damage instead of
+		// reporting it.
+		rows, err := s.countLedgerRows(ctx, namespace)
+		if err != nil {
+			return err
 		}
-		if err := sqlite.Migrate(ctx, s.db, namespace, schema); err != nil {
-			return fmt.Errorf("sqlitestore: re-apply the schema: %w", err)
+		if rows == schema.fileCount() {
+			return fmt.Errorf("sqlitestore: namespace %q holds %d of its %d tables: %w",
+				namespace, present, len(names), ErrInvalid)
 		}
-		s.log.WarnContext(ctx,
-			"sqlitestore: the migration ledger recorded tables that were absent, so the schema was applied again",
-			"namespace", namespace)
-		return nil
-	default:
-		return fmt.Errorf("sqlitestore: namespace %q holds %d of its %d tables: %w",
-			namespace, present, len(names), ErrInvalid)
 	}
+	// The guard and the erase share one statement, and SQLite holds the
+	// write lock across the whole statement. No other open can commit
+	// between the guard's count and the delete, so the ledger only ever
+	// loses rows while no table of this store exists. A concurrent open's
+	// recorded rows therefore survive this sweep, and the re-apply
+	// converges with concurrent opens through the runner's per-file
+	// records. A crash between the sweep and the re-apply leaves an empty
+	// ledger beside absent tables, a state the next open applies cleanly.
+	placeholders := strings.TrimSuffix(strings.Repeat("?, ", len(names)), ", ")
+	stmt := `DELETE FROM ` + namespace + schemaLedgerSuffix +
+		` WHERE 0 = (SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN (` + placeholders + `))`
+	args := make([]any, len(names))
+	for i, name := range names {
+		args[i] = name
+	}
+	if _, err := s.db.Writer().ExecContext(ctx, stmt, args...); err != nil {
+		return fmt.Errorf("sqlitestore: clear the migration ledger: %w", err)
+	}
+	if err := sqlite.Migrate(ctx, s.db, namespace, schema); err != nil {
+		return fmt.Errorf("sqlitestore: re-apply the schema: %w", err)
+	}
+	s.log.WarnContext(ctx,
+		"sqlitestore: the migration ledger disagreed with the qualified tables, so the schema was applied again",
+		"namespace", namespace, "tables_present", present)
+	return nil
+}
+
+// countLedgerRows counts the rows of this namespace's migration ledger. The
+// runner creates the ledger before Open reconciles, so the table is always
+// there when this runs.
+func (s *Store) countLedgerRows(ctx context.Context, namespace string) (int, error) {
+	var rows int
+	if err := s.db.Writer().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM `+namespace+schemaLedgerSuffix).Scan(&rows); err != nil {
+		return 0, fmt.Errorf("sqlitestore: count the migration ledger rows: %w", err)
+	}
+	return rows, nil
 }
 
 // countPresentTables counts how many of the store's qualified tables exist.

@@ -7,11 +7,13 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/nrynss/keel/cost"
 	"github.com/nrynss/keel/cost/sqlitestore"
+	"github.com/nrynss/keel/sqlite"
 )
 
 // withNamespace sets the schema namespace the store owns.
@@ -378,14 +380,18 @@ func TestStrandedLedgerReopensAsAFreshStore(t *testing.T) {
 
 // TestOpenRefusesAPartialTableSet drops one table from a working namespace
 // store and reopens. Every migration commits whole or not at all, so a
-// schema one table short is corruption no ordinary path produces. The open
-// must refuse it with ErrInvalid instead of healing it.
+// schema one table short is corruption no ordinary path produces. The
+// ledger stays complete, so the open must refuse the file with ErrInvalid
+// instead of healing it.
 func TestOpenRefusesAPartialTableSet(t *testing.T) {
 	const namespace = "credits"
 	path := filepath.Join(t.TempDir(), "cost.db")
 	openStore(t, path, withNamespace(namespace), withLimit(1000))
 	if _, err := openFresh(t, path).Exec(`DROP TABLE ` + namespace + `_grant`); err != nil {
 		t.Fatalf("drop a qualified table: %v", err)
+	}
+	if n := freshCount(t, path, namespace+"_schema_migrations"); n != 6 {
+		t.Fatalf("migration ledger rows = %d, want the complete six the refusal reads", n)
 	}
 	_, err := sqlitestore.Open(t.Context(), sqlitestore.Config{
 		DB:        openDB(t, path),
@@ -420,5 +426,183 @@ func TestLedgerTableMirrorsTheRunnerNaming(t *testing.T) {
 	}
 	if n := freshCount(t, path, namespace+"_schema_migrations"); n != want {
 		t.Fatalf("migration ledger rows = %d, want one per migration file (%d)", n, want)
+	}
+}
+
+// freshPresentTables counts the qualified tables a namespace owns, read over
+// a fresh connection with every name bound as an argument. The suffixes
+// list every table the migrations create.
+func freshPresentTables(t *testing.T, path, namespace string) int {
+	t.Helper()
+	suffixes := []string{
+		"charge", "budget", "reservation", "owner_budget",
+		"settle", "settle_once", "grant", "quote",
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?, ", len(suffixes)), ", ")
+	args := make([]any, len(suffixes))
+	for i, suffix := range suffixes {
+		args[i] = namespace + "_" + suffix
+	}
+	var n int
+	if err := openFresh(t, path).QueryRow(
+		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN (`+placeholders+`)`,
+		args...).Scan(&n); err != nil {
+		t.Fatalf("count the qualified tables: %v", err)
+	}
+	return n
+}
+
+// strandedFixtureFile hand-builds the file an earlier layout leaves behind
+// under a custom namespace: the rows sit under the fixed default names
+// while a full ledger records every migration as applied for the qualified
+// prefix. The seed connection closes before the call returns, so the file
+// is quiescent for the opens that follow.
+func strandedFixtureFile(t *testing.T, path, namespace string) {
+	t.Helper()
+	seed := openFresh(t, path)
+	schema := strings.ReplaceAll(fixedNameSchema,
+		"cost_schema_migrations", namespace+"_schema_migrations")
+	if _, err := seed.Exec(schema); err != nil {
+		t.Fatalf("build the stranded schema: %v", err)
+	}
+	if _, err := seed.Exec(
+		`INSERT INTO cost_charge (kind, units, unit_price, ref, denomination, created_at)
+			VALUES ('gen', 3, 10, 'job-1', '', 0)`); err != nil {
+		t.Fatalf("seed a charge under the old names: %v", err)
+	}
+	if err := seed.Close(); err != nil {
+		t.Fatalf("close the seed connection: %v", err)
+	}
+}
+
+// TestConcurrentOpensOfAStrandedFileConverge opens one stranded fixture
+// from three handles at once, round after round. The sweep at open holds
+// its guard and its erase in one statement, so no opener can erase the rows
+// another opener's re-apply has already recorded. Every open must succeed
+// or refuse with ErrInvalid, and every round must leave the file
+// consistent, with a full ledger beside its eight tables and a canary open
+// that succeeds.
+func TestConcurrentOpensOfAStrandedFileConverge(t *testing.T) {
+	const (
+		namespace = "credits"
+		rounds    = 8
+		openers   = 3
+	)
+	ctx := t.Context()
+	credit := cost.Denomination{Name: "credit", Minor: 1}
+	for round := 0; round < rounds; round++ {
+		path := filepath.Join(t.TempDir(), "cost.db")
+		strandedFixtureFile(t, path, namespace)
+
+		handles := make([]*sqlite.DB, openers)
+		results := make([]error, openers)
+		for i := range handles {
+			handles[i] = openDB(t, path)
+		}
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		for i := range handles {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				<-start
+				cfg := sqlitestore.Config{
+					DB:           handles[i],
+					Namespace:    namespace,
+					Limit:        1000,
+					Denomination: credit,
+					Logger:       slog.New(slog.DiscardHandler),
+				}
+				_, results[i] = sqlitestore.Open(ctx, cfg)
+			}(i)
+		}
+		close(start)
+		wg.Wait()
+		for i, err := range results {
+			if err == nil || errors.Is(err, sqlitestore.ErrInvalid) {
+				continue
+			}
+			t.Fatalf("round %d opener %d failed with an unclassified error: %v", round, i, err)
+		}
+
+		// The file must have converged whichever opener won the race. A
+		// canary open succeeds, the ledger holds one row per migration
+		// file, and all eight qualified tables exist beside it.
+		canary := openStore(t, path, withNamespace(namespace), withLimit(1000), withDenomination(credit))
+		if _, err := canary.Charges(ctx); err != nil {
+			t.Fatalf("round %d canary read: %v", round, err)
+		}
+		if n := freshCount(t, path, namespace+"_schema_migrations"); n != 6 {
+			t.Fatalf("round %d migration ledger rows = %d, want 6", round, n)
+		}
+		if n := freshPresentTables(t, path, namespace); n != 8 {
+			t.Fatalf("round %d qualified tables present = %d, want 8", round, n)
+		}
+	}
+}
+
+// TestReopenFinishesAnInterruptedReapply hand-builds the state a crash mid
+// re-apply leaves. The sweep has cleared the ledger, files 0001 through
+// 0003 of the re-apply have committed, and the rest have not. The reopen
+// must finish the remaining files instead of failing on the tables that
+// already stand, and the rows the first three files recorded must survive
+// untouched. Their hand-inserted stamps read zero, so a surviving stamp
+// proves the reopen spared them rather than erasing and re-recording them.
+func TestReopenFinishesAnInterruptedReapply(t *testing.T) {
+	const namespace = "credits"
+	path := filepath.Join(t.TempDir(), "cost.db")
+	strandedFixtureFile(t, path, namespace)
+
+	observer := openFresh(t, path)
+	if _, err := observer.Exec(`DELETE FROM ` + namespace + `_schema_migrations`); err != nil {
+		t.Fatalf("play the ledger sweep: %v", err)
+	}
+	entries, err := os.ReadDir("migrations")
+	if err != nil {
+		t.Fatalf("list the migration files: %v", err)
+	}
+	for _, entry := range entries[:3] {
+		body, err := os.ReadFile(filepath.Join("migrations", entry.Name()))
+		if err != nil {
+			t.Fatalf("read %s: %v", entry.Name(), err)
+		}
+		rewritten := strings.ReplaceAll(string(body), "{{table}}", namespace)
+		if _, err := observer.Exec(rewritten); err != nil {
+			t.Fatalf("apply %s: %v", entry.Name(), err)
+		}
+		if _, err := observer.Exec(
+			`INSERT INTO `+namespace+`_schema_migrations (filename, applied_at) VALUES (?, 0)`,
+			entry.Name()); err != nil {
+			t.Fatalf("record %s: %v", entry.Name(), err)
+		}
+	}
+	if n := freshCount(t, path, namespace+"_schema_migrations"); n != 3 {
+		t.Fatalf("mid-reapply ledger rows = %d, want 3", n)
+	}
+	if n := freshPresentTables(t, path, namespace); n != 5 {
+		t.Fatalf("mid-reapply qualified tables present = %d, want the five of the first three files", n)
+	}
+
+	store := openStore(t, path, withNamespace(namespace), withLimit(1000))
+	ctx := t.Context()
+	if err := store.Add(ctx, cost.Charge{Kind: "gen", Units: 1, UnitPrice: 5, Ref: "fresh-1"}); err != nil {
+		t.Fatalf("add over the converged store: %v", err)
+	}
+	if got, err := store.Charges(ctx); err != nil || len(got) != 1 {
+		t.Fatalf("charges over the converged store = %+v (err %v), want the one fresh charge", got, err)
+	}
+	if n := freshCount(t, path, namespace+"_schema_migrations"); n != 6 {
+		t.Fatalf("ledger rows after the reopen = %d, want 6", n)
+	}
+	if n := freshPresentTables(t, path, namespace); n != 8 {
+		t.Fatalf("qualified tables present after the reopen = %d, want 8", n)
+	}
+	var spared int
+	if err := openFresh(t, path).QueryRow(
+		`SELECT COUNT(*) FROM ` + namespace + `_schema_migrations WHERE applied_at = 0`).Scan(&spared); err != nil {
+		t.Fatalf("read the surviving stamps: %v", err)
+	}
+	if spared != 3 {
+		t.Fatalf("rows still carrying their original stamp = %d, want the 3 the reopen had to spare", spared)
 	}
 }
