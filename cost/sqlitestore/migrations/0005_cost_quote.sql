@@ -1,4 +1,4 @@
-CREATE TABLE cost_quote (
+CREATE TABLE {{table}}_quote (
     id               TEXT    PRIMARY KEY,
     owner            TEXT    NOT NULL,
     price_nd         INTEGER NOT NULL,
@@ -12,11 +12,11 @@ CREATE TABLE cost_quote (
     created_at       INTEGER NOT NULL
 );
 
-CREATE INDEX cost_quote_expires ON cost_quote (expires_at);
-CREATE INDEX cost_quote_owner ON cost_quote (owner);
+CREATE INDEX {{table}}_quote_expires ON {{table}}_quote (expires_at);
+CREATE INDEX {{table}}_quote_owner ON {{table}}_quote (owner);
 -- The claim index is partial because only claimed rows carry a claim
 -- deadline. Open and done rows keep claim_expires_at at 0, which sits
 -- inside the sweep's range, so a full index would make every quote write
 -- fetch and reject every live row. The partial form bounds the index to
 -- the handful of rows a claim holds right now.
-CREATE INDEX cost_quote_claim ON cost_quote (claim_expires_at) WHERE state = 'claimed';
+CREATE INDEX {{table}}_quote_claim ON {{table}}_quote (claim_expires_at) WHERE state = 'claimed';

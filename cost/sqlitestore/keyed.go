@@ -48,7 +48,7 @@ func (k *KeyedBudget) SetLimit(ctx context.Context, owner string, limit cost.Pri
 	if limit < 0 {
 		return fmt.Errorf("sqlitestore: set owner limit %d: %w", limit, cost.ErrNegativeLimit)
 	}
-	const query = `INSERT INTO cost_owner_budget (owner, limit_nd, spent_nd) VALUES (?, ?, 0)
+	query := `INSERT INTO ` + k.store.tables.ownerBudget + ` (owner, limit_nd, spent_nd) VALUES (?, ?, 0)
 		ON CONFLICT(owner) DO UPDATE SET limit_nd = excluded.limit_nd`
 	if _, err := k.store.db.Writer().ExecContext(ctx, query, owner, int64(limit)); err != nil {
 		return fmt.Errorf("sqlitestore: set owner limit: %w", err)
@@ -82,10 +82,10 @@ func (k *KeyedBudget) Reserve(ctx context.Context, owner string, estimate cost.P
 	}
 	defer func() { _ = tx.Rollback() }() // a committed transaction rolls back to a no-op
 	if _, err := tx.ExecContext(ctx,
-		`DELETE FROM cost_reservation WHERE expires_at <= ?`, now.UnixMilli()); err != nil {
+		`DELETE FROM `+k.store.tables.reservation+` WHERE expires_at <= ?`, now.UnixMilli()); err != nil {
 		return Reservation{}, fmt.Errorf("sqlitestore: reserve: purge expired: %w", err)
 	}
-	owned, err := loadOwner(ctx, tx, owner, now, k.store.windowSince(now))
+	owned, err := k.store.loadOwner(ctx, tx, owner, now, k.store.windowSince(now))
 	if err != nil {
 		return Reservation{}, fmt.Errorf("sqlitestore: reserve: %w", err)
 	}
@@ -115,7 +115,7 @@ func (k *KeyedBudget) Reserve(ctx context.Context, owner string, estimate cost.P
 	}
 	expires := now.Add(k.store.reservationTTL)
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO cost_reservation (id, owner, amount_nd, expires_at, created_at) VALUES (?, ?, ?, ?, ?)`,
+		`INSERT INTO `+k.store.tables.reservation+` (id, owner, amount_nd, expires_at, created_at) VALUES (?, ?, ?, ?, ?)`,
 		reservationID, owner, int64(estimate), expires.UnixMilli(), now.UnixMilli()); err != nil {
 		return Reservation{}, fmt.Errorf("sqlitestore: reserve: %w", err)
 	}
@@ -146,7 +146,7 @@ func (k *KeyedBudget) Settle(ctx context.Context, owner string, r Reservation, a
 		return fmt.Errorf("sqlitestore: settle: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }() // a committed transaction rolls back to a no-op
-	if err := settleOwnerBooks(ctx, tx, k.store.now(), owner, actual, r.ID); err != nil {
+	if err := k.store.settleOwnerBooks(ctx, tx, k.store.now(), owner, actual, r.ID); err != nil {
 		return fmt.Errorf("sqlitestore: settle: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -179,7 +179,7 @@ func (k *KeyedBudget) SettleOnce(ctx context.Context, owner string, r Reservatio
 		return false, fmt.Errorf("sqlitestore: settle once: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }() // a committed transaction rolls back to a no-op
-	inserted, err := insertSettleOnce(ctx, tx, k.store.now(), kind, ref)
+	inserted, err := k.store.insertSettleOnce(ctx, tx, k.store.now(), kind, ref)
 	if err != nil {
 		return false, fmt.Errorf("sqlitestore: settle once: %w", err)
 	}
@@ -189,7 +189,7 @@ func (k *KeyedBudget) SettleOnce(ctx context.Context, owner string, r Reservatio
 		// mistyped owner is named instead of silently freed.
 		var one int
 		err := tx.QueryRowContext(ctx,
-			`SELECT 1 FROM cost_owner_budget WHERE owner = ?`, owner).Scan(&one)
+			`SELECT 1 FROM `+k.store.tables.ownerBudget+` WHERE owner = ?`, owner).Scan(&one)
 		if errors.Is(err, sql.ErrNoRows) {
 			return false, fmt.Errorf("sqlitestore: settle once: owner %q: %w", owner, cost.ErrUnknownOwner)
 		}
@@ -198,7 +198,7 @@ func (k *KeyedBudget) SettleOnce(ctx context.Context, owner string, r Reservatio
 		}
 		if r.ID != "" {
 			if _, err := tx.ExecContext(ctx,
-				`DELETE FROM cost_reservation WHERE id = ? AND owner = ?`, r.ID, owner); err != nil {
+				`DELETE FROM `+k.store.tables.reservation+` WHERE id = ? AND owner = ?`, r.ID, owner); err != nil {
 				return false, fmt.Errorf("sqlitestore: settle once: %w", err)
 			}
 		}
@@ -207,7 +207,7 @@ func (k *KeyedBudget) SettleOnce(ctx context.Context, owner string, r Reservatio
 		}
 		return false, nil
 	}
-	if err := settleOwnerBooks(ctx, tx, k.store.now(), owner, actual, r.ID); err != nil {
+	if err := k.store.settleOwnerBooks(ctx, tx, k.store.now(), owner, actual, r.ID); err != nil {
 		return false, fmt.Errorf("sqlitestore: settle once: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -221,14 +221,14 @@ func (k *KeyedBudget) SettleOnce(ctx context.Context, owner string, r Reservatio
 // owner's name, the grant draw and the hold release. It reads both spent
 // totals first, so an unknown owner or an overflow refuses before any write
 // lands. The caller owns the transaction and the commit.
-func settleOwnerBooks(ctx context.Context, tx *sql.Tx, now time.Time, owner string, actual cost.Price, holdID string) error {
+func (s *Store) settleOwnerBooks(ctx context.Context, tx *sql.Tx, now time.Time, owner string, actual cost.Price, holdID string) error {
 	var spent, ownerSpent int64
 	if err := tx.QueryRowContext(ctx,
-		`SELECT spent_nd FROM cost_budget WHERE id = 1`).Scan(&spent); err != nil {
+		`SELECT spent_nd FROM `+s.tables.budget+` WHERE id = 1`).Scan(&spent); err != nil {
 		return err
 	}
 	if err := tx.QueryRowContext(ctx,
-		`SELECT spent_nd FROM cost_owner_budget WHERE owner = ?`, owner).Scan(&ownerSpent); err != nil {
+		`SELECT spent_nd FROM `+s.tables.ownerBudget+` WHERE owner = ?`, owner).Scan(&ownerSpent); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("owner %q: %w", owner, cost.ErrUnknownOwner)
 		}
@@ -243,24 +243,24 @@ func settleOwnerBooks(ctx context.Context, tx *sql.Tx, now time.Time, owner stri
 		return err
 	}
 	if _, err := tx.ExecContext(ctx,
-		`UPDATE cost_budget SET spent_nd = ? WHERE id = 1`, int64(nextSpent)); err != nil {
+		`UPDATE `+s.tables.budget+` SET spent_nd = ? WHERE id = 1`, int64(nextSpent)); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx,
-		`UPDATE cost_owner_budget SET spent_nd = ? WHERE owner = ?`, int64(nextOwnerSpent), owner); err != nil {
+		`UPDATE `+s.tables.ownerBudget+` SET spent_nd = ? WHERE owner = ?`, int64(nextOwnerSpent), owner); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO cost_settle (owner, amount_nd, created_at) VALUES (?, ?, ?)`,
+		`INSERT INTO `+s.tables.settle+` (owner, amount_nd, created_at) VALUES (?, ?, ?)`,
 		owner, int64(actual), now.UnixMilli()); err != nil {
 		return err
 	}
-	if err := drawGrants(ctx, tx, now, actual); err != nil {
+	if err := s.drawGrants(ctx, tx, now, actual); err != nil {
 		return err
 	}
 	if holdID != "" {
 		if _, err := tx.ExecContext(ctx,
-			`DELETE FROM cost_reservation WHERE id = ? AND owner = ?`, holdID, owner); err != nil {
+			`DELETE FROM `+s.tables.reservation+` WHERE id = ? AND owner = ?`, holdID, owner); err != nil {
 			return err
 		}
 	}
@@ -283,7 +283,7 @@ func (k *KeyedBudget) Release(ctx context.Context, owner string, r Reservation) 
 	}
 	var one int
 	err := k.store.db.Reader().QueryRowContext(ctx,
-		`SELECT 1 FROM cost_owner_budget WHERE owner = ?`, owner).Scan(&one)
+		`SELECT 1 FROM `+k.store.tables.ownerBudget+` WHERE owner = ?`, owner).Scan(&one)
 	if errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("sqlitestore: release: owner %q: %w", owner, cost.ErrUnknownOwner)
 	}
@@ -291,7 +291,7 @@ func (k *KeyedBudget) Release(ctx context.Context, owner string, r Reservation) 
 		return fmt.Errorf("sqlitestore: release: %w", err)
 	}
 	if _, err := k.store.db.Writer().ExecContext(ctx,
-		`DELETE FROM cost_reservation WHERE id = ? AND owner = ?`, r.ID, owner); err != nil {
+		`DELETE FROM `+k.store.tables.reservation+` WHERE id = ? AND owner = ?`, r.ID, owner); err != nil {
 		return fmt.Errorf("sqlitestore: release: %w", err)
 	}
 	return nil
@@ -310,7 +310,7 @@ func (k *KeyedBudget) Remaining(ctx context.Context, owner string) (cost.Price, 
 		return 0, emptyOwner("remaining")
 	}
 	now := k.store.now()
-	owned, err := loadOwner(ctx, k.store.db.Reader(), owner, now, k.store.windowSince(now))
+	owned, err := k.store.loadOwner(ctx, k.store.db.Reader(), owner, now, k.store.windowSince(now))
 	if err != nil {
 		return 0, err
 	}
@@ -327,14 +327,14 @@ func (k *KeyedBudget) SpentSince(ctx context.Context, owner string, t time.Time)
 	}
 	var one int
 	err := k.store.db.Reader().QueryRowContext(ctx,
-		`SELECT 1 FROM cost_owner_budget WHERE owner = ?`, owner).Scan(&one)
+		`SELECT 1 FROM `+k.store.tables.ownerBudget+` WHERE owner = ?`, owner).Scan(&one)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, fmt.Errorf("sqlitestore: spend since: owner %q: %w", owner, cost.ErrUnknownOwner)
 	}
 	if err != nil {
 		return 0, fmt.Errorf("sqlitestore: spend since: %w", err)
 	}
-	return sumSettles(ctx, k.store.db.Reader(), owner, t.UnixMilli())
+	return k.store.sumSettles(ctx, k.store.db.Reader(), owner, t.UnixMilli())
 }
 
 // ForgetOwner removes every row keyed to owner: the ceiling row in
@@ -365,13 +365,13 @@ func (k *KeyedBudget) ForgetOwner(ctx context.Context, owner string) error {
 	// commits first and is refused below, or waits and then finds no
 	// ceiling row, so no hold outlives the owner it was taken for.
 	if _, err := tx.ExecContext(ctx,
-		`DELETE FROM cost_reservation WHERE owner = ? AND expires_at <= ?`,
+		`DELETE FROM `+k.store.tables.reservation+` WHERE owner = ? AND expires_at <= ?`,
 		owner, now.UnixMilli()); err != nil {
 		return fmt.Errorf("sqlitestore: forget owner: purge expired: %w", err)
 	}
 	var live int
 	if err := tx.QueryRowContext(ctx,
-		`SELECT EXISTS (SELECT 1 FROM cost_reservation WHERE owner = ? AND expires_at > ?)`,
+		`SELECT EXISTS (SELECT 1 FROM `+k.store.tables.reservation+` WHERE owner = ? AND expires_at > ?)`,
 		owner, now.UnixMilli()).Scan(&live); err != nil {
 		return fmt.Errorf("sqlitestore: forget owner: %w", err)
 	}
@@ -380,7 +380,7 @@ func (k *KeyedBudget) ForgetOwner(ctx context.Context, owner string) error {
 	}
 	var known int
 	if err := tx.QueryRowContext(ctx,
-		`SELECT EXISTS (SELECT 1 FROM cost_owner_budget WHERE owner = ?)`,
+		`SELECT EXISTS (SELECT 1 FROM `+k.store.tables.ownerBudget+` WHERE owner = ?)`,
 		owner).Scan(&known); err != nil {
 		return fmt.Errorf("sqlitestore: forget owner: %w", err)
 	}
@@ -388,11 +388,11 @@ func (k *KeyedBudget) ForgetOwner(ctx context.Context, owner string) error {
 		return fmt.Errorf("sqlitestore: forget owner: owner %q: %w", owner, cost.ErrUnknownOwner)
 	}
 	if _, err := tx.ExecContext(ctx,
-		`DELETE FROM cost_settle WHERE owner = ?`, owner); err != nil {
+		`DELETE FROM `+k.store.tables.settle+` WHERE owner = ?`, owner); err != nil {
 		return fmt.Errorf("sqlitestore: forget owner: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx,
-		`DELETE FROM cost_owner_budget WHERE owner = ?`, owner); err != nil {
+		`DELETE FROM `+k.store.tables.ownerBudget+` WHERE owner = ?`, owner); err != nil {
 		return fmt.Errorf("sqlitestore: forget owner: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -407,11 +407,11 @@ func (k *KeyedBudget) ForgetOwner(ctx context.Context, owner string) error {
 // after it, so the owner reads one window. It counts only reservations
 // whose expiry is still in the future, as loadGlobal does, and reports an
 // error matching cost.ErrUnknownOwner when no ceiling was set for owner.
-func loadOwner(ctx context.Context, q querier, owner string, now time.Time, since int64) (budgetState, error) {
+func (s *Store) loadOwner(ctx context.Context, q querier, owner string, now time.Time, since int64) (budgetState, error) {
 	var state budgetState
 	var limit, lifetime int64
 	err := q.QueryRowContext(ctx,
-		`SELECT limit_nd, spent_nd FROM cost_owner_budget WHERE owner = ?`, owner).Scan(&limit, &lifetime)
+		`SELECT limit_nd, spent_nd FROM `+s.tables.ownerBudget+` WHERE owner = ?`, owner).Scan(&limit, &lifetime)
 	if errors.Is(err, sql.ErrNoRows) {
 		return budgetState{}, fmt.Errorf("sqlitestore: owner %q: %w", owner, cost.ErrUnknownOwner)
 	}
@@ -422,7 +422,7 @@ func loadOwner(ctx context.Context, q querier, owner string, now time.Time, sinc
 	if since == 0 {
 		state.spent = cost.Price(lifetime)
 	} else {
-		spent, err := sumSettles(ctx, q, owner, since)
+		spent, err := s.sumSettles(ctx, q, owner, since)
 		if err != nil {
 			return budgetState{}, err
 		}
@@ -430,7 +430,7 @@ func loadOwner(ctx context.Context, q querier, owner string, now time.Time, sinc
 	}
 	var reserved int64
 	if err := q.QueryRowContext(ctx,
-		`SELECT COALESCE(SUM(amount_nd), 0) FROM cost_reservation WHERE owner = ? AND expires_at > ? AND created_at >= ?`,
+		`SELECT COALESCE(SUM(amount_nd), 0) FROM `+s.tables.reservation+` WHERE owner = ? AND expires_at > ? AND created_at >= ?`,
 		owner, now.UnixMilli(), since).Scan(&reserved); err != nil {
 		return budgetState{}, fmt.Errorf("sqlitestore: read owner reservations: %w", err)
 	}
