@@ -53,7 +53,7 @@ func (s *Store) Grant(ctx context.Context, amount cost.Price, expiresAt time.Tim
 	if key != "" {
 		var one int
 		err := tx.QueryRowContext(ctx,
-			`SELECT 1 FROM cost_grant WHERE grant_key = ?`, key).Scan(&one)
+			`SELECT 1 FROM `+s.tables.grant+` WHERE grant_key = ?`, key).Scan(&one)
 		if err == nil {
 			return fmt.Errorf("sqlitestore: grant %q: %w", key, ErrGrantRepeated)
 		}
@@ -62,7 +62,7 @@ func (s *Store) Grant(ctx context.Context, amount cost.Price, expiresAt time.Tim
 		}
 	}
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO cost_grant (amount_nd, drawn_nd, grant_key, expires_at, created_at)
+		`INSERT INTO `+s.tables.grant+` (amount_nd, drawn_nd, grant_key, expires_at, created_at)
 			VALUES (?, 0, ?, ?, ?)`,
 		int64(amount), key, expiresAt.UnixMilli(), now.UnixMilli()); err != nil {
 		return fmt.Errorf("sqlitestore: grant: %w", err)
@@ -79,14 +79,14 @@ func (s *Store) Grant(ctx context.Context, amount cost.Price, expiresAt time.Tim
 // that bound. It reports an error matching cost.ErrOverflow when the exact
 // balance leaves the int64 range.
 func (s *Store) Balance(ctx context.Context) (cost.Price, error) {
-	return grantBalance(ctx, s.db.Reader(), s.now())
+	return s.grantBalance(ctx, s.db.Reader(), s.now())
 }
 
-// grantBalance sums what the unexpired grants still fund. An empty or absent
+// grantBalance sums what the store's unexpired grants still fund. An empty
 // grant table answers zero.
-func grantBalance(ctx context.Context, q querier, now time.Time) (cost.Price, error) {
+func (s *Store) grantBalance(ctx context.Context, q querier, now time.Time) (cost.Price, error) {
 	rows, err := q.QueryContext(ctx,
-		`SELECT amount_nd, drawn_nd FROM cost_grant WHERE expires_at > ?`, now.UnixMilli())
+		`SELECT amount_nd, drawn_nd FROM `+s.tables.grant+` WHERE expires_at > ?`, now.UnixMilli())
 	if err != nil {
 		return 0, fmt.Errorf("sqlitestore: read grants: %w", err)
 	}
@@ -119,12 +119,12 @@ func grantBalance(ctx context.Context, q querier, now time.Time) (cost.Price, er
 // past the live pool places what fits, and the rest books as spend with
 // nothing behind it, exactly as a settle past the ceiling still books. The
 // caller holds the write transaction.
-func drawGrants(ctx context.Context, tx *sql.Tx, now time.Time, actual cost.Price) error {
+func (s *Store) drawGrants(ctx context.Context, tx *sql.Tx, now time.Time, actual cost.Price) error {
 	if actual == 0 {
 		return nil
 	}
 	rows, err := tx.QueryContext(ctx,
-		`SELECT id, amount_nd, drawn_nd FROM cost_grant WHERE expires_at > ?
+		`SELECT id, amount_nd, drawn_nd FROM `+s.tables.grant+` WHERE expires_at > ?
 			ORDER BY expires_at ASC, id ASC`,
 		now.UnixMilli())
 	if err != nil {
@@ -200,7 +200,7 @@ func drawGrants(ctx context.Context, tx *sql.Tx, now time.Time, actual cost.Pric
 			return err
 		}
 		if _, err := tx.ExecContext(ctx,
-			`UPDATE cost_grant SET drawn_nd = ? WHERE id = ?`, int64(drawn), g.id); err != nil {
+			`UPDATE `+s.tables.grant+` SET drawn_nd = ? WHERE id = ?`, int64(drawn), g.id); err != nil {
 			return fmt.Errorf("draw grant: %w", err)
 		}
 	}

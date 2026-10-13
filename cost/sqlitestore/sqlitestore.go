@@ -49,6 +49,18 @@
 // Totals and charges keep all history either way. Spend booked before this
 // version stays in the lifetime total and outside every window.
 //
+// Each namespace owns its migration ledger and its tables. A namespace
+// reads as lowercase, so two names that differ only in ASCII case are one
+// namespace. Two different namespaces therefore share one database file as
+// two isolated stores, which is how a dollar budget and a provider-credit
+// budget stay apart in one file. The empty namespace keeps the historical
+// table names, cost_charge and the rest, so a file an earlier version wrote
+// under the default namespace reads its rows with no migration. Open sweeps
+// a ledger whose tables are all absent and applies the schema again, so
+// such a file opens as the fresh store its tables describe. A partly
+// present table set beside a ledger holding at least one row per file this
+// binary carries is corruption, and the open refuses it.
+//
 // A store speaks one Denomination for its whole life: its ceiling, its
 // owners, its grants and its ledger. The zero denomination is USD
 // nanodollars, the behaviour every store had before denominations existed.
@@ -90,6 +102,7 @@
 package sqlitestore
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"embed"
@@ -97,6 +110,8 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -105,10 +120,21 @@ import (
 	"github.com/nrynss/keel/sqlite"
 )
 
-// schemaNamespace is the migration ledger namespace this package owns. It
-// shares the database file with every other namespace without colliding,
-// because each namespace keeps its own ledger.
+// schemaNamespace is the migration ledger namespace and the default table
+// prefix this package owns. Each namespace owns its ledger and its tables,
+// so a store shares the database file with every other namespace without
+// colliding.
 const schemaNamespace = "cost"
+
+// schemaTable is the token every migration file carries where the
+// namespace-qualified prefix belongs. qualifiedSchema refuses a file
+// without it, so a later migration cannot apply to the wrong table.
+const schemaTable = "{{table}}"
+
+// schemaLedgerSuffix is the suffix of the migration ledger table a
+// namespace owns. It mirrors the ledger naming the sqlite package applies,
+// so the reset at open clears the one table the migration runner reads.
+const schemaLedgerSuffix = "_schema_migrations"
 
 //go:embed migrations/*.sql
 var migrations embed.FS
@@ -133,8 +159,14 @@ type Config struct {
 	// closes it.
 	DB *sqlite.DB
 
-	// Namespace overrides the migration ledger namespace. Empty means the
-	// one this package owns.
+	// Namespace names the migration ledger and the tables this store
+	// owns. It reads as lowercase, so two names that differ only in
+	// ASCII case are one namespace, because SQLite folds table names to
+	// one. Empty means the one this package owns, which keeps the
+	// historical table names, cost_charge and the rest. Two different
+	// namespaces share one database file as two isolated stores, which
+	// is how a dollar budget and a provider-credit budget stay apart in
+	// one file.
 	Namespace string
 
 	// Limit is the budget ceiling. It must not be below zero. The store
@@ -194,6 +226,7 @@ type Config struct {
 // concurrent use.
 type Store struct {
 	db             *sqlite.DB
+	tables         costTables
 	now            func() time.Time
 	log            *slog.Logger
 	reservationTTL time.Duration
@@ -214,6 +247,45 @@ type Store struct {
 	// leader never finishes before the waiter that must share its
 	// outcome is on the flight.
 	onWaiterJoin func(quoteID string)
+}
+
+// costTables holds the table names one store owns. Open derives them from
+// the namespace, and every statement the store runs names its tables
+// through this struct, so two namespaces never touch each other's rows.
+type costTables struct {
+	charge      string
+	budget      string
+	reservation string
+	ownerBudget string
+	settle      string
+	settleOnce  string
+	grant       string
+	quote       string
+}
+
+// newTables prefixes every table name with the namespace. Open has already
+// turned the empty namespace into the package default, so the default store
+// keeps the historical cost_ names.
+func newTables(namespace string) costTables {
+	return costTables{
+		charge:      namespace + "_charge",
+		budget:      namespace + "_budget",
+		reservation: namespace + "_reservation",
+		ownerBudget: namespace + "_owner_budget",
+		settle:      namespace + "_settle",
+		settleOnce:  namespace + "_settle_once",
+		grant:       namespace + "_grant",
+		quote:       namespace + "_quote",
+	}
+}
+
+// names lists the store's table names in one fixed order, so the presence
+// check at open binds every name as an argument.
+func (t costTables) names() []string {
+	return []string{
+		t.charge, t.budget, t.reservation, t.ownerBudget,
+		t.settle, t.settleOnce, t.grant, t.quote,
+	}
 }
 
 // A Store satisfies cost.ChargeSink, so a meter can take it as the sink that
@@ -238,10 +310,24 @@ type Reservation struct {
 // configured ceiling and purges reservations that already expired, so a restart
 // frees the budget a dead process was holding. It refuses a file whose stored
 // denomination differs from cfg.Denomination, because a reopen under another
-// name would silently reprice every recorded amount. A cancelled context stops
-// the open and no store comes back, but the schema, its migration ledger row and
-// the ceiling may already have landed. Those bytes are inert, so a caller
-// may retry the open and a second open on the same file is unaffected.
+// name would silently reprice every recorded amount. Open also reconciles
+// the migration ledger with the tables it names. The reconciliation covers
+// the states this package's own paths can produce. A ledger whose tables
+// are all absent is swept and the schema is applied again, so the file
+// opens as the fresh store its tables describe. The rows under any other
+// names stay on disk unread. The sweep is one guarded statement, so a
+// concurrent open of the same file can never erase ledger rows whose
+// tables already exist. A partly present table set beside a ledger holding
+// at least one row per file this binary carries is corruption. The open
+// refuses it with ErrInvalid, because no path in this package leaves that
+// state behind. A ledger short beside a full table set is a
+// state the reconciliation does not cover. Open runs the migration runner
+// before it reconciles, so such a file fails in the runner first, and the
+// guard is what keeps that state from ever forming. A cancelled context
+// stops the open and no store comes back, but the schema, its migration
+// ledger row and the ceiling may already have landed. Those bytes are
+// inert, so a caller may retry the open and a second open on the same file
+// is unaffected.
 func Open(ctx context.Context, cfg Config) (*Store, error) {
 	if cfg.DB == nil {
 		return nil, fmt.Errorf("sqlitestore: open: %w: DB must not be nil", ErrInvalid)
@@ -254,13 +340,20 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 	default:
 		return nil, fmt.Errorf("sqlitestore: open: period %d: %w", cfg.Period, ErrInvalid)
 	}
-	namespace := cfg.Namespace
+	// SQLite folds table names that differ only in ASCII case into one,
+	// so the namespace folds with them. A case twin of an open
+	// namespace is that namespace, and never a silent second one.
+	namespace := strings.ToLower(cfg.Namespace)
 	if namespace == "" {
 		namespace = schemaNamespace
 	}
-	schema, err := fs.Sub(migrations, "migrations")
+	embedded, err := fs.Sub(migrations, "migrations")
 	if err != nil {
 		return nil, fmt.Errorf("sqlitestore: open: %w", err)
+	}
+	schema, err := qualifiedSchema(embedded, namespace)
+	if err != nil {
+		return nil, err
 	}
 	if err := sqlite.Migrate(ctx, cfg.DB, namespace, schema); err != nil {
 		return nil, fmt.Errorf("sqlitestore: open: %w", err)
@@ -282,6 +375,7 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 	}
 	store := &Store{
 		db:             cfg.DB,
+		tables:         newTables(namespace),
 		now:            now,
 		log:            logger,
 		reservationTTL: ttl,
@@ -290,6 +384,9 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 		quoteTolerance: cfg.QuoteTolerance,
 		reprice:        cfg.Reprice,
 		flights:        make(map[string]*quoteFlight),
+	}
+	if err := store.reconcileSchema(ctx, namespace, schema); err != nil {
+		return nil, fmt.Errorf("sqlitestore: open: %w", err)
 	}
 	if err := store.checkDenomination(ctx); err != nil {
 		return nil, fmt.Errorf("sqlitestore: open: %w", err)
@@ -305,8 +402,223 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("sqlitestore: open: %w", err)
 	}
-	logger.InfoContext(ctx, "sqlitestore: opened", "limit", int64(cfg.Limit), "denomination", cfg.Denomination.Name, "expired_reservations", purged, "expired_quotes", swept)
+	logger.InfoContext(ctx, "sqlitestore: opened", "namespace", namespace, "limit", int64(cfg.Limit), "denomination", cfg.Denomination.Name, "expired_reservations", purged, "expired_quotes", swept)
 	return store, nil
+}
+
+// qualifiedSchema rewrites the namespace token in every migration file to
+// the namespace prefix and serves the result as a small in-memory tree. The
+// migration runner sees the original file names, so the ledger records them
+// unchanged.
+func qualifiedSchema(source fs.FS, namespace string) (schemaTree, error) {
+	names, err := fs.Glob(source, "*.sql")
+	if err != nil {
+		return schemaTree{}, fmt.Errorf("sqlitestore: open: %w", err)
+	}
+	files := make(map[string][]byte, len(names))
+	for _, name := range names {
+		body, err := fs.ReadFile(source, name)
+		if err != nil {
+			return schemaTree{}, fmt.Errorf("sqlitestore: open: %w", err)
+		}
+		if !bytes.Contains(body, []byte(schemaTable)) {
+			return schemaTree{}, fmt.Errorf("sqlitestore: open: %s carries no %s token", name, schemaTable)
+		}
+		files[name] = bytes.ReplaceAll(body, []byte(schemaTable), []byte(namespace))
+	}
+	if len(files) == 0 {
+		return schemaTree{}, fmt.Errorf("sqlitestore: open: %w: no migration files", ErrInvalid)
+	}
+	return schemaTree{files: files}, nil
+}
+
+// schemaTree is an fs.FS over rewritten migration files. It serves the
+// shapes the migration runner reads: one directory listing, and one file
+// read per file.
+type schemaTree struct {
+	files map[string][]byte
+}
+
+// fileCount returns how many migration files the tree serves. The
+// reconciliation compares it with the ledger's row count, so a ledger
+// holding at least one row per file is recognised even while its tables
+// are partly gone.
+func (t schemaTree) fileCount() int { return len(t.files) }
+
+// Open returns one migration file of the tree as an fs.File.
+func (t schemaTree) Open(name string) (fs.File, error) {
+	body, ok := t.files[name]
+	if !ok || !fs.ValidPath(name) {
+		return nil, &fs.PathError{Op: "open", Path: name, Err: fs.ErrNotExist}
+	}
+	return &schemaFile{
+		Reader: bytes.NewReader(body),
+		entry:  schemaEntry{name: name, size: int64(len(body))},
+	}, nil
+}
+
+// ReadFile returns the rewritten body of one migration file.
+func (t schemaTree) ReadFile(name string) ([]byte, error) {
+	body, ok := t.files[name]
+	if !ok || !fs.ValidPath(name) {
+		return nil, &fs.PathError{Op: "read", Path: name, Err: fs.ErrNotExist}
+	}
+	return bytes.Clone(body), nil
+}
+
+// ReadDir lists the migration files in filename order, which is the order
+// the runner applies them in.
+func (t schemaTree) ReadDir(name string) ([]fs.DirEntry, error) {
+	if name != "." {
+		return nil, &fs.PathError{Op: "readdir", Path: name, Err: fs.ErrNotExist}
+	}
+	names := make([]string, 0, len(t.files))
+	for name := range t.files {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	entries := make([]fs.DirEntry, 0, len(names))
+	for _, name := range names {
+		entries = append(entries, schemaEntry{name: name, size: int64(len(t.files[name]))})
+	}
+	return entries, nil
+}
+
+// schemaFile is one open migration file of a schemaTree.
+type schemaFile struct {
+	*bytes.Reader
+	entry schemaEntry
+}
+
+// Stat returns the file's name and size.
+func (f *schemaFile) Stat() (fs.FileInfo, error) { return f.entry, nil }
+
+// Close releases the reader. The body lives in memory, so this is a no-op.
+func (f *schemaFile) Close() error { return nil }
+
+// schemaEntry names one file of a schemaTree. It is both the fs.FileInfo a
+// Stat returns and the fs.DirEntry a listing carries, which is every shape
+// the migration runner reads.
+type schemaEntry struct {
+	name string
+	size int64
+}
+
+// Name returns the file's name.
+func (e schemaEntry) Name() string { return e.name }
+
+// Size returns the file's size in bytes.
+func (e schemaEntry) Size() int64 { return e.size }
+
+// Mode reports a read-only regular file.
+func (e schemaEntry) Mode() fs.FileMode { return 0o444 }
+
+// ModTime returns the zero time, because a rewritten body has none.
+func (e schemaEntry) ModTime() time.Time { return time.Time{} }
+
+// IsDir reports false, because every entry is a file.
+func (e schemaEntry) IsDir() bool { return false }
+
+// Sys returns nil, because the tree holds nothing behind the bytes.
+func (e schemaEntry) Sys() any { return nil }
+
+// Type reports the mode's type bits, which name a regular file.
+func (e schemaEntry) Type() fs.FileMode { return e.Mode().Type() }
+
+// Info returns the entry as its own file info.
+func (e schemaEntry) Info() (fs.FileInfo, error) { return e, nil }
+
+// reconcileSchema aligns the migration ledger with the qualified tables on
+// disk. A ledger whose tables are all absent vouches for a schema this
+// prefix cannot see, so the sweep clears it and the runner applies the
+// files again. The file then opens as the fresh store its tables describe,
+// and the rows under other names stay on disk unread. A partly present
+// table set beside a ledger holding at least one row per file this binary
+// carries is dropped-table corruption. The open refuses it instead of
+// healing it. The sweep is one guarded
+// statement. The guard re-counts the qualified tables inside the write
+// lock the delete itself takes. The ledger therefore only ever loses rows
+// while no table of this store exists. Concurrent opens of one file
+// converge through the runner's per-file records.
+func (s *Store) reconcileSchema(ctx context.Context, namespace string, schema schemaTree) error {
+	names := s.tables.names()
+	present, err := s.countPresentTables(ctx, names)
+	if err != nil {
+		return err
+	}
+	switch {
+	case present == len(names):
+		return nil
+	case present > 0:
+		// A partly present set beside a ledger holding at least one row
+		// per file this binary carries means tables of a recorded schema
+		// are gone. A newer binary records rows for files this one does
+		// not carry, and those rows outlive it on disk. Nothing in this
+		// package deletes a table, so healing would bury outside damage
+		// instead of reporting it.
+		rows, err := s.countLedgerRows(ctx, namespace)
+		if err != nil {
+			return err
+		}
+		if rows >= schema.fileCount() {
+			return fmt.Errorf("sqlitestore: namespace %q holds %d of its %d tables: %w",
+				namespace, present, len(names), ErrInvalid)
+		}
+	}
+	// The guard and the erase share one statement, and SQLite holds the
+	// write lock across the whole statement. No other open can commit
+	// between the guard's count and the delete, so the ledger only ever
+	// loses rows while no table of this store exists. A concurrent open's
+	// recorded rows therefore survive this sweep, and the re-apply
+	// converges with concurrent opens through the runner's per-file
+	// records. A crash between the sweep and the re-apply leaves an empty
+	// ledger beside absent tables, a state the next open applies cleanly.
+	placeholders := strings.TrimSuffix(strings.Repeat("?, ", len(names)), ", ")
+	stmt := `DELETE FROM ` + namespace + schemaLedgerSuffix +
+		` WHERE 0 = (SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN (` + placeholders + `))`
+	args := make([]any, len(names))
+	for i, name := range names {
+		args[i] = name
+	}
+	if _, err := s.db.Writer().ExecContext(ctx, stmt, args...); err != nil {
+		return fmt.Errorf("sqlitestore: clear the migration ledger: %w", err)
+	}
+	if err := sqlite.Migrate(ctx, s.db, namespace, schema); err != nil {
+		return fmt.Errorf("sqlitestore: re-apply the schema: %w", err)
+	}
+	s.log.WarnContext(ctx,
+		"sqlitestore: the migration ledger disagreed with the qualified tables, so the schema was applied again",
+		"namespace", namespace, "tables_present", present)
+	return nil
+}
+
+// countLedgerRows counts the rows of this namespace's migration ledger. The
+// runner creates the ledger before Open reconciles, so the table is always
+// there when this runs.
+func (s *Store) countLedgerRows(ctx context.Context, namespace string) (int, error) {
+	var rows int
+	if err := s.db.Writer().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM `+namespace+schemaLedgerSuffix).Scan(&rows); err != nil {
+		return 0, fmt.Errorf("sqlitestore: count the migration ledger rows: %w", err)
+	}
+	return rows, nil
+}
+
+// countPresentTables counts how many of the store's qualified tables exist.
+// The names travel as arguments, so no table name lands in the statement
+// text.
+func (s *Store) countPresentTables(ctx context.Context, names []string) (int, error) {
+	placeholders := strings.TrimSuffix(strings.Repeat("?, ", len(names)), ", ")
+	query := `SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN (` + placeholders + `)`
+	args := make([]any, len(names))
+	for i, name := range names {
+		args[i] = name
+	}
+	var present int
+	if err := s.db.Writer().QueryRowContext(ctx, query, args...).Scan(&present); err != nil {
+		return 0, fmt.Errorf("sqlitestore: count the qualified tables: %w", err)
+	}
+	return present, nil
 }
 
 // checkDenomination refuses a file whose stored denomination differs from
@@ -316,7 +628,7 @@ func (s *Store) checkDenomination(ctx context.Context) error {
 	var name string
 	var minor int64
 	err := s.db.Writer().QueryRowContext(ctx,
-		`SELECT denomination, minor_units FROM cost_budget WHERE id = 1`).Scan(&name, &minor)
+		`SELECT denomination, minor_units FROM `+s.tables.budget+` WHERE id = 1`).Scan(&name, &minor)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
@@ -342,7 +654,7 @@ func (s *Store) Denomination() cost.Denomination {
 // denomination is written with the ceiling on the first open, and every later
 // open has already checked itself against the stored one.
 func (s *Store) setLimit(ctx context.Context, limit cost.Price) error {
-	const query = `INSERT INTO cost_budget (id, limit_nd, spent_nd, denomination, minor_units)
+	query := `INSERT INTO ` + s.tables.budget + ` (id, limit_nd, spent_nd, denomination, minor_units)
 		VALUES (1, ?, 0, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET limit_nd = excluded.limit_nd`
 	if _, err := s.db.Writer().ExecContext(ctx, query, int64(limit), s.denom.Name, int64(s.denom.Minor)); err != nil {
@@ -355,7 +667,7 @@ func (s *Store) setLimit(ctx context.Context, limit cost.Price) error {
 // how many it removed.
 func (s *Store) purgeExpired(ctx context.Context, now time.Time) (int, error) {
 	result, err := s.db.Writer().ExecContext(ctx,
-		`DELETE FROM cost_reservation WHERE expires_at <= ?`, now.UnixMilli())
+		`DELETE FROM `+s.tables.reservation+` WHERE expires_at <= ?`, now.UnixMilli())
 	if err != nil {
 		return 0, fmt.Errorf("sqlitestore: purge reservations: %w", err)
 	}
@@ -377,7 +689,7 @@ func (s *Store) Add(ctx context.Context, c cost.Charge) error {
 		return fmt.Errorf("sqlitestore: add charge in %q over a %q store: %w",
 			c.Denomination.Name, s.denom.Name, cost.ErrDenominationMismatch)
 	}
-	const query = `INSERT INTO cost_charge (kind, units, unit_price, ref, denomination, created_at)
+	query := `INSERT INTO ` + s.tables.charge + ` (kind, units, unit_price, ref, denomination, created_at)
 		VALUES (?, ?, ?, ?, ?, ?)`
 	_, err := s.db.Writer().ExecContext(ctx, query,
 		c.Kind, int64(c.Units), int64(c.UnitPrice), c.Ref, s.denom.Name, s.now().UnixMilli())
@@ -390,27 +702,29 @@ func (s *Store) Add(ctx context.Context, c cost.Charge) error {
 // Charges returns every recorded charge in insertion order. Each charge names
 // the denomination it was written under.
 func (s *Store) Charges(ctx context.Context) ([]cost.Charge, error) {
-	return s.queryCharges(ctx, `SELECT kind, units, unit_price, ref, denomination FROM cost_charge ORDER BY id`)
+	return s.queryCharges(ctx,
+		`SELECT kind, units, unit_price, ref, denomination FROM `+s.tables.charge+` ORDER BY id`)
 }
 
 // Total returns the sum of every charge in the ledger. It reports an error
 // matching cost.ErrOverflow when the exact sum leaves the int64 range.
 func (s *Store) Total(ctx context.Context) (cost.Price, error) {
-	return s.total(ctx, `SELECT kind, units, unit_price, ref, denomination FROM cost_charge ORDER BY id`)
+	return s.total(ctx,
+		`SELECT kind, units, unit_price, ref, denomination FROM `+s.tables.charge+` ORDER BY id`)
 }
 
 // TotalByKind returns the sum of the charges whose Kind equals kind. It reports
 // an error matching cost.ErrOverflow when the exact sum leaves the int64 range.
 func (s *Store) TotalByKind(ctx context.Context, kind string) (cost.Price, error) {
 	return s.total(ctx,
-		`SELECT kind, units, unit_price, ref, denomination FROM cost_charge WHERE kind = ? ORDER BY id`, kind)
+		`SELECT kind, units, unit_price, ref, denomination FROM `+s.tables.charge+` WHERE kind = ? ORDER BY id`, kind)
 }
 
 // TotalForRef returns the sum of the charges whose Ref equals ref. It reports
 // an error matching cost.ErrOverflow when the exact sum leaves the int64 range.
 func (s *Store) TotalForRef(ctx context.Context, ref string) (cost.Price, error) {
 	return s.total(ctx,
-		`SELECT kind, units, unit_price, ref, denomination FROM cost_charge WHERE ref = ? ORDER BY id`, ref)
+		`SELECT kind, units, unit_price, ref, denomination FROM `+s.tables.charge+` WHERE ref = ? ORDER BY id`, ref)
 }
 
 // total loads the matching charges and sums them through a cost.Ledger, so the
@@ -485,7 +799,7 @@ func (s *Store) Spent(ctx context.Context) (cost.Price, error) {
 // covers. A store with a period answers its current window through
 // Spent, and any other window through here.
 func (s *Store) SpentSince(ctx context.Context, t time.Time) (cost.Price, error) {
-	return sumSettles(ctx, s.db.Reader(), "", t.UnixMilli())
+	return s.sumSettles(ctx, s.db.Reader(), "", t.UnixMilli())
 }
 
 // Reserved returns the sum of the reservations that are still holding budget.
@@ -537,7 +851,7 @@ func (s *Store) Reserve(ctx context.Context, estimate cost.Price) (Reservation, 
 	}
 	defer func() { _ = tx.Rollback() }() // a committed transaction rolls back to a no-op
 	if _, err := tx.ExecContext(ctx,
-		`DELETE FROM cost_reservation WHERE expires_at <= ?`, now.UnixMilli()); err != nil {
+		`DELETE FROM `+s.tables.reservation+` WHERE expires_at <= ?`, now.UnixMilli()); err != nil {
 		return Reservation{}, fmt.Errorf("sqlitestore: reserve: purge expired: %w", err)
 	}
 	state, err := s.loadGlobal(ctx, tx, now)
@@ -558,7 +872,7 @@ func (s *Store) Reserve(ctx context.Context, estimate cost.Price) (Reservation, 
 	}
 	expires := now.Add(s.reservationTTL)
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO cost_reservation (id, amount_nd, expires_at, created_at) VALUES (?, ?, ?, ?)`,
+		`INSERT INTO `+s.tables.reservation+` (id, amount_nd, expires_at, created_at) VALUES (?, ?, ?, ?)`,
 		reservationID, int64(estimate), expires.UnixMilli(), now.UnixMilli()); err != nil {
 		return Reservation{}, fmt.Errorf("sqlitestore: reserve: %w", err)
 	}
@@ -583,7 +897,7 @@ func (s *Store) Settle(ctx context.Context, r Reservation, actual cost.Price) er
 		return fmt.Errorf("sqlitestore: settle: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }() // a committed transaction rolls back to a no-op
-	if err := settleBooks(ctx, tx, s.now(), "", actual, r.ID); err != nil {
+	if err := s.settleBooks(ctx, tx, s.now(), "", actual, r.ID); err != nil {
 		return fmt.Errorf("sqlitestore: settle: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -613,14 +927,14 @@ func (s *Store) SettleOnce(ctx context.Context, r Reservation, actual cost.Price
 	// The pair row decides the booking, so it lands first. A conflict
 	// leaves the transaction untouched, and the hold below still goes
 	// back, because a deduplicated call must not keep budget.
-	inserted, err := insertSettleOnce(ctx, tx, s.now(), kind, ref)
+	inserted, err := s.insertSettleOnce(ctx, tx, s.now(), kind, ref)
 	if err != nil {
 		return false, fmt.Errorf("sqlitestore: settle once: %w", err)
 	}
 	if !inserted {
 		if r.ID != "" {
 			if _, err := tx.ExecContext(ctx,
-				`DELETE FROM cost_reservation WHERE id = ?`, r.ID); err != nil {
+				`DELETE FROM `+s.tables.reservation+` WHERE id = ?`, r.ID); err != nil {
 				return false, fmt.Errorf("sqlitestore: settle once: %w", err)
 			}
 		}
@@ -629,7 +943,7 @@ func (s *Store) SettleOnce(ctx context.Context, r Reservation, actual cost.Price
 		}
 		return false, nil
 	}
-	if err := settleBooks(ctx, tx, s.now(), "", actual, r.ID); err != nil {
+	if err := s.settleBooks(ctx, tx, s.now(), "", actual, r.ID); err != nil {
 		return false, fmt.Errorf("sqlitestore: settle once: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -644,12 +958,12 @@ func (s *Store) SettleOnce(ctx context.Context, r Reservation, actual cost.Price
 // matching both ErrInvalid and cost.ErrEmptyReference, the same sentinel
 // the in-memory accounts refuse with. The pair key must name its work to
 // stay unique.
-func insertSettleOnce(ctx context.Context, tx *sql.Tx, now time.Time, kind, ref string) (bool, error) {
+func (s *Store) insertSettleOnce(ctx context.Context, tx *sql.Tx, now time.Time, kind, ref string) (bool, error) {
 	if ref == "" {
 		return false, fmt.Errorf("%w: the reference must not be empty: %w", ErrInvalid, cost.ErrEmptyReference)
 	}
 	result, err := tx.ExecContext(ctx,
-		`INSERT INTO cost_settle_once (kind, ref, created_at) VALUES (?, ?, ?)
+		`INSERT INTO `+s.tables.settleOnce+` (kind, ref, created_at) VALUES (?, ?, ?)
 			ON CONFLICT (kind, ref) DO NOTHING`,
 		kind, ref, now.UnixMilli())
 	if err != nil {
@@ -662,15 +976,15 @@ func insertSettleOnce(ctx context.Context, tx *sql.Tx, now time.Time, kind, ref 
 	return inserted == 1, nil
 }
 
-// settleBooks applies the booking every settle shares inside the caller's
-// transaction: the new spent total, the settle history row under owner, the
-// grant draw and the hold release. It reads the spent total first, so an
-// overflow refuses before any write lands. The caller owns the transaction
-// and the commit.
-func settleBooks(ctx context.Context, tx *sql.Tx, now time.Time, owner string, actual cost.Price, holdID string) error {
+// settleBooks applies the booking every unkeyed settle shares inside the
+// caller's transaction: the new spent total, the settle history row under
+// owner, the grant draw and the hold release. It reads the spent total
+// first, so an overflow refuses before any write lands. The caller owns
+// the transaction and the commit.
+func (s *Store) settleBooks(ctx context.Context, tx *sql.Tx, now time.Time, owner string, actual cost.Price, holdID string) error {
 	var spent int64
 	if err := tx.QueryRowContext(ctx,
-		`SELECT spent_nd FROM cost_budget WHERE id = 1`).Scan(&spent); err != nil {
+		`SELECT spent_nd FROM `+s.tables.budget+` WHERE id = 1`).Scan(&spent); err != nil {
 		return err
 	}
 	next, err := addPrice(cost.Price(spent), actual)
@@ -678,20 +992,20 @@ func settleBooks(ctx context.Context, tx *sql.Tx, now time.Time, owner string, a
 		return err
 	}
 	if _, err := tx.ExecContext(ctx,
-		`UPDATE cost_budget SET spent_nd = ? WHERE id = 1`, int64(next)); err != nil {
+		`UPDATE `+s.tables.budget+` SET spent_nd = ? WHERE id = 1`, int64(next)); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO cost_settle (owner, amount_nd, created_at) VALUES (?, ?, ?)`,
+		`INSERT INTO `+s.tables.settle+` (owner, amount_nd, created_at) VALUES (?, ?, ?)`,
 		owner, int64(actual), now.UnixMilli()); err != nil {
 		return err
 	}
-	if err := drawGrants(ctx, tx, now, actual); err != nil {
+	if err := s.drawGrants(ctx, tx, now, actual); err != nil {
 		return err
 	}
 	if holdID != "" {
 		if _, err := tx.ExecContext(ctx,
-			`DELETE FROM cost_reservation WHERE id = ?`, holdID); err != nil {
+			`DELETE FROM `+s.tables.reservation+` WHERE id = ?`, holdID); err != nil {
 			return err
 		}
 	}
@@ -706,7 +1020,7 @@ func (s *Store) Release(ctx context.Context, r Reservation) error {
 		return nil
 	}
 	if _, err := s.db.Writer().ExecContext(ctx,
-		`DELETE FROM cost_reservation WHERE id = ?`, r.ID); err != nil {
+		`DELETE FROM `+s.tables.reservation+` WHERE id = ?`, r.ID); err != nil {
 		return fmt.Errorf("sqlitestore: release: %w", err)
 	}
 	return nil
@@ -757,7 +1071,7 @@ func (s *Store) loadGlobal(ctx context.Context, q querier, now time.Time) (budge
 	var state budgetState
 	var limit, lifetime int64
 	if err := q.QueryRowContext(ctx,
-		`SELECT limit_nd, spent_nd FROM cost_budget WHERE id = 1`).Scan(&limit, &lifetime); err != nil {
+		`SELECT limit_nd, spent_nd FROM `+s.tables.budget+` WHERE id = 1`).Scan(&limit, &lifetime); err != nil {
 		return budgetState{}, fmt.Errorf("sqlitestore: read budget: %w", err)
 	}
 	state.limit = cost.Price(limit)
@@ -765,7 +1079,7 @@ func (s *Store) loadGlobal(ctx context.Context, q querier, now time.Time) (budge
 	if since == 0 {
 		state.spent = cost.Price(lifetime)
 	} else {
-		spent, err := sumSettles(ctx, q, "", since)
+		spent, err := s.sumSettles(ctx, q, "", since)
 		if err != nil {
 			return budgetState{}, err
 		}
@@ -775,19 +1089,19 @@ func (s *Store) loadGlobal(ctx context.Context, q querier, now time.Time) (budge
 	if err := q.QueryRowContext(ctx,
 		`SELECT COALESCE(SUM(amount_nd), 0),
 			COALESCE(SUM(CASE WHEN created_at >= ? THEN amount_nd ELSE 0 END), 0)
-		FROM cost_reservation WHERE expires_at > ?`,
+		FROM `+s.tables.reservation+` WHERE expires_at > ?`,
 		since, now.UnixMilli()).Scan(&holds, &reserved); err != nil {
 		return budgetState{}, fmt.Errorf("sqlitestore: read reservations: %w", err)
 	}
 	state.reserved, state.holds = cost.Price(reserved), cost.Price(holds)
 	var granted int
 	if err := q.QueryRowContext(ctx,
-		`SELECT EXISTS (SELECT 1 FROM cost_grant)`).Scan(&granted); err != nil {
+		`SELECT EXISTS (SELECT 1 FROM `+s.tables.grant+`)`).Scan(&granted); err != nil {
 		return budgetState{}, fmt.Errorf("sqlitestore: read grants: %w", err)
 	}
 	state.granted = granted != 0
 	if state.granted {
-		funded, err := grantBalance(ctx, q, now)
+		funded, err := s.grantBalance(ctx, q, now)
 		if err != nil {
 			return budgetState{}, err
 		}
@@ -800,14 +1114,14 @@ func (s *Store) loadGlobal(ctx context.Context, q querier, now time.Time) (budge
 // owner sums every owner, so the global ceiling reads the whole store.
 // It reports an error matching cost.ErrOverflow when the exact sum leaves
 // the int64 range.
-func sumSettles(ctx context.Context, q querier, owner string, sinceMillis int64) (cost.Price, error) {
+func (s *Store) sumSettles(ctx context.Context, q querier, owner string, sinceMillis int64) (cost.Price, error) {
 	var query string
 	var args []any
 	if owner == "" {
-		query = `SELECT amount_nd FROM cost_settle WHERE created_at >= ?`
+		query = `SELECT amount_nd FROM ` + s.tables.settle + ` WHERE created_at >= ?`
 		args = []any{sinceMillis}
 	} else {
-		query = `SELECT amount_nd FROM cost_settle WHERE owner = ? AND created_at >= ?`
+		query = `SELECT amount_nd FROM ` + s.tables.settle + ` WHERE owner = ? AND created_at >= ?`
 		args = []any{owner, sinceMillis}
 	}
 	rows, err := q.QueryContext(ctx, query, args...)

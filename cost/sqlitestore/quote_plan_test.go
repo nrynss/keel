@@ -34,7 +34,8 @@ func TestSweepQuotesPlanUsesIndexes(t *testing.T) {
 		t.Fatalf("open sqlite: %v", err)
 	}
 	t.Cleanup(func() { _ = db.Close() }) // the handle is discarded here, so a close failure cannot fail the test
-	if _, err := Open(t.Context(), Config{DB: db, Limit: cost.Dollar, Logger: logger}); err != nil {
+	store, err := Open(t.Context(), Config{DB: db, Limit: cost.Dollar, Logger: logger})
+	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
 	tx, err := db.Writer().BeginTx(t.Context(), nil)
@@ -43,7 +44,7 @@ func TestSweepQuotesPlanUsesIndexes(t *testing.T) {
 	}
 	defer func() { _ = tx.Rollback() }() // the plan read needs no commit
 	now := time.Now().UnixMilli()
-	rows, err := tx.QueryContext(t.Context(), "EXPLAIN QUERY PLAN "+sweepQuotesSQL,
+	rows, err := tx.QueryContext(t.Context(), "EXPLAIN QUERY PLAN "+store.sweepQuotesSQL(),
 		quoteClaimed, now, quoteClaimed, now)
 	if err != nil {
 		t.Fatalf("explain the sweep: %v", err)

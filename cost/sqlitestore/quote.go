@@ -30,13 +30,16 @@ const (
 // action through it.
 const quoteChargeKind = "quoted"
 
-// sweepQuotesSQL removes every quote past its life. An open or done quote
-// dies at its confirm deadline. A claimed one dies when its claim lapses,
-// because a lapsed claim means the runner is gone.
-const sweepQuotesSQL = `DELETE FROM cost_quote
+// sweepQuotesSQL removes every quote past its life from the store's quote
+// table. An open or done quote dies at its confirm deadline. A claimed one
+// dies when its claim lapses, because a lapsed claim means the runner is
+// gone.
+func (s *Store) sweepQuotesSQL() string {
+	return `DELETE FROM ` + s.tables.quote + `
 	WHERE (state <> ? AND expires_at <= ?) OR (state = ? AND claim_expires_at <= ?)`
+}
 
-// quoteRow is one cost_quote row in the shape the quote path reads.
+// quoteRow is one quote row in the shape the quote path reads.
 type quoteRow struct {
 	id              string
 	owner           string
@@ -100,7 +103,7 @@ func (s *Store) Quote(ctx context.Context, owner string, estimate cost.Price, tt
 		return cost.Quote{}, fmt.Errorf("sqlitestore: quote: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }() // a committed transaction rolls back to a no-op
-	if _, err := sweepQuotes(ctx, tx, now); err != nil {
+	if _, err := s.sweepQuotes(ctx, tx, now); err != nil {
 		return cost.Quote{}, fmt.Errorf("sqlitestore: quote: %w", err)
 	}
 	quoteID, err := id.New()
@@ -109,7 +112,7 @@ func (s *Store) Quote(ctx context.Context, owner string, estimate cost.Price, tt
 	}
 	expires := now.Add(ttl)
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO cost_quote (id, owner, price_nd, denomination, state, expires_at, created_at)
+		`INSERT INTO `+s.tables.quote+` (id, owner, price_nd, denomination, state, expires_at, created_at)
 			VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		quoteID, owner, int64(estimate), s.denom.Name, quoteOpen, expires.UnixMilli(), now.UnixMilli()); err != nil {
 		return cost.Quote{}, fmt.Errorf("sqlitestore: quote: %w", err)
@@ -238,7 +241,7 @@ func (s *Store) runLead(ctx context.Context, quoteID string, work cost.Work) (co
 	// The read phase refuses what no claim can fix, and prices the
 	// action through Reprice outside any transaction, so app I/O never
 	// sits inside a claim.
-	row, err := readQuoteRow(ctx, s.db.Reader(), quoteID)
+	row, err := s.readQuoteRow(ctx, s.db.Reader(), quoteID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return cost.Usage{}, unknownQuote(quoteID)
 	}
@@ -352,7 +355,7 @@ func (s *Store) claimQuote(ctx context.Context, quoteID string, current cost.Pri
 		return quoteClaim{}, false, cost.Usage{}, fmt.Errorf("sqlitestore: claim quote %s: %w", quoteID, err)
 	}
 	defer func() { _ = tx.Rollback() }() // a committed transaction rolls back to a no-op
-	row, err := readQuoteRow(ctx, tx, quoteID)
+	row, err := s.readQuoteRow(ctx, tx, quoteID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return quoteClaim{}, false, cost.Usage{}, unknownQuote(quoteID)
 	}
@@ -365,10 +368,10 @@ func (s *Store) claimQuote(ctx context.Context, quoteID string, current cost.Pri
 	// The sweep runs after the read, so a quote this run refuses as
 	// expired is refused as expired rather than swept into unknown. The
 	// expired holds go with it, so the bounds below read only live ones.
-	if _, err := sweepQuotes(ctx, tx, now); err != nil {
+	if _, err := s.sweepQuotes(ctx, tx, now); err != nil {
 		return quoteClaim{}, false, cost.Usage{}, fmt.Errorf("sqlitestore: claim quote %s: %w", quoteID, err)
 	}
-	if _, err := purgeExpiredHolds(ctx, tx, now); err != nil {
+	if _, err := s.purgeExpiredHolds(ctx, tx, now); err != nil {
 		return quoteClaim{}, false, cost.Usage{}, fmt.Errorf("sqlitestore: claim quote %s: %w", quoteID, err)
 	}
 	switch {
@@ -404,7 +407,7 @@ func (s *Store) claimQuote(ctx context.Context, quoteID string, current cost.Pri
 	// The quote is open and inside its window. The claim checks the same
 	// bounds a keyed reserve checks, so a quoted action never takes more
 	// than the owner's share or the pool's headroom allows.
-	owned, err := loadOwner(ctx, tx, row.owner, now, s.windowSince(now))
+	owned, err := s.loadOwner(ctx, tx, row.owner, now, s.windowSince(now))
 	if err != nil {
 		return quoteClaim{}, false, cost.Usage{}, fmt.Errorf("sqlitestore: claim quote %s: %w", quoteID, err)
 	}
@@ -436,7 +439,7 @@ func (s *Store) claimQuote(ctx context.Context, quoteID string, current cost.Pri
 	}
 	until := now.Add(s.reservationTTL)
 	result, err := tx.ExecContext(ctx,
-		`UPDATE cost_quote SET state = ?, reservation_id = ?, claim_expires_at = ?
+		`UPDATE `+s.tables.quote+` SET state = ?, reservation_id = ?, claim_expires_at = ?
 			WHERE id = ? AND state = ?`,
 		quoteClaimed, reservationID, until.UnixMilli(), quoteID, quoteOpen)
 	if err != nil {
@@ -450,7 +453,7 @@ func (s *Store) claimQuote(ctx context.Context, quoteID string, current cost.Pri
 		return quoteClaim{}, false, cost.Usage{}, fmt.Errorf("sqlitestore: claim quote %s: state changed during the claim", quoteID)
 	}
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO cost_reservation (id, owner, amount_nd, expires_at, created_at) VALUES (?, ?, ?, ?, ?)`,
+		`INSERT INTO `+s.tables.reservation+` (id, owner, amount_nd, expires_at, created_at) VALUES (?, ?, ?, ?, ?)`,
 		reservationID, row.owner, int64(row.price), until.UnixMilli(), now.UnixMilli()); err != nil {
 		return quoteClaim{}, false, cost.Usage{}, fmt.Errorf("sqlitestore: claim quote %s: %w", quoteID, err)
 	}
@@ -484,7 +487,7 @@ func (s *Store) settleQuote(ctx context.Context, claim quoteClaim, settled cost.
 	defer func() { _ = tx.Rollback() }() // a committed transaction rolls back to a no-op
 	var spent int64
 	if err := tx.QueryRowContext(ctx,
-		`SELECT spent_nd FROM cost_budget WHERE id = 1`).Scan(&spent); err != nil {
+		`SELECT spent_nd FROM `+s.tables.budget+` WHERE id = 1`).Scan(&spent); err != nil {
 		return fmt.Errorf("sqlitestore: settle quote %s: %w", claim.quoteID, err)
 	}
 	next, err := addPrice(cost.Price(spent), settled)
@@ -492,12 +495,12 @@ func (s *Store) settleQuote(ctx context.Context, claim quoteClaim, settled cost.
 		return fmt.Errorf("sqlitestore: settle quote %s: %w", claim.quoteID, err)
 	}
 	if _, err := tx.ExecContext(ctx,
-		`UPDATE cost_budget SET spent_nd = ? WHERE id = 1`, int64(next)); err != nil {
+		`UPDATE `+s.tables.budget+` SET spent_nd = ? WHERE id = 1`, int64(next)); err != nil {
 		return fmt.Errorf("sqlitestore: settle quote %s: %w", claim.quoteID, err)
 	}
 	var ownerSpent int64
 	if err := tx.QueryRowContext(ctx,
-		`SELECT spent_nd FROM cost_owner_budget WHERE owner = ?`, claim.owner).Scan(&ownerSpent); err != nil {
+		`SELECT spent_nd FROM `+s.tables.ownerBudget+` WHERE owner = ?`, claim.owner).Scan(&ownerSpent); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("sqlitestore: settle quote %s: owner %q: %w", claim.quoteID, claim.owner, cost.ErrUnknownOwner)
 		}
@@ -508,29 +511,29 @@ func (s *Store) settleQuote(ctx context.Context, claim quoteClaim, settled cost.
 		return fmt.Errorf("sqlitestore: settle quote %s: %w", claim.quoteID, err)
 	}
 	if _, err := tx.ExecContext(ctx,
-		`UPDATE cost_owner_budget SET spent_nd = ? WHERE owner = ?`, int64(nextOwner), claim.owner); err != nil {
+		`UPDATE `+s.tables.ownerBudget+` SET spent_nd = ? WHERE owner = ?`, int64(nextOwner), claim.owner); err != nil {
 		return fmt.Errorf("sqlitestore: settle quote %s: %w", claim.quoteID, err)
 	}
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO cost_settle (owner, amount_nd, created_at) VALUES (?, ?, ?)`,
+		`INSERT INTO `+s.tables.settle+` (owner, amount_nd, created_at) VALUES (?, ?, ?)`,
 		claim.owner, int64(settled), now.UnixMilli()); err != nil {
 		return fmt.Errorf("sqlitestore: settle quote %s: %w", claim.quoteID, err)
 	}
-	if err := drawGrants(ctx, tx, now, settled); err != nil {
+	if err := s.drawGrants(ctx, tx, now, settled); err != nil {
 		return fmt.Errorf("sqlitestore: settle quote %s: %w", claim.quoteID, err)
 	}
 	if _, err := tx.ExecContext(ctx,
-		`DELETE FROM cost_reservation WHERE id = ?`, claim.reservationID); err != nil {
+		`DELETE FROM `+s.tables.reservation+` WHERE id = ?`, claim.reservationID); err != nil {
 		return fmt.Errorf("sqlitestore: settle quote %s: %w", claim.quoteID, err)
 	}
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO cost_charge (kind, units, unit_price, ref, denomination, created_at)
+		`INSERT INTO `+s.tables.charge+` (kind, units, unit_price, ref, denomination, created_at)
 			VALUES (?, ?, ?, ?, ?, ?)`,
 		quoteChargeKind, 1, int64(settled), claim.quoteID, s.denom.Name, now.UnixMilli()); err != nil {
 		return fmt.Errorf("sqlitestore: settle quote %s: %w", claim.quoteID, err)
 	}
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO cost_quote (id, owner, price_nd, denomination, state, outcome_nd, outcome_measured,
+		`INSERT INTO `+s.tables.quote+` (id, owner, price_nd, denomination, state, outcome_nd, outcome_measured,
 			reservation_id, claim_expires_at, expires_at, created_at)
 			VALUES (?, ?, ?, ?, ?, ?, ?, '', 0, ?, ?)
 			ON CONFLICT(id) DO UPDATE SET state = excluded.state,
@@ -561,11 +564,11 @@ func (s *Store) abandonQuote(ctx context.Context, claim quoteClaim) error {
 	}
 	defer func() { _ = tx.Rollback() }() // a committed transaction rolls back to a no-op
 	if _, err := tx.ExecContext(ctx,
-		`DELETE FROM cost_reservation WHERE id = ?`, claim.reservationID); err != nil {
+		`DELETE FROM `+s.tables.reservation+` WHERE id = ?`, claim.reservationID); err != nil {
 		return fmt.Errorf("sqlitestore: abandon quote %s: %w", claim.quoteID, err)
 	}
 	if _, err := tx.ExecContext(ctx,
-		`UPDATE cost_quote SET state = ?, reservation_id = '', claim_expires_at = 0
+		`UPDATE `+s.tables.quote+` SET state = ?, reservation_id = '', claim_expires_at = 0
 			WHERE id = ? AND state = ?`, quoteOpen, claim.quoteID, quoteClaimed); err != nil {
 		return fmt.Errorf("sqlitestore: abandon quote %s: %w", claim.quoteID, err)
 	}
@@ -585,7 +588,7 @@ func (s *Store) freshQuote(ctx context.Context, old quoteRow, price cost.Price) 
 		return cost.Quote{}, fmt.Errorf("sqlitestore: fresh quote: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }() // a committed transaction rolls back to a no-op
-	if _, err := sweepQuotes(ctx, tx, now); err != nil {
+	if _, err := s.sweepQuotes(ctx, tx, now); err != nil {
 		return cost.Quote{}, fmt.Errorf("sqlitestore: fresh quote: %w", err)
 	}
 	fresh, err := s.insertFreshQuote(ctx, tx, old, price, now)
@@ -608,7 +611,7 @@ func (s *Store) insertFreshQuote(ctx context.Context, tx *sql.Tx, old quoteRow, 
 	}
 	expires := now.Add(old.expiresAt.Sub(old.createdAt))
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO cost_quote (id, owner, price_nd, denomination, state, expires_at, created_at)
+		`INSERT INTO `+s.tables.quote+` (id, owner, price_nd, denomination, state, expires_at, created_at)
 			VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		quoteID, old.owner, int64(price), s.denom.Name, quoteOpen, expires.UnixMilli(), now.UnixMilli()); err != nil {
 		return cost.Quote{}, fmt.Errorf("sqlitestore: fresh quote: %w", err)
@@ -619,8 +622,8 @@ func (s *Store) insertFreshQuote(ctx context.Context, tx *sql.Tx, old quoteRow, 
 // sweepQuotes removes every expired quote inside the caller's
 // transaction. It runs the statement the house sweeps reservations with,
 // so no scheduler and no caller code are needed.
-func sweepQuotes(ctx context.Context, tx *sql.Tx, now time.Time) (int64, error) {
-	result, err := tx.ExecContext(ctx, sweepQuotesSQL,
+func (s *Store) sweepQuotes(ctx context.Context, tx *sql.Tx, now time.Time) (int64, error) {
+	result, err := tx.ExecContext(ctx, s.sweepQuotesSQL(),
 		quoteClaimed, now.UnixMilli(), quoteClaimed, now.UnixMilli())
 	if err != nil {
 		return 0, fmt.Errorf("sqlitestore: sweep quotes: %w", err)
@@ -636,7 +639,7 @@ func sweepQuotes(ctx context.Context, tx *sql.Tx, now time.Time) (int64, error) 
 // its first caller, so a restart never carries dead quotes forward. It is
 // the statement the write paths run, on the writer pool directly.
 func (s *Store) sweepQuotesAtOpen(ctx context.Context, now time.Time) (int64, error) {
-	result, err := s.db.Writer().ExecContext(ctx, sweepQuotesSQL,
+	result, err := s.db.Writer().ExecContext(ctx, s.sweepQuotesSQL(),
 		quoteClaimed, now.UnixMilli(), quoteClaimed, now.UnixMilli())
 	if err != nil {
 		return 0, fmt.Errorf("sqlitestore: sweep quotes: %w", err)
@@ -651,9 +654,9 @@ func (s *Store) sweepQuotesAtOpen(ctx context.Context, now time.Time) (int64, er
 // purgeExpiredHolds removes every reservation whose expiry has passed, so
 // the claim bounds read only live holds. It is the sweep the reserve
 // paths run.
-func purgeExpiredHolds(ctx context.Context, tx *sql.Tx, now time.Time) (int64, error) {
+func (s *Store) purgeExpiredHolds(ctx context.Context, tx *sql.Tx, now time.Time) (int64, error) {
 	result, err := tx.ExecContext(ctx,
-		`DELETE FROM cost_reservation WHERE expires_at <= ?`, now.UnixMilli())
+		`DELETE FROM `+s.tables.reservation+` WHERE expires_at <= ?`, now.UnixMilli())
 	if err != nil {
 		return 0, fmt.Errorf("sqlitestore: purge reservations: %w", err)
 	}
@@ -667,13 +670,13 @@ func purgeExpiredHolds(ctx context.Context, tx *sql.Tx, now time.Time) (int64, e
 // readQuoteRow loads one quote row. It runs on the reader pool and inside
 // a write transaction alike, because both satisfy the query shape it
 // needs.
-func readQuoteRow(ctx context.Context, q querier, quoteID string) (quoteRow, error) {
+func (s *Store) readQuoteRow(ctx context.Context, q querier, quoteID string) (quoteRow, error) {
 	var row quoteRow
 	var price, outcome, outcomeMeasured, expiresAt, createdAt int64
 	err := q.QueryRowContext(ctx,
 		`SELECT id, owner, price_nd, denomination, state, outcome_nd, outcome_measured,
 			claim_expires_at, expires_at, created_at
-		FROM cost_quote WHERE id = ?`, quoteID).Scan(
+		FROM `+s.tables.quote+` WHERE id = ?`, quoteID).Scan(
 		&row.id, &row.owner, &price, &row.denomination, &row.state, &outcome,
 		&outcomeMeasured, &row.claimExpiresAt, &expiresAt, &createdAt)
 	if err != nil {
