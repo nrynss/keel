@@ -404,6 +404,41 @@ func TestOpenRefusesAPartialTableSet(t *testing.T) {
 	}
 }
 
+// TestOpenRefusesASupersetLedgerBesideAPartialTableSet drops one table from
+// a working namespace store and records one ledger row for a file this
+// binary does not carry, the shape a rollback from a newer binary leaves
+// beside outside damage. The ledger still records every file this binary
+// carries, so the open must refuse the file with ErrInvalid instead of
+// opening it and failing raw on the first read of the dropped table.
+func TestOpenRefusesASupersetLedgerBesideAPartialTableSet(t *testing.T) {
+	const namespace = "credits"
+	path := filepath.Join(t.TempDir(), "cost.db")
+	openStore(t, path, withNamespace(namespace), withLimit(1000))
+	seed := openFresh(t, path)
+	if _, err := seed.Exec(`DROP TABLE ` + namespace + `_grant`); err != nil {
+		t.Fatalf("drop a qualified table: %v", err)
+	}
+	if _, err := seed.Exec(
+		`INSERT INTO ` + namespace + `_schema_migrations (filename, applied_at) VALUES ('0007_future.sql', 0)`); err != nil {
+		t.Fatalf("record a file this binary does not carry: %v", err)
+	}
+	if n := freshCount(t, path, namespace+"_schema_migrations"); n != 7 {
+		t.Fatalf("migration ledger rows = %d, want the superset seven", n)
+	}
+	if n := freshPresentTables(t, path, namespace); n != 7 {
+		t.Fatalf("qualified tables present = %d, want the one-table-short seven", n)
+	}
+	_, err := sqlitestore.Open(t.Context(), sqlitestore.Config{
+		DB:        openDB(t, path),
+		Limit:     1000,
+		Namespace: namespace,
+		Logger:    slog.New(slog.DiscardHandler),
+	})
+	if !errors.Is(err, sqlitestore.ErrInvalid) {
+		t.Fatalf("open over a superset ledger beside a partial table set error = %v, want ErrInvalid", err)
+	}
+}
+
 // TestLedgerTableMirrorsTheRunnerNaming pins the ledger table name the
 // reset at open clears. The name mirrors the migration runner's own ledger
 // naming, so a fresh namespace must leave one ledger row per migration file

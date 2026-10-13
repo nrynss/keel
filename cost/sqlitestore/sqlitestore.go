@@ -58,8 +58,8 @@
 // under the default namespace reads its rows with no migration. Open sweeps
 // a ledger whose tables are all absent and applies the schema again, so
 // such a file opens as the fresh store its tables describe. A partly
-// present table set beside a complete ledger is corruption, and the open
-// refuses it.
+// present table set beside a ledger holding at least one row per file this
+// binary carries is corruption, and the open refuses it.
 //
 // A store speaks one Denomination for its whole life: its ceiling, its
 // owners, its grants and its ledger. The zero denomination is USD
@@ -317,9 +317,10 @@ type Reservation struct {
 // opens as the fresh store its tables describe. The rows under any other
 // names stay on disk unread. The sweep is one guarded statement, so a
 // concurrent open of the same file can never erase ledger rows whose
-// tables already exist. A partly present table set beside a complete
-// ledger refuses the open with ErrInvalid, because no path in this package
-// leaves it behind on its own. A ledger short beside a full table set is a
+// tables already exist. A partly present table set beside a ledger holding
+// at least one row per file this binary carries is corruption. The open
+// refuses it with ErrInvalid, because no path in this package leaves that
+// state behind. A ledger short beside a full table set is a
 // state the reconciliation does not cover. Open runs the migration runner
 // before it reconciles, so such a file fails in the runner first, and the
 // guard is what keeps that state from ever forming. A cancelled context
@@ -439,9 +440,9 @@ type schemaTree struct {
 }
 
 // fileCount returns how many migration files the tree serves. The
-// reconciliation compares it with the ledger's row count, so a ledger that
-// vouches for a complete schema is recognised even while its tables are
-// partly gone.
+// reconciliation compares it with the ledger's row count, so a ledger
+// holding at least one row per file is recognised even while its tables
+// are partly gone.
 func (t schemaTree) fileCount() int { return len(t.files) }
 
 // Open returns one migration file of the tree as an fs.File.
@@ -532,8 +533,9 @@ func (e schemaEntry) Info() (fs.FileInfo, error) { return e, nil }
 // prefix cannot see, so the sweep clears it and the runner applies the
 // files again. The file then opens as the fresh store its tables describe,
 // and the rows under other names stay on disk unread. A partly present
-// table set beside a complete ledger is dropped-table corruption, so the
-// open refuses it instead of healing it. The sweep is one guarded
+// table set beside a ledger holding at least one row per file this binary
+// carries is dropped-table corruption. The open refuses it instead of
+// healing it. The sweep is one guarded
 // statement. The guard re-counts the qualified tables inside the write
 // lock the delete itself takes. The ledger therefore only ever loses rows
 // while no table of this store exists. Concurrent opens of one file
@@ -548,15 +550,17 @@ func (s *Store) reconcileSchema(ctx context.Context, namespace string, schema sc
 	case present == len(names):
 		return nil
 	case present > 0:
-		// A partly present set with a full ledger means tables of a
-		// recorded schema are gone. Nothing in this package deletes a
-		// table, so healing would bury outside damage instead of
-		// reporting it.
+		// A partly present set beside a ledger holding at least one row
+		// per file this binary carries means tables of a recorded schema
+		// are gone. A newer binary records rows for files this one does
+		// not carry, and those rows outlive it on disk. Nothing in this
+		// package deletes a table, so healing would bury outside damage
+		// instead of reporting it.
 		rows, err := s.countLedgerRows(ctx, namespace)
 		if err != nil {
 			return err
 		}
-		if rows == schema.fileCount() {
+		if rows >= schema.fileCount() {
 			return fmt.Errorf("sqlitestore: namespace %q holds %d of its %d tables: %w",
 				namespace, present, len(names), ErrInvalid)
 		}
