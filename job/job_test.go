@@ -73,6 +73,8 @@ func (m *memStore) Finish(_ context.Context, rec Record) error {
 	cur.Status = rec.Status
 	cur.Data = rec.Data
 	cur.Err = rec.Err
+	cur.Code = rec.Code
+	cur.Detail = rec.Detail
 	cur.UpdatedAt = rec.UpdatedAt
 	m.records[rec.ID] = cur
 	return nil
@@ -349,6 +351,9 @@ func TestPanicBecomesErrorTerminal(t *testing.T) {
 	}
 	if payload.JobID != id || !strings.Contains(string(payload.Error), "illustrator exploded") {
 		t.Errorf("terminal payload = %s, want the panic value in the envelope", payload.Error)
+	}
+	if code := decodeEnvelope(t, payload.Error).Code; code != "job_failed" {
+		t.Errorf("envelope code = %q, want job_failed on the panic path", code)
 	}
 
 	res, err := r.Result(context.Background(), id)
@@ -701,8 +706,9 @@ func TestCancelRunningJobRecoversSlot(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Result(%s): %v", id, err)
 		}
-		if res.Status != StatusCancelled || res.Data != nil || !errors.Is(res.Err, context.Canceled) {
-			t.Errorf("Result(%s) = %+v, want cancelled with context.Canceled in the chain and nil data", id, res)
+		if res.Status != StatusCancelled || res.Data != nil || !errors.Is(res.Err, context.Canceled) ||
+			res.Code != "" || len(res.Detail) != 0 {
+			t.Errorf("Result(%s) = %+v, want cancelled with context.Canceled in the chain, nil data and no code", id, res)
 		}
 	}
 
@@ -787,9 +793,19 @@ func TestResultCapFailsJob(t *testing.T) {
 		if events[0].Name != wire.EventError {
 			t.Fatalf("terminal event = %+v, want %q", events[0], wire.EventError)
 		}
+		payload, ok := events[0].Data.(wire.ErrorEvent)
+		if !ok {
+			t.Fatalf("terminal payload = %T, want wire.ErrorEvent", events[0].Data)
+		}
+		if code := decodeEnvelope(t, payload.Error).Code; code != "job_failed" {
+			t.Errorf("envelope code = %q, want job_failed on the over-cap path", code)
+		}
 		res := waitStatus(t, r, id, StatusError)
 		if !errors.Is(res.Err, ErrResultTooLarge) {
 			t.Errorf("Err = %v, want errors.Is(.., ErrResultTooLarge)", res.Err)
+		}
+		if res.Code != "" || len(res.Detail) != 0 {
+			t.Errorf("Code, Detail = %q, %s, want empty on the over-cap path", res.Code, res.Detail)
 		}
 		if res.Data != nil {
 			t.Errorf("Data = %q, want nil alongside the cap failure", res.Data)

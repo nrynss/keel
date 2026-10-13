@@ -224,6 +224,63 @@ func TestTerminalErrorTextRoundTrip(t *testing.T) {
 	}
 }
 
+// TestErrorCodeAndDetailRoundTrip: Create and Finish store the failure code
+// and its raw detail beside the error text, and a terminal that names no
+// code reads back empty with a nil detail.
+func TestErrorCodeAndDetailRoundTrip(t *testing.T) {
+	store, _ := openStore(t)
+	coded := running("job-code", "render")
+	coded.Code = "budget_exhausted"
+	coded.Detail = json.RawMessage(`{"retry_after":30}`)
+	if err := store.Create(t.Context(), coded); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	got, err := store.Get(t.Context(), "job-code")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Code != "budget_exhausted" || string(got.Detail) != `{"retry_after":30}` {
+		t.Errorf("Get = %+v, want the code and detail Create stored", got)
+	}
+
+	terminal := job.Record{
+		ID:        "job-code",
+		Status:    job.StatusError,
+		Err:       errors.New("over budget"),
+		Code:      "budget_exhausted",
+		Detail:    json.RawMessage(`{"retry_after":30}`),
+		UpdatedAt: time.Unix(1700001200, 0),
+	}
+	if err := store.Finish(t.Context(), terminal); err != nil {
+		t.Fatalf("Finish: %v", err)
+	}
+	got, err = store.Get(t.Context(), "job-code")
+	if err != nil {
+		t.Fatalf("Get after Finish: %v", err)
+	}
+	if got.Status != job.StatusError || got.Err == nil || got.Err.Error() != "over budget" {
+		t.Errorf("Get = %+v, want the stored error text", got)
+	}
+	if got.Code != "budget_exhausted" || string(got.Detail) != `{"retry_after":30}` {
+		t.Errorf("Get = %+v, want the terminal code and detail", got)
+	}
+
+	if err := store.Create(t.Context(), running("job-plain", "render")); err != nil {
+		t.Fatalf("Create plain: %v", err)
+	}
+	plain := job.Record{ID: "job-plain", Status: job.StatusError, Err: errors.New("boom"), UpdatedAt: time.Unix(1700001300, 0)}
+	if err := store.Finish(t.Context(), plain); err != nil {
+		t.Fatalf("Finish plain: %v", err)
+	}
+	got, err = store.Get(t.Context(), "job-plain")
+	if err != nil {
+		t.Fatalf("Get plain: %v", err)
+	}
+	if got.Code != "" || got.Detail != nil {
+		t.Errorf("plain terminal Code, Detail = %q, %s, want empty and nil", got.Code, got.Detail)
+	}
+}
+
 // TestUnfinishedOldestFirst: the running and queued rows come back, ordered
 // by their last change, and a terminal row stays out.
 func TestUnfinishedOldestFirst(t *testing.T) {

@@ -31,7 +31,7 @@ var migrations embed.FS
 
 // selectColumns is the column list every read shares, in the order
 // scanRecord decodes it.
-const selectColumns = `SELECT id, kind, status, attempt, parent_id, root_id, progress, result, error, updated_at FROM jobs`
+const selectColumns = `SELECT id, kind, status, attempt, parent_id, root_id, progress, result, error, error_code, error_detail, updated_at FROM jobs`
 
 // ErrInvalid is returned by Open for unusable configuration, such as a nil
 // database.
@@ -89,10 +89,10 @@ func (s *Store) Create(ctx context.Context, rec job.Record) error {
 		return fmt.Errorf("sqlitestore: create %s: %w", rec.ID, err)
 	}
 	_, err = s.db.Writer().ExecContext(ctx,
-		`INSERT INTO jobs (id, kind, status, attempt, parent_id, root_id, progress, result, error, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO jobs (id, kind, status, attempt, parent_id, root_id, progress, result, error, error_code, error_detail, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		rec.ID, rec.Kind, string(rec.Status), rec.Attempt, rec.ParentID, rec.RootID,
-		progress, rec.Data, errorText(rec.Err), rec.UpdatedAt.UnixNano())
+		progress, rec.Data, errorText(rec.Err), rec.Code, string(rec.Detail), rec.UpdatedAt.UnixNano())
 	if err != nil {
 		return fmt.Errorf("sqlitestore: create %s: %w", rec.ID, err)
 	}
@@ -121,13 +121,13 @@ func (s *Store) SetProgress(ctx context.Context, rec job.Record) error {
 		progress, rec.UpdatedAt.UnixNano(), rec.ID)
 }
 
-// Finish records the job's terminal state. It updates Status, Data, Err and
-// UpdatedAt, keeps the Kind and lineage Create stored, and reports
-// ErrUnknownJob for an id it does not hold.
+// Finish records the job's terminal state. It updates Status, Data, Err,
+// Code, Detail and UpdatedAt, keeps the Kind and lineage Create stored, and
+// reports ErrUnknownJob for an id it does not hold.
 func (s *Store) Finish(ctx context.Context, rec job.Record) error {
 	return s.update(ctx, rec.ID,
-		`UPDATE jobs SET status = ?, result = ?, error = ?, updated_at = ? WHERE id = ?`,
-		string(rec.Status), rec.Data, errorText(rec.Err), rec.UpdatedAt.UnixNano(), rec.ID)
+		`UPDATE jobs SET status = ?, result = ?, error = ?, error_code = ?, error_detail = ?, updated_at = ? WHERE id = ?`,
+		string(rec.Status), rec.Data, errorText(rec.Err), rec.Code, string(rec.Detail), rec.UpdatedAt.UnixNano(), rec.ID)
 }
 
 // Get returns the record stored under id. A missing row reports
@@ -296,10 +296,12 @@ func scanRecord(row rowScanner, what string) (job.Record, error) {
 		status    string
 		progress  string
 		errText   string
+		errCode   string
+		errDetail string
 		updatedAt int64
 	)
 	err := row.Scan(&rec.ID, &rec.Kind, &status, &rec.Attempt, &rec.ParentID, &rec.RootID,
-		&progress, &rec.Data, &errText, &updatedAt)
+		&progress, &rec.Data, &errText, &errCode, &errDetail, &updatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return job.Record{}, fmt.Errorf("sqlitestore: %s: %w", what, job.ErrUnknownJob)
 	}
@@ -312,6 +314,10 @@ func scanRecord(row rowScanner, what string) (job.Record, error) {
 	}
 	if errText != "" {
 		rec.Err = errors.New(errText)
+	}
+	rec.Code = errCode
+	if errDetail != "" {
+		rec.Detail = json.RawMessage(errDetail)
 	}
 	rec.UpdatedAt = time.Unix(0, updatedAt)
 	return rec, nil
