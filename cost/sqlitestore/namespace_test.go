@@ -2,7 +2,11 @@ package sqlitestore_test
 
 import (
 	"context"
+	"errors"
+	"log/slog"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -315,5 +319,106 @@ func TestNamespaceReadsAsLowercase(t *testing.T) {
 	}
 	if n := freshCount(t, path, "usd_charge"); n != 1 {
 		t.Fatalf("charge rows through the case twin = %d, want 1", n)
+	}
+}
+
+// TestStrandedLedgerReopensAsAFreshStore hand-builds the file an earlier
+// layout leaves behind under a custom namespace: the rows sit under the
+// fixed default names while the ledger records every migration as applied
+// for the qualified one. Open must read that ledger as vouching for tables
+// it cannot see, apply the schema again, and hand back a fresh store. The
+// rows under the old names stay on disk unread.
+func TestStrandedLedgerReopensAsAFreshStore(t *testing.T) {
+	const namespace = "credits"
+	path := filepath.Join(t.TempDir(), "cost.db")
+	seed := openFresh(t, path)
+	schema := strings.ReplaceAll(fixedNameSchema,
+		"cost_schema_migrations", namespace+"_schema_migrations")
+	if _, err := seed.Exec(schema); err != nil {
+		t.Fatalf("build the stranded schema: %v", err)
+	}
+	if _, err := seed.Exec(
+		`INSERT INTO cost_charge (kind, units, unit_price, ref, denomination, created_at)
+			VALUES ('gen', 3, 10, 'job-1', '', 0)`); err != nil {
+		t.Fatalf("seed a charge under the old names: %v", err)
+	}
+	if _, err := seed.Exec(
+		`INSERT INTO cost_budget (id, limit_nd, spent_nd, denomination, minor_units)
+			VALUES (1, 1000, 30, '', 0)`); err != nil {
+		t.Fatalf("seed the ceiling under the old names: %v", err)
+	}
+	if err := seed.Close(); err != nil {
+		t.Fatalf("close the seed connection: %v", err)
+	}
+
+	store := openStore(t, path, withNamespace(namespace), withLimit(1000))
+	ctx := t.Context()
+	if got, err := store.Charges(ctx); err != nil || len(got) != 0 {
+		t.Fatalf("charges over the reopened store = %+v (err %v), want an empty ledger", got, err)
+	}
+	if spent, err := store.Spent(ctx); err != nil || spent != 0 {
+		t.Fatalf("spent over the reopened store = %d (err %v), want 0", spent, err)
+	}
+	if err := store.Add(ctx, cost.Charge{Kind: "gen", Units: 1, UnitPrice: 5, Ref: "fresh-1"}); err != nil {
+		t.Fatalf("add a charge over the reopened store: %v", err)
+	}
+	if n := freshCount(t, path, namespace+"_charge"); n != 1 {
+		t.Fatalf("qualified charge rows = %d, want the one fresh charge", n)
+	}
+	if n := freshCount(t, path, "cost_charge"); n != 1 {
+		t.Fatalf("charge rows under the old name = %d, want the seeded row still on disk", n)
+	}
+	if spent := freshSpent(t, path, "cost_budget"); spent != 30 {
+		t.Fatalf("spent under the old name = %d, want the seeded 30 still on disk", spent)
+	}
+	if n := freshCount(t, path, namespace+"_schema_migrations"); n != 6 {
+		t.Fatalf("migration ledger rows after the reopen = %d, want 6", n)
+	}
+}
+
+// TestOpenRefusesAPartialTableSet drops one table from a working namespace
+// store and reopens. Every migration commits whole or not at all, so a
+// schema one table short is corruption no ordinary path produces. The open
+// must refuse it with ErrInvalid instead of healing it.
+func TestOpenRefusesAPartialTableSet(t *testing.T) {
+	const namespace = "credits"
+	path := filepath.Join(t.TempDir(), "cost.db")
+	openStore(t, path, withNamespace(namespace), withLimit(1000))
+	if _, err := openFresh(t, path).Exec(`DROP TABLE ` + namespace + `_grant`); err != nil {
+		t.Fatalf("drop a qualified table: %v", err)
+	}
+	_, err := sqlitestore.Open(t.Context(), sqlitestore.Config{
+		DB:        openDB(t, path),
+		Limit:     1000,
+		Namespace: namespace,
+		Logger:    slog.New(slog.DiscardHandler),
+	})
+	if !errors.Is(err, sqlitestore.ErrInvalid) {
+		t.Fatalf("open over a one-table-short schema error = %v, want ErrInvalid", err)
+	}
+}
+
+// TestLedgerTableMirrorsTheRunnerNaming pins the ledger table name the
+// reset at open clears. The name mirrors the migration runner's own ledger
+// naming, so a fresh namespace must leave one ledger row per migration file
+// in a table of exactly that name. A silent rename in the runner then fails
+// here instead of turning the reset into a delete on a table that is not
+// there.
+func TestLedgerTableMirrorsTheRunnerNaming(t *testing.T) {
+	const namespace = "mirror"
+	path := filepath.Join(t.TempDir(), "cost.db")
+	openStore(t, path, withNamespace(namespace), withLimit(1000))
+	entries, err := os.ReadDir("migrations")
+	if err != nil {
+		t.Fatalf("list the migration files: %v", err)
+	}
+	want := 0
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".sql") {
+			want++
+		}
+	}
+	if n := freshCount(t, path, namespace+"_schema_migrations"); n != want {
+		t.Fatalf("migration ledger rows = %d, want one per migration file (%d)", n, want)
 	}
 }

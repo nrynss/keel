@@ -55,7 +55,10 @@
 // two isolated stores, which is how a dollar budget and a provider-credit
 // budget stay apart in one file. The empty namespace keeps the historical
 // table names, cost_charge and the rest, so a file an earlier version wrote
-// under the default namespace reads its rows with no migration.
+// under the default namespace reads its rows with no migration. Open clears
+// a ledger whose tables are all absent and applies the schema again, so
+// such a file opens as the fresh store its tables describe. A table set
+// that is only partly present is corruption, and the open refuses it.
 //
 // A store speaks one Denomination for its whole life: its ceiling, its
 // owners, its grants and its ledger. The zero denomination is USD
@@ -126,6 +129,11 @@ const schemaNamespace = "cost"
 // namespace-qualified prefix belongs. qualifiedSchema refuses a file
 // without it, so a later migration cannot apply to the wrong table.
 const schemaTable = "{{table}}"
+
+// schemaLedgerSuffix is the suffix of the migration ledger table a
+// namespace owns. It mirrors the ledger naming the sqlite package applies,
+// so the reset at open clears the one table the migration runner reads.
+const schemaLedgerSuffix = "_schema_migrations"
 
 //go:embed migrations/*.sql
 var migrations embed.FS
@@ -270,6 +278,15 @@ func newTables(namespace string) costTables {
 	}
 }
 
+// names lists the store's table names in one fixed order, so the presence
+// check at open binds every name as an argument.
+func (t costTables) names() []string {
+	return []string{
+		t.charge, t.budget, t.reservation, t.ownerBudget,
+		t.settle, t.settleOnce, t.grant, t.quote,
+	}
+}
+
 // A Store satisfies cost.ChargeSink, so a meter can take it as the sink that
 // records settled charges.
 var _ cost.ChargeSink = (*Store)(nil)
@@ -292,10 +309,15 @@ type Reservation struct {
 // configured ceiling and purges reservations that already expired, so a restart
 // frees the budget a dead process was holding. It refuses a file whose stored
 // denomination differs from cfg.Denomination, because a reopen under another
-// name would silently reprice every recorded amount. A cancelled context stops
-// the open and no store comes back, but the schema, its migration ledger row and
-// the ceiling may already have landed. Those bytes are inert, so a caller
-// may retry the open and a second open on the same file is unaffected.
+// name would silently reprice every recorded amount. Open also reconciles the
+// migration ledger with the tables it names. A ledger whose tables are all
+// absent is cleared and applied again, so the file opens as the fresh store
+// its tables describe. The rows under any other names stay on disk unread.
+// A table set that is only partly present refuses the open with ErrInvalid,
+// because no ordinary path leaves part of a schema behind. A cancelled context
+// stops the open and no store comes back, but the schema, its migration ledger
+// row and the ceiling may already have landed. Those bytes are inert, so a
+// caller may retry the open and a second open on the same file is unaffected.
 func Open(ctx context.Context, cfg Config) (*Store, error) {
 	if cfg.DB == nil {
 		return nil, fmt.Errorf("sqlitestore: open: %w: DB must not be nil", ErrInvalid)
@@ -352,6 +374,9 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 		quoteTolerance: cfg.QuoteTolerance,
 		reprice:        cfg.Reprice,
 		flights:        make(map[string]*quoteFlight),
+	}
+	if err := store.reconcileSchema(ctx, namespace, schema); err != nil {
+		return nil, fmt.Errorf("sqlitestore: open: %w", err)
 	}
 	if err := store.checkDenomination(ctx); err != nil {
 		return nil, fmt.Errorf("sqlitestore: open: %w", err)
@@ -486,6 +511,62 @@ func (e schemaEntry) Type() fs.FileMode { return e.Mode().Type() }
 
 // Info returns the entry as its own file info.
 func (e schemaEntry) Info() (fs.FileInfo, error) { return e, nil }
+
+// reconcileSchema aligns the migration ledger with the qualified tables on
+// disk. A ledger whose tables are all absent vouches for a schema this
+// prefix cannot see. Clearing the ledger and applying the files again opens
+// the file as the fresh store its tables describe, and the rows under other
+// names stay on disk unread. A partly present table set is corruption,
+// because every migration commits whole or not at all, so the open refuses
+// it instead of healing it.
+func (s *Store) reconcileSchema(ctx context.Context, namespace string, schema fs.FS) error {
+	names := s.tables.names()
+	present, err := s.countPresentTables(ctx, names)
+	if err != nil {
+		return err
+	}
+	switch {
+	case present == len(names):
+		return nil
+	case present == 0:
+		// The delete lands before the runner re-applies, so a crash
+		// between the two leaves an empty ledger and absent tables, a
+		// state the next open applies cleanly. Two processes resetting
+		// one stranded file converge through the runner's own
+		// concurrent-open handling.
+		if _, err := s.db.Writer().ExecContext(ctx,
+			`DELETE FROM `+namespace+schemaLedgerSuffix); err != nil {
+			return fmt.Errorf("sqlitestore: clear the migration ledger: %w", err)
+		}
+		if err := sqlite.Migrate(ctx, s.db, namespace, schema); err != nil {
+			return fmt.Errorf("sqlitestore: re-apply the schema: %w", err)
+		}
+		s.log.WarnContext(ctx,
+			"sqlitestore: the migration ledger recorded tables that were absent, so the schema was applied again",
+			"namespace", namespace)
+		return nil
+	default:
+		return fmt.Errorf("sqlitestore: namespace %q holds %d of its %d tables: %w",
+			namespace, present, len(names), ErrInvalid)
+	}
+}
+
+// countPresentTables counts how many of the store's qualified tables exist.
+// The names travel as arguments, so no table name lands in the statement
+// text.
+func (s *Store) countPresentTables(ctx context.Context, names []string) (int, error) {
+	placeholders := strings.TrimSuffix(strings.Repeat("?, ", len(names)), ", ")
+	query := `SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN (` + placeholders + `)`
+	args := make([]any, len(names))
+	for i, name := range names {
+		args[i] = name
+	}
+	var present int
+	if err := s.db.Writer().QueryRowContext(ctx, query, args...).Scan(&present); err != nil {
+		return 0, fmt.Errorf("sqlitestore: count the qualified tables: %w", err)
+	}
+	return present, nil
+}
 
 // checkDenomination refuses a file whose stored denomination differs from
 // the configured one. A file with no ceiling row yet accepts anything,

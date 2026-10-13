@@ -128,6 +128,17 @@ func freshCount(t *testing.T, path, table string) int {
 	return n
 }
 
+// freshSpent reads the booked spend of one budget table over a fresh
+// connection.
+func freshSpent(t *testing.T, path, table string) cost.Price {
+	t.Helper()
+	var spent int64
+	if err := openFresh(t, path).QueryRow("SELECT spent_nd FROM " + table + " WHERE id = 1").Scan(&spent); err != nil {
+		t.Fatalf("read %s: %v", table, err)
+	}
+	return cost.Price(spent)
+}
+
 // TestChargesRoundTripAndTotal pins that every field survives the database and
 // that the totals agree with the charges that were written.
 func TestChargesRoundTripAndTotal(t *testing.T) {
