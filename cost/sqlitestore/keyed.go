@@ -337,15 +337,15 @@ func (k *KeyedBudget) SpentSince(ctx context.Context, owner string, t time.Time)
 	return k.store.sumSettles(ctx, k.store.db.Reader(), owner, t.UnixMilli())
 }
 
-// ForgetOwner removes every row keyed to owner: the ceiling row in
-// cost_owner_budget, the owner's reservation rows and the owner's settle
-// history. It refuses with ErrReservationLive while the owner holds an
-// unexpired reservation, because that is money in flight. Settle or
+// ForgetOwner removes every row keyed to owner: the owner's ceiling row in
+// the owner budget table, the owner's reservation rows and the owner's
+// settle history. It refuses with ErrReservationLive while the owner holds
+// an unexpired reservation, because that is money in flight. Settle or
 // release the hold first, or let it expire. An owner no ceiling was ever
 // set for reports an error matching cost.ErrUnknownOwner, the answer the
 // keyed reads already use, so an erase.Target maps it to erase.ErrGone
 // without importing this package. Repeating an erase therefore answers
-// the same way again. The ledger is not the owner's: cost_charge rows key
+// the same way again. The ledger is not the owner's: charge rows key
 // by ref, not owner, so scoping them is the consumer's decision, and
 // ForgetOwner leaves every charge in place. It reports ErrInvalid when
 // owner is empty, as the other keyed methods do. A cancelled context

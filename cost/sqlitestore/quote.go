@@ -39,7 +39,7 @@ func (s *Store) sweepQuotesSQL() string {
 	WHERE (state <> ? AND expires_at <= ?) OR (state = ? AND claim_expires_at <= ?)`
 }
 
-// quoteRow is one cost_quote row in the shape the quote path reads.
+// quoteRow is one quote row in the shape the quote path reads.
 type quoteRow struct {
 	id              string
 	owner           string
