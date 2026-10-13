@@ -2,6 +2,8 @@ package job_test
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
@@ -137,6 +139,58 @@ func TestRecordSurvivesCancelledRequest(t *testing.T) {
 		t.Fatalf("Start under a cancelled request: %v", err)
 	}
 	waitForDurableStatus(t, reader, id, job.StatusDone)
+}
+
+// TestFailureCodeIsDurable pins the durable failure code. A job that fails
+// with a Failure keeps its code and detail beside the error text, so Result
+// after a restart reports the code the stream carried.
+func TestFailureCodeIsDurable(t *testing.T) {
+	ctx := context.Background()
+	writer, reader := openDurableStores(t)
+
+	broker := stream.New(stream.Config{Heartbeat: time.Hour})
+	runner, err := job.Open(ctx, job.Config{Broker: broker, Store: writer})
+	if err != nil {
+		t.Fatalf("job.Open: %v", err)
+	}
+
+	cause := errors.New("over budget")
+	id, err := runner.Start(ctx, func(context.Context, func(job.Progress)) ([]byte, error) {
+		return nil, fmt.Errorf("plan: %w", job.Failure{
+			Code:   "budget_exhausted",
+			Detail: map[string]int{"retry_after": 30},
+			Err:    cause,
+		})
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	stored := waitForDurableStatus(t, reader, id, job.StatusError)
+	if stored.Code != "budget_exhausted" {
+		t.Errorf("stored Code = %q, want budget_exhausted", stored.Code)
+	}
+	if string(stored.Detail) != `{"retry_after":30}` {
+		t.Errorf("stored Detail = %s, want the retry hint", stored.Detail)
+	}
+	if stored.Err == nil || stored.Err.Error() != "plan: "+cause.Error() {
+		t.Errorf("stored Err = %v, want the composed message", stored.Err)
+	}
+
+	// A restart over the same file: the job is terminal, so recovery
+	// republishes nothing, and Result reports what the stream carried.
+	fresh := stream.New(stream.Config{Heartbeat: time.Hour})
+	restarted, err := job.Open(ctx, job.Config{Broker: fresh, Store: writer})
+	if err != nil {
+		t.Fatalf("restart job.Open: %v", err)
+	}
+	res, err := restarted.Result(ctx, id)
+	if err != nil {
+		t.Fatalf("Result after restart: %v", err)
+	}
+	if res.Status != job.StatusError || res.Code != "budget_exhausted" || string(res.Detail) != `{"retry_after":30}` {
+		t.Errorf("Result after restart = %+v, want error with budget_exhausted and its detail", res)
+	}
 }
 
 // waitForDurableStatus reads id back through the given store until it reaches

@@ -31,6 +31,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -119,6 +120,39 @@ var (
 	ErrInterrupted = errors.New("job: interrupted")
 )
 
+// Failure is the error a work function returns when it can name why the job
+// failed. The Runner publishes Code and Detail in the error terminal's wire
+// envelope, so a client branches on the envelope code and never on the
+// message. Return it bare or wrapped from a Func, and callers recover the
+// cause with errors.As.
+//
+// Code must be a stable snake_case identifier the client branches on, never
+// prose. Detail is optional and follows the same rules as the detail
+// argument of wire.NewErrorEvent. A blank Code keeps the job_failed code and
+// still publishes the Detail. An error chain with no Failure in it keeps the
+// job_failed code every error carried before this type existed, so existing
+// consumers are unchanged.
+type Failure struct {
+	// Code is the stable snake_case wire code a client branches on. Empty
+	// means the job_failed fallback.
+	Code string
+	// Detail is optional JSON detail, as wire.NewErrorEvent accepts.
+	Detail any
+	// Err is the underlying cause. It may be nil.
+	Err error
+}
+
+// Error returns the cause's message when Err is set, and the code otherwise.
+func (f Failure) Error() string {
+	if f.Err != nil {
+		return f.Err.Error()
+	}
+	return "job: " + f.Code
+}
+
+// Unwrap returns the cause, nil when there is none.
+func (f Failure) Unwrap() error { return f.Err }
+
 // Progress is one progress report a job publishes. The Runner adds the job
 // id, so the report carries only what the work knows. Current and Total are
 // optional, and Detail is optional raw JSON the application alone reads.
@@ -167,6 +201,13 @@ type Result struct {
 	Data []byte
 	// Err is the terminal error, nil for a done job.
 	Err error
+	// Code is the stable wire code the error terminal carried, so a client
+	// branches on it and never on Err's message. It is empty unless Status
+	// is StatusError, and empty means the job_failed fallback.
+	Code string
+	// Detail is the raw JSON detail the error terminal carried, nil when
+	// the job named none.
+	Detail json.RawMessage
 }
 
 // Kind configures one class of job. Each kind runs under its own concurrency
@@ -245,13 +286,22 @@ type Record struct {
 	// chain, so a reader classifies on Status and reads Err for its
 	// message.
 	Err error
+	// Code is the stable error code the terminal carried, kept beside the
+	// error text so a restart reports the code the stream carried. Empty
+	// means the job_failed fallback, and it is empty for every status but
+	// error.
+	Code string
+	// Detail is the raw JSON detail the terminal carried, nil when the job
+	// named none.
+	Detail json.RawMessage
 	// UpdatedAt is when the record last changed.
 	UpdatedAt time.Time
 }
 
 // result maps a record to the catch-up Result.
 func (rec Record) result() Result {
-	return Result{ID: rec.ID, Status: rec.Status, Data: rec.Data, Err: rec.Err}
+	return Result{ID: rec.ID, Status: rec.Status, Data: rec.Data, Err: rec.Err,
+		Code: rec.Code, Detail: rec.Detail}
 }
 
 // Store records job state durably. This package declares the interface, and
@@ -270,8 +320,9 @@ type Store interface {
 	// SetProgress records the job's latest progress snapshot. It reads
 	// ID, Progress and UpdatedAt.
 	SetProgress(ctx context.Context, rec Record) error
-	// Finish records the job's terminal state. It updates Status, Data, Err
-	// and UpdatedAt, and keeps the Kind and lineage Create stored.
+	// Finish records the job's terminal state. It updates Status, Data,
+	// Err, Code, Detail and UpdatedAt, and keeps the Kind and lineage
+	// Create stored.
 	Finish(ctx context.Context, rec Record) error
 	// Get returns the record stored under id, or ErrUnknownJob.
 	Get(ctx context.Context, id string) (Record, error)
@@ -693,6 +744,17 @@ func (r *Runner) run(ctx context.Context, cancel context.CancelFunc, rec Record,
 	default:
 		res.Status = StatusError
 		res.Err = err
+		res.Code = failureCode
+		// A Failure in the chain names the terminal. A usable code replaces
+		// the fallback, and the detail travels either way, so a blank code
+		// loses nothing the work named.
+		var fail Failure
+		if errors.As(err, &fail) {
+			if strings.TrimSpace(fail.Code) != "" {
+				res.Code = fail.Code
+			}
+			res.Detail = r.encodeFailureDetail(rec.ID, fail.Detail)
+		}
 	}
 
 	terminal := Record{
@@ -700,6 +762,8 @@ func (r *Runner) run(ctx context.Context, cancel context.CancelFunc, rec Record,
 		Status:    res.Status,
 		Data:      res.Data,
 		Err:       res.Err,
+		Code:      res.Code,
+		Detail:    res.Detail,
 		UpdatedAt: r.now(),
 	}
 	if err := r.store.Finish(writeCtx, terminal); err != nil {
@@ -726,14 +790,19 @@ func (r *Runner) publishProgress(id string, p Progress) {
 }
 
 // publishTerminal publishes the one terminal event for a job. A failure
-// carries the wire error envelope, and every other status carries the wire
-// status payload. The event is marked terminal, so the broker retains it for
-// a subscriber that joins after the job ended.
+// carries the wire error envelope with the code the work named through
+// Failure, or the job_failed code when it named none. Every other status
+// carries the wire status payload. The event is marked terminal, so the
+// broker retains it for a subscriber that joins after the job ended.
 func (r *Runner) publishTerminal(res Result) {
 	name := string(res.Status)
 	var payload any
 	if res.Status == StatusError {
-		event, err := wire.NewErrorEvent(res.ID, failureCode, errorText(res.Err), nil)
+		code := res.Code
+		if code == "" {
+			code = failureCode
+		}
+		event, err := wire.NewErrorEvent(res.ID, code, errorText(res.Err), res.Detail)
 		if err != nil {
 			r.log.Error("job: encode error terminal", "id", res.ID, "error", err)
 			event = wire.ErrorEvent{JobID: res.ID, Status: name}
@@ -743,6 +812,27 @@ func (r *Runner) publishTerminal(res Result) {
 		payload = wire.StatusEvent{JobID: res.ID, Status: name}
 	}
 	r.broker.Publish(Topic(res.ID), stream.Event{Name: name, Data: payload, Terminal: true})
+}
+
+// encodeFailureDetail marshals the detail a Failure carries for the record.
+// A detail that fails to encode is logged like every other encode fault and
+// stored empty. A detail that encodes to null counts as absent, which is how
+// the wire envelope treats it on the stream too.
+func (r *Runner) encodeFailureDetail(id string, detail any) json.RawMessage {
+	if detail == nil {
+		return nil
+	}
+	raw, err := json.Marshal(detail)
+	switch {
+	case err != nil:
+		r.log.Error("job: encode failure detail", "id", id, "error", err)
+		return nil
+	case string(raw) == "null":
+		// A detail that encodes to null counts as absent.
+		return nil
+	default:
+		return raw
+	}
 }
 
 // errorText returns an error's message, or the empty string for a nil error.
