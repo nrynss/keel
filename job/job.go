@@ -124,7 +124,9 @@ var (
 // failed. The Runner publishes Code and Detail in the error terminal's wire
 // envelope, so a client branches on the envelope code and never on the
 // message. Return it bare or wrapped from a Func, and callers recover the
-// cause with errors.As.
+// cause with errors.As. The value form is the recommended shape. A *Failure
+// in the chain is honoured the same way, so a pointer return reaches the
+// terminal with its code and detail too.
 //
 // Code must be a stable snake_case identifier the client branches on, never
 // prose. Detail is optional and follows the same rules as the detail
@@ -730,6 +732,14 @@ func (r *Runner) run(ctx context.Context, cancel context.CancelFunc, rec Record,
 
 	data, err := call(ctx, fn, progress)
 
+	// A nil *Failure in the chain names nothing, and walking past it calls a
+	// value-receiver method on a nil receiver and panics. Swap it for a
+	// plain error, so the terminal keeps the job_failed fallback.
+	var pfail *Failure
+	if errors.As(err, &pfail) && pfail == nil {
+		err = errors.New("job: nil failure")
+	}
+
 	res := Result{ID: rec.ID, Data: data}
 	switch {
 	case err == nil && r.overCap(len(data)):
@@ -745,16 +755,21 @@ func (r *Runner) run(ctx context.Context, cancel context.CancelFunc, rec Record,
 		res.Status = StatusError
 		res.Err = err
 		res.Code = failureCode
-		// A Failure in the chain names the terminal. A usable code replaces
-		// the fallback, and the detail travels either way, so a blank code
-		// loses nothing the work named.
+		// A Failure in the chain names the terminal, as a value or as a
+		// pointer. A usable code replaces the fallback, and the detail
+		// travels either way, so a blank code loses nothing the work named.
+		// A nil pointer never lands here, because the swap above replaced
+		// it.
 		var fail Failure
-		if errors.As(err, &fail) {
-			if strings.TrimSpace(fail.Code) != "" {
-				res.Code = fail.Code
-			}
-			res.Detail = r.encodeFailureDetail(rec.ID, fail.Detail)
+		switch {
+		case errors.As(err, &fail):
+		case errors.As(err, &pfail) && pfail != nil:
+			fail = *pfail
 		}
+		if strings.TrimSpace(fail.Code) != "" {
+			res.Code = fail.Code
+		}
+		res.Detail = r.encodeFailureDetail(rec.ID, fail.Detail)
 	}
 
 	terminal := Record{

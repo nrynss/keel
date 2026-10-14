@@ -35,10 +35,11 @@ func decodeEnvelope(t *testing.T, raw json.RawMessage) envelopeBody {
 
 // TestFailureNamesTerminalCode pins the failure-code contract. A Failure in
 // the work function's error chain names the code and detail the error
-// terminal carries, and a wrapped Failure is still found. A blank code falls
-// back to job_failed while its detail still travels. A chain with no Failure
-// carries job_failed and no detail, which is what every error carried before
-// Failure existed.
+// terminal carries, as a value or as a pointer. A wrapped Failure is still
+// found. A blank code falls back to job_failed while its detail still
+// travels. A nil pointer names nothing, so it keeps the fallback too. A
+// chain with no Failure carries job_failed and no detail, which is what
+// every error carried before Failure existed.
 func TestFailureNamesTerminalCode(t *testing.T) {
 	cause := errors.New("reserve: over budget")
 	cases := []struct {
@@ -46,23 +47,49 @@ func TestFailureNamesTerminalCode(t *testing.T) {
 		err        error
 		wantCode   string
 		wantDetail string
+		// wantMessage overrides the expected envelope message for an error
+		// whose own Error method cannot be called, such as a typed nil.
+		wantMessage string
+		// wantCause marks an error that carries cause, so the terminal keeps
+		// it in the chain.
+		wantCause bool
 	}{
 		{
 			name:       "coded-failure",
 			err:        Failure{Code: "budget_exhausted", Detail: map[string]int{"retry_after": 30}, Err: cause},
 			wantCode:   "budget_exhausted",
 			wantDetail: `{"retry_after":30}`,
+			wantCause:  true,
 		},
 		{
 			name:       "wrapped-failure",
 			err:        fmt.Errorf("plan: %w", Failure{Code: "input_rejected", Detail: map[string]any{"field": "length"}, Err: cause}),
 			wantCode:   "input_rejected",
 			wantDetail: `{"field":"length"}`,
+			wantCause:  true,
 		},
 		{
-			name:     "failure-without-detail",
-			err:      Failure{Code: "provider_fault", Err: cause},
-			wantCode: "provider_fault",
+			name:       "coded-pointer-failure",
+			err:        &Failure{Code: "budget_spent", Detail: map[string]int{"retry_after": 30}, Err: cause},
+			wantCode:   "budget_spent",
+			wantDetail: `{"retry_after":30}`,
+			wantCause:  true,
+		},
+		{
+			// The conversion to error keeps go vet's %w check quiet, which
+			// asks for the value form. The wrapped pointer is the shape this
+			// row pins.
+			name:       "wrapped-pointer-failure",
+			err:        fmt.Errorf("plan: %w", error(&Failure{Code: "quota_spent", Detail: map[string]any{"field": "length"}, Err: cause})),
+			wantCode:   "quota_spent",
+			wantDetail: `{"field":"length"}`,
+			wantCause:  true,
+		},
+		{
+			name:      "failure-without-detail",
+			err:       Failure{Code: "provider_fault", Err: cause},
+			wantCode:  "provider_fault",
+			wantCause: true,
 		},
 		{
 			name: "blank-code-falls-back",
@@ -73,11 +100,19 @@ func TestFailureNamesTerminalCode(t *testing.T) {
 			},
 			wantCode:   "job_failed",
 			wantDetail: `{"field":"length"}`,
+			wantCause:  true,
 		},
 		{
-			name:     "plain-error-falls-back",
-			err:      cause,
-			wantCode: "job_failed",
+			name:        "nil-pointer-failure-falls-back",
+			err:         (*Failure)(nil),
+			wantCode:    "job_failed",
+			wantMessage: "job: nil failure",
+		},
+		{
+			name:      "plain-error-falls-back",
+			err:       cause,
+			wantCode:  "job_failed",
+			wantCause: true,
 		},
 	}
 	for _, tc := range cases {
@@ -96,11 +131,15 @@ func TestFailureNamesTerminalCode(t *testing.T) {
 				t.Fatalf("terminal payload = %T, want wire.ErrorEvent", events[0].Data)
 			}
 			body := decodeEnvelope(t, payload.Error)
+			wantMessage := tc.wantMessage
+			if wantMessage == "" {
+				wantMessage = tc.err.Error()
+			}
 			if body.Code != tc.wantCode {
 				t.Errorf("envelope code = %q, want %q", body.Code, tc.wantCode)
 			}
-			if body.Message != tc.err.Error() {
-				t.Errorf("envelope message = %q, want the error's own text %q", body.Message, tc.err.Error())
+			if body.Message != wantMessage {
+				t.Errorf("envelope message = %q, want %q", body.Message, wantMessage)
 			}
 			if tc.wantDetail == "" {
 				if body.Detail != nil {
@@ -126,7 +165,7 @@ func TestFailureNamesTerminalCode(t *testing.T) {
 			} else if string(res.Detail) != tc.wantDetail {
 				t.Errorf("Result.Detail = %s, want %s", res.Detail, tc.wantDetail)
 			}
-			if !errors.Is(res.Err, cause) {
+			if tc.wantCause && !errors.Is(res.Err, cause) {
 				t.Errorf("Result.Err = %v, want the cause still in the chain", res.Err)
 			}
 		})
