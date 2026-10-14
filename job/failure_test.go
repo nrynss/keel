@@ -233,6 +233,106 @@ type panicOnError struct{}
 // Error panics whatever it is asked.
 func (panicOnError) Error() string { panic("panicOnError: Error panicked") }
 
+// selfPoison panics with itself whenever its message is read, so every
+// further attempt to render it panics too. fmt tolerates one nested panic and
+// no more, so a render of this value without its own boundary ends the
+// process.
+type selfPoison struct{}
+
+// Error panics with the value itself.
+func (selfPoison) Error() string { panic(selfPoison{}) }
+
+// poisonLadder panics with its next rung when its message is read, and the
+// last rung panics with a string. A render has to step past two panics before
+// it can print anything.
+type poisonLadder struct{ rung int }
+
+// Error panics with the next rung, or with a string at the last one.
+func (e poisonLadder) Error() string {
+	if e.rung >= 2 {
+		panic("poisonLadder: the last rung panicked with a string")
+	}
+	panic(poisonLadder{rung: e.rung + 1})
+}
+
+// TestPoisonedRenderBecomesErrorTerminal pins the render policy: a value whose
+// own render poisons reaches an error terminal, whether a work function
+// returned it or panicked with it. The process keeps serving, and the message
+// names the panic. Without the boundary around the render, the second panic
+// escapes, the goroutine dies, and this test ends the test process.
+func TestPoisonedRenderBecomesErrorTerminal(t *testing.T) {
+	cases := []struct {
+		name string
+		fn   Func
+	}{
+		{
+			name: "returned-self-poison",
+			fn: func(context.Context, func(Progress)) ([]byte, error) {
+				return nil, selfPoison{}
+			},
+		},
+		{
+			name: "returned-poison-ladder",
+			fn: func(context.Context, func(Progress)) ([]byte, error) {
+				return nil, poisonLadder{}
+			},
+		},
+		{
+			name: "panicked-self-poison",
+			fn: func(context.Context, func(Progress)) ([]byte, error) {
+				panic(selfPoison{})
+			},
+		},
+		{
+			name: "panicked-poison-ladder",
+			fn: func(context.Context, func(Progress)) ([]byte, error) {
+				panic(poisonLadder{})
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b, r := newBrokerAndRunner(t)
+			id, sub := startGated(t, b, r, tc.fn)
+
+			events := drain(t, sub, 1)
+			if events[0].Name != wire.EventError {
+				t.Fatalf("terminal event = %+v, want %q", events[0], wire.EventError)
+			}
+			payload, ok := events[0].Data.(wire.ErrorEvent)
+			if !ok {
+				t.Fatalf("terminal payload = %T, want wire.ErrorEvent", events[0].Data)
+			}
+			body := decodeEnvelope(t, payload.Error)
+			if body.Code != "job_failed" {
+				t.Errorf("envelope code = %q, want the fallback", body.Code)
+			}
+			if !strings.Contains(body.Message, "job: panicked") {
+				t.Errorf("envelope message = %q, want the panic named", body.Message)
+			}
+
+			res, err := r.Result(context.Background(), id)
+			if err != nil {
+				t.Fatalf("Result: %v", err)
+			}
+			if res.Status != StatusError {
+				t.Errorf("Result.Status = %q, want %q", res.Status, StatusError)
+			}
+			if !errors.Is(res.Err, ErrPanic) {
+				t.Errorf("Result.Err = %v, want errors.Is(.., ErrPanic)", res.Err)
+			}
+
+			// The runner survives every shape: the next job runs normally.
+			_, sub2 := startGated(t, b, r, func(ctx context.Context, progress func(Progress)) ([]byte, error) {
+				return []byte("ok"), nil
+			})
+			if events := drain(t, sub2, 1); events[0].Name != wire.EventDone {
+				t.Errorf("next job terminal = %q, want %q", events[0].Name, wire.EventDone)
+			}
+		})
+	}
+}
+
 // onceError answers its first Error call and panics on every later one, so a
 // second read of the same value ends the process. It counts the calls.
 type onceError struct{ calls atomic.Int32 }
