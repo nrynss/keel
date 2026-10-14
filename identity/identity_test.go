@@ -289,6 +289,18 @@ func TestRevokedSessionFailsNextRequest(t *testing.T) {
 	}
 }
 
+// forgedValue returns good with its signature suffix overwritten, so the
+// result differs from good whatever the minted bytes are. The signature is
+// hex, so a fixed 00 suffix reproduces the minted value once in 256 mints and
+// the forged case would then assert on a good cookie.
+func forgedValue(good string) string {
+	suffix := "00"
+	if strings.HasSuffix(good, suffix) {
+		suffix = "11"
+	}
+	return good[:len(good)-2] + suffix
+}
+
 // TestForgedAndUnknownCookiesFail checks every bad cookie minted a fresh
 // guest instead of an error, and never resolved a user.
 func TestForgedAndUnknownCookiesFail(t *testing.T) {
@@ -297,7 +309,7 @@ func TestForgedAndUnknownCookiesFail(t *testing.T) {
 	cookie, user := fx.mint()
 	good := cookie.Value
 	cases := map[string]string{
-		"tampered signature": good[:len(good)-2] + "00",
+		"tampered signature": forgedValue(good),
 		"empty value":        "",
 		"no signature":       strings.SplitN(good, ".", 2)[0],
 		"unknown session":    "ffffffffffffffffffffffffffffffff." + strings.SplitN(good, ".", 2)[1],
@@ -315,6 +327,30 @@ func TestForgedAndUnknownCookiesFail(t *testing.T) {
 			t.Fatalf("%s: resolved the forged user %q", name, user.ID)
 		}
 	}
+}
+
+// TestForgedSignatureDiffersFromTheMintedOne pins the tamper itself: the
+// value the forged case sends is never the minted one. The flake this
+// replaced happened when the minted signature ended in 00, so the loop mints
+// until that exact case appears and then checks the tamper still forges it.
+func TestForgedSignatureDiffersFromTheMintedOne(t *testing.T) {
+	clock := &testClock{at: time.Unix(1758000000, 0)}
+	fx := openFixture(t, clock)
+	// A hex signature ends in 00 once in 256 mints, so the bound sits far
+	// above the expected run and the loop measures the case on purpose.
+	const bound = 100000
+	for i := 0; i < bound; i++ {
+		cookie, _ := fx.mint()
+		good := cookie.Value
+		if !strings.HasSuffix(good, "00") {
+			continue
+		}
+		if forged := forgedValue(good); forged == good {
+			t.Fatalf("forged value equals the minted one %q, want a tampered signature", good)
+		}
+		return
+	}
+	t.Fatalf("no minted signature ended in 00 across %d mints, the case went unmeasured", bound)
 }
 
 // TestBearerCarriesTheSameSession checks the signed cookie value works
