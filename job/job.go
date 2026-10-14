@@ -22,7 +22,12 @@
 // Panic policy: a job's function is caller supplied and may panic. The
 // Runner recovers at the job boundary, the one place a panic is a data
 // point rather than a corrupted process, and converts it to an error
-// terminal with ErrPanic in its chain. The process keeps serving.
+// terminal with ErrPanic in its chain. The process keeps serving. Reading
+// the error the function returns runs under the same boundary, because a
+// chain walk calls the caller's own methods. A malformed chain therefore
+// ends in an error terminal too, with ErrPanic in its chain and the
+// job_failed fallback, since a chain the Runner could not read names no
+// code.
 package job
 
 import (
@@ -102,8 +107,9 @@ var (
 	// concurrency limit. Start never blocks for a slot, so saturation
 	// surfaces here.
 	ErrLimit = errors.New("job: kind at capacity")
-	// ErrPanic wraps the value a job function panicked with. The terminal
-	// status is StatusError like any other failure.
+	// ErrPanic wraps the value a job function panicked with, and a panic
+	// an error raised while the Runner read it. The terminal status is
+	// StatusError like any other failure.
 	ErrPanic = errors.New("job: panicked")
 	// ErrNoBroker is returned by Open when no broker is configured.
 	// Progress and terminal events are the product, so a Runner that
@@ -140,7 +146,10 @@ type Failure struct {
 	Code string
 	// Detail is optional JSON detail, as wire.NewErrorEvent accepts.
 	Detail any
-	// Err is the underlying cause. It may be nil.
+	// Err is the underlying cause. It may be nil. A nil *Failure is not a
+	// usable cause, because Failure carries value-receiver methods and a
+	// chain cannot be walked through the nil pointer. The terminal then
+	// reports the panic it caught, with the job_failed fallback.
 	Err error
 }
 
@@ -284,9 +293,11 @@ type Record struct {
 	Progress Progress
 	// Data is the terminal result bytes.
 	Data []byte
-	// Err is the terminal error. A durable store keeps its text, not its
-	// chain, so a reader classifies on Status and reads Err for its
-	// message.
+	// Err is the terminal error. The Runner reads the message of an error a
+	// work function returned inside its terminal panic boundary, and
+	// records an error that answers with that message and unwraps to the
+	// function's own error. A durable store keeps its text, not its chain,
+	// so a reader classifies on Status and reads Err for its message.
 	Err error
 	// Code is the stable error code the terminal carried, kept beside the
 	// error text so a restart reports the code the stream carried. Empty
@@ -732,45 +743,7 @@ func (r *Runner) run(ctx context.Context, cancel context.CancelFunc, rec Record,
 
 	data, err := call(ctx, fn, progress)
 
-	// A nil *Failure in the chain names nothing, and walking past it calls a
-	// value-receiver method on a nil receiver and panics. Swap it for a
-	// plain error, so the terminal keeps the job_failed fallback.
-	var pfail *Failure
-	if errors.As(err, &pfail) && pfail == nil {
-		err = errors.New("job: nil failure")
-	}
-
-	res := Result{ID: rec.ID, Data: data}
-	switch {
-	case err == nil && r.overCap(len(data)):
-		res.Status = StatusError
-		res.Err = fmt.Errorf("%w: %d bytes over %d", ErrResultTooLarge, len(data), r.maxResultBytes)
-		res.Data = nil
-	case err == nil:
-		res.Status = StatusDone
-	case errors.Is(err, context.Canceled):
-		res.Status = StatusCancelled
-		res.Err = err
-	default:
-		res.Status = StatusError
-		res.Err = err
-		res.Code = failureCode
-		// A Failure in the chain names the terminal, as a value or as a
-		// pointer. A usable code replaces the fallback, and the detail
-		// travels either way, so a blank code loses nothing the work named.
-		// A nil pointer never lands here, because the swap above replaced
-		// it.
-		var fail Failure
-		switch {
-		case errors.As(err, &fail):
-		case errors.As(err, &pfail) && pfail != nil:
-			fail = *pfail
-		}
-		if strings.TrimSpace(fail.Code) != "" {
-			res.Code = fail.Code
-		}
-		res.Detail = r.encodeFailureDetail(rec.ID, fail.Detail)
-	}
+	res := r.terminal(rec.ID, data, err)
 
 	terminal := Record{
 		ID:        rec.ID,
@@ -785,6 +758,79 @@ func (r *Runner) run(ctx context.Context, cancel context.CancelFunc, rec Record,
 		r.log.Error("job: record terminal", "id", rec.ID, "kind", rec.Kind, "error", err)
 	}
 	r.publishTerminal(res)
+}
+
+// readError is the error a terminal records for the error a work function
+// returned. Error returns the message the Runner read inside the terminal
+// panic boundary, and Unwrap keeps the work function's own error for a caller
+// that asks with errors.Is or errors.As. A caller-supplied Error method
+// therefore runs once, inside the boundary, and a store that keeps the
+// message runs no caller code at all.
+type readError struct {
+	text string
+	err  error
+}
+
+// Error returns the message the Runner read.
+func (e readError) Error() string { return e.text }
+
+// Unwrap returns the work function's own error.
+func (e readError) Unwrap() error { return e.err }
+
+// terminal reads what a work function returned into the terminal result. A
+// work function supplies the value, so the entire reading runs inside a panic
+// boundary: walking an error chain and rendering its message both call the
+// caller's own methods, and a malformed value panics them. A nil *Failure
+// beneath a valid one is such a value, because Failure carries value-receiver
+// methods and no walk can step through the nil pointer. A caught panic
+// becomes the terminal's own data point, with ErrPanic in its chain and the
+// job_failed fallback, so the process keeps serving. A reading that succeeds
+// records a readError over the work function's error, so the message is read
+// once, here.
+func (r *Runner) terminal(id string, data []byte, err error) (res Result) {
+	defer func() {
+		if p := recover(); p != nil {
+			res = Result{
+				ID:     id,
+				Data:   data,
+				Status: StatusError,
+				Code:   failureCode,
+				Err:    fmt.Errorf("%w: reading the returned error: %v", ErrPanic, p),
+			}
+		}
+	}()
+
+	res = Result{ID: id, Data: data}
+	switch {
+	case err == nil && r.overCap(len(data)):
+		res.Status = StatusError
+		res.Err = fmt.Errorf("%w: %d bytes over %d", ErrResultTooLarge, len(data), r.maxResultBytes)
+		res.Data = nil
+	case err == nil:
+		res.Status = StatusDone
+	case errors.Is(err, context.Canceled):
+		res.Status = StatusCancelled
+		res.Err = readError{text: errorText(err), err: err}
+	default:
+		res.Status = StatusError
+		res.Code = failureCode
+		// A Failure in the chain names the terminal, as a value or as a
+		// pointer. A usable code replaces the fallback, and the detail
+		// travels either way, so a blank code loses nothing the work named.
+		var fail Failure
+		var pfail *Failure
+		switch {
+		case errors.As(err, &fail):
+		case errors.As(err, &pfail) && pfail != nil:
+			fail = *pfail
+		}
+		if strings.TrimSpace(fail.Code) != "" {
+			res.Code = fail.Code
+		}
+		res.Detail = r.encodeFailureDetail(id, fail.Detail)
+		res.Err = readError{text: errorText(err), err: err}
+	}
+	return res
 }
 
 // overCap reports whether a result of n bytes is over the configured cap.

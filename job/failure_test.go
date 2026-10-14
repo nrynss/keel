@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/nrynss/keel/wire"
@@ -37,9 +39,10 @@ func decodeEnvelope(t *testing.T, raw json.RawMessage) envelopeBody {
 // the work function's error chain names the code and detail the error
 // terminal carries, as a value or as a pointer. A wrapped Failure is still
 // found. A blank code falls back to job_failed while its detail still
-// travels. A nil pointer names nothing, so it keeps the fallback too. A
-// chain with no Failure carries job_failed and no detail, which is what
-// every error carried before Failure existed.
+// travels. A chain with no Failure carries job_failed and no detail, which is
+// what every error carried before Failure existed. A chain the Runner cannot
+// read, because a walk or a message render panics inside it, reaches the
+// terminal as the ErrPanic data point instead of ending the process.
 func TestFailureNamesTerminalCode(t *testing.T) {
 	cause := errors.New("reserve: over budget")
 	cases := []struct {
@@ -47,12 +50,13 @@ func TestFailureNamesTerminalCode(t *testing.T) {
 		err        error
 		wantCode   string
 		wantDetail string
-		// wantMessage overrides the expected envelope message for an error
-		// whose own Error method cannot be called, such as a typed nil.
-		wantMessage string
 		// wantCause marks an error that carries cause, so the terminal keeps
 		// it in the chain.
 		wantCause bool
+		// wantPanic marks an error whose chain cannot be read, so the
+		// terminal is the ErrPanic data point with the fallback code. The
+		// error's own Error method is never called by this test.
+		wantPanic bool
 	}{
 		{
 			name:       "coded-failure",
@@ -103,16 +107,48 @@ func TestFailureNamesTerminalCode(t *testing.T) {
 			wantCause:  true,
 		},
 		{
-			name:        "nil-pointer-failure-falls-back",
-			err:         (*Failure)(nil),
-			wantCode:    "job_failed",
-			wantMessage: "job: nil failure",
-		},
-		{
 			name:      "plain-error-falls-back",
 			err:       cause,
 			wantCode:  "job_failed",
 			wantCause: true,
+		},
+		{
+			name:      "nil-pointer-failure-panics",
+			err:       (*Failure)(nil),
+			wantCode:  "job_failed",
+			wantPanic: true,
+		},
+		{
+			name:      "value-over-nil-panics",
+			err:       fmt.Errorf("outer: %w", Failure{Code: "a", Err: (*Failure)(nil)}),
+			wantCode:  "job_failed",
+			wantPanic: true,
+		},
+		{
+			name:      "pointer-over-nil-panics",
+			err:       fmt.Errorf("outer: %w", error(&Failure{Code: "a", Err: (*Failure)(nil)})),
+			wantCode:  "job_failed",
+			wantPanic: true,
+		},
+		{
+			name:      "pointer-under-value-over-nil-panics",
+			err:       Failure{Code: "a", Err: &Failure{Code: "b", Err: (*Failure)(nil)}},
+			wantCode:  "job_failed",
+			wantPanic: true,
+		},
+		{
+			// The cancellation walk matches the join's first element, so the
+			// panic lands in the message render rather than the walk.
+			name:      "cancelled-join-over-nil-panics",
+			err:       errors.Join(context.Canceled, error(&Failure{Code: "a", Err: (*Failure)(nil)})),
+			wantCode:  "job_failed",
+			wantPanic: true,
+		},
+		{
+			name:      "panicking-error-method-panics",
+			err:       panicOnError{},
+			wantCode:  "job_failed",
+			wantPanic: true,
 		},
 	}
 	for _, tc := range cases {
@@ -131,15 +167,15 @@ func TestFailureNamesTerminalCode(t *testing.T) {
 				t.Fatalf("terminal payload = %T, want wire.ErrorEvent", events[0].Data)
 			}
 			body := decodeEnvelope(t, payload.Error)
-			wantMessage := tc.wantMessage
-			if wantMessage == "" {
-				wantMessage = tc.err.Error()
-			}
 			if body.Code != tc.wantCode {
 				t.Errorf("envelope code = %q, want %q", body.Code, tc.wantCode)
 			}
-			if body.Message != wantMessage {
-				t.Errorf("envelope message = %q, want %q", body.Message, wantMessage)
+			if tc.wantPanic {
+				if !strings.Contains(body.Message, "job: panicked") {
+					t.Errorf("envelope message = %q, want the panic named", body.Message)
+				}
+			} else if body.Message != tc.err.Error() {
+				t.Errorf("envelope message = %q, want the error's own text %q", body.Message, tc.err.Error())
 			}
 			if tc.wantDetail == "" {
 				if body.Detail != nil {
@@ -168,7 +204,83 @@ func TestFailureNamesTerminalCode(t *testing.T) {
 			if tc.wantCause && !errors.Is(res.Err, cause) {
 				t.Errorf("Result.Err = %v, want the cause still in the chain", res.Err)
 			}
+			if tc.wantPanic {
+				if res.Status != StatusError {
+					t.Errorf("Result.Status = %q, want %q", res.Status, StatusError)
+				}
+				if !errors.Is(res.Err, ErrPanic) {
+					t.Errorf("Result.Err = %v, want errors.Is(.., ErrPanic)", res.Err)
+				}
+
+				// The runner survives every shape: the next job runs
+				// normally.
+				_, sub2 := startGated(t, b, r, func(ctx context.Context, progress func(Progress)) ([]byte, error) {
+					return []byte("ok"), nil
+				})
+				if events := drain(t, sub2, 1); events[0].Name != wire.EventDone {
+					t.Errorf("next job terminal = %q, want %q", events[0].Name, wire.EventDone)
+				}
+			}
 		})
+	}
+}
+
+// panicOnError is an error whose own Error method panics, with no pointer
+// anywhere in its chain. A work function may return it, and the terminal path
+// may not end the process over it.
+type panicOnError struct{}
+
+// Error panics whatever it is asked.
+func (panicOnError) Error() string { panic("panicOnError: Error panicked") }
+
+// onceError answers its first Error call and panics on every later one, so a
+// second read of the same value ends the process. It counts the calls.
+type onceError struct{ calls atomic.Int32 }
+
+// Error returns the message on the first call and panics afterwards.
+func (e *onceError) Error() string {
+	if e.calls.Add(1) > 1 {
+		panic("onceError: Error called twice")
+	}
+	return "read once"
+}
+
+// TestTerminalReadsTheWorkErrorOnce pins the read policy: the Runner reads the
+// message of the error a work function returned inside its terminal boundary
+// and records that message, so the store and the stream never call the
+// caller's own Error method again. The harness error ends the process if they
+// do, and the Result keeps the value itself for errors.Is.
+func TestTerminalReadsTheWorkErrorOnce(t *testing.T) {
+	b, r := newBrokerAndRunner(t)
+	once := &onceError{}
+
+	id, sub := startGated(t, b, r, func(ctx context.Context, progress func(Progress)) ([]byte, error) {
+		return nil, once
+	})
+	events := drain(t, sub, 1)
+	if events[0].Name != wire.EventError {
+		t.Fatalf("terminal event = %+v, want %q", events[0], wire.EventError)
+	}
+	payload, ok := events[0].Data.(wire.ErrorEvent)
+	if !ok {
+		t.Fatalf("terminal payload = %T, want wire.ErrorEvent", events[0].Data)
+	}
+	if got := decodeEnvelope(t, payload.Error).Message; got != "read once" {
+		t.Errorf("envelope message = %q, want the message the Runner read", got)
+	}
+
+	res, err := r.Result(context.Background(), id)
+	if err != nil {
+		t.Fatalf("Result: %v", err)
+	}
+	if got := once.calls.Load(); got != 1 {
+		t.Errorf("Error calls = %d, want exactly the one read", got)
+	}
+	if res.Err == nil || res.Err.Error() != "read once" {
+		t.Errorf("Result.Err = %v, want the message the Runner read", res.Err)
+	}
+	if !errors.Is(res.Err, once) {
+		t.Errorf("Result.Err = %v, want the work function's own error in the chain", res.Err)
 	}
 }
 
