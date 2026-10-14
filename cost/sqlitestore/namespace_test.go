@@ -324,6 +324,91 @@ func TestNamespaceReadsAsLowercase(t *testing.T) {
 	}
 }
 
+// refusedOpen attempts an open that must fail with ErrInvalid, and returns
+// the error for the caller to inspect.
+func refusedOpen(t *testing.T, path, namespace string) error {
+	t.Helper()
+	_, err := sqlitestore.Open(t.Context(), sqlitestore.Config{
+		DB:        openDB(t, path),
+		Namespace: namespace,
+		Limit:     cost.Dollar,
+		Logger:    slog.New(slog.DiscardHandler),
+	})
+	if !errors.Is(err, sqlitestore.ErrInvalid) {
+		t.Fatalf("open %q error = %v, want ErrInvalid", namespace, err)
+	}
+	return err
+}
+
+// TestOpenRefusesANamespaceEndingInTheOwnerSuffix reproduces the issue. The
+// budget table of usd_owner is usd_owner_budget, which is also the
+// owner-budget table of usd. Open must refuse the second namespace before
+// any migration runs, and the first store must keep working.
+func TestOpenRefusesANamespaceEndingInTheOwnerSuffix(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cost.db")
+	usd := openStore(t, path, withNamespace("usd"), withLimit(cost.Dollar))
+
+	err := refusedOpen(t, path, "usd_owner")
+	if !strings.Contains(err.Error(), "usd_owner") {
+		t.Fatalf("open usd_owner error = %v, want it to name the namespace", err)
+	}
+
+	// The refused open wrote nothing, so the usd store keeps working.
+	ctx := t.Context()
+	charge := cost.Charge{Kind: "gen", Units: 1, UnitPrice: 500, Ref: "job-1"}
+	if err := usd.Add(ctx, charge); err != nil {
+		t.Fatalf("add after the refused open: %v", err)
+	}
+	got, err := usd.Charges(ctx)
+	if err != nil || len(got) != 1 || got[0] != charge {
+		t.Fatalf("charges after the refused open = %+v (err %v), want %+v", got, err, []cost.Charge{charge})
+	}
+}
+
+// TestOpenRefusesTheOwnerSuffixAloneOnAFreshFile opens the suffixed
+// namespace first, with no other namespace on the file. The refusal is
+// unconditional, because the base namespace may open later, and the file
+// must stay usable for it afterwards.
+func TestOpenRefusesTheOwnerSuffixAloneOnAFreshFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cost.db")
+	refusedOpen(t, path, "usd_owner")
+	// The namespace folds to lowercase before the check, so the upper
+	// spelling is the same refusal.
+	refusedOpen(t, path, "USD_OWNER")
+
+	// The refusals wrote nothing, so the base namespace opens the file.
+	store := openStore(t, path, withNamespace("usd"), withLimit(cost.Dollar))
+	ctx := t.Context()
+	charge := cost.Charge{Kind: "gen", Units: 2, UnitPrice: 10, Ref: "job-2"}
+	if err := store.Add(ctx, charge); err != nil {
+		t.Fatalf("add after the refused opens: %v", err)
+	}
+	got, err := store.Charges(ctx)
+	if err != nil || len(got) != 1 || got[0] != charge {
+		t.Fatalf("charges after the refused opens = %+v (err %v), want %+v", got, err, []cost.Charge{charge})
+	}
+}
+
+// TestANamespaceContainingTheSuffixButNotEndingInItStillOpens pins the
+// boundary of the refusal. The suffix must sit at the end of the name, so
+// owner_pool opens and owns its tables beside any neighbour.
+func TestANamespaceContainingTheSuffixButNotEndingInItStillOpens(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cost.db")
+	store := openStore(t, path, withNamespace("owner_pool"), withLimit(1000))
+	ctx := t.Context()
+	charge := cost.Charge{Kind: "gen", Units: 1, UnitPrice: 5, Ref: "job-1"}
+	if err := store.Add(ctx, charge); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	got, err := store.Charges(ctx)
+	if err != nil || len(got) != 1 || got[0] != charge {
+		t.Fatalf("charges = %+v (err %v), want %+v", got, err, []cost.Charge{charge})
+	}
+	if n := freshCount(t, path, "owner_pool_schema_migrations"); n != 6 {
+		t.Fatalf("migration ledger rows = %d, want 6", n)
+	}
+}
+
 // TestStrandedLedgerReopensAsAFreshStore hand-builds the file an earlier
 // layout leaves behind under a custom namespace: the rows sit under the
 // fixed default names while the ledger records every migration as applied

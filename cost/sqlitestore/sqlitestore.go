@@ -136,6 +136,12 @@ const schemaTable = "{{table}}"
 // so the reset at open clears the one table the migration runner reads.
 const schemaLedgerSuffix = "_schema_migrations"
 
+// ownerSuffix is the namespace ending Open refuses. A namespace cut from a
+// base name by this suffix derives its budget table into the base
+// namespace's owner-budget table, so the two namespaces would share one
+// table.
+const ownerSuffix = "_owner"
+
 //go:embed migrations/*.sql
 var migrations embed.FS
 
@@ -166,7 +172,9 @@ type Config struct {
 	// historical table names, cost_charge and the rest. Two different
 	// namespaces share one database file as two isolated stores, which
 	// is how a dollar budget and a provider-credit budget stay apart in
-	// one file.
+	// one file. A name ending in _owner is refused with ErrInvalid,
+	// because its budget table would collide with the base namespace's
+	// owner-budget table.
 	Namespace string
 
 	// Limit is the budget ceiling. It must not be below zero. The store
@@ -346,6 +354,17 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 	namespace := strings.ToLower(cfg.Namespace)
 	if namespace == "" {
 		namespace = schemaNamespace
+	}
+	// A namespace ending in _owner collides with the namespace its name
+	// is cut from. The budget table of usd_owner is usd_owner_budget,
+	// which is also the owner-budget table of usd. The second open of
+	// the pair then fails inside the migration runner on a table that
+	// already exists. Open refuses the suffix before any migration runs.
+	// The refusal is unconditional, so a name ending in _owner is
+	// refused even alone on a fresh file. The base namespace may open
+	// later, and this error is the one shape a caller can branch on.
+	if strings.HasSuffix(namespace, ownerSuffix) {
+		return nil, fmt.Errorf("sqlitestore: open: namespace %q: %w: ends in the reserved owner suffix", namespace, ErrInvalid)
 	}
 	embedded, err := fs.Sub(migrations, "migrations")
 	if err != nil {
