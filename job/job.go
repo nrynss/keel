@@ -27,7 +27,8 @@
 // chain walk calls the caller's own methods. A malformed chain therefore
 // ends in an error terminal too, with ErrPanic in its chain and the
 // job_failed fallback, since a chain the Runner could not read names no
-// code.
+// code. A panic value whose own render panics is named by its type, because
+// rendering that value again would end the process.
 package job
 
 import (
@@ -795,7 +796,7 @@ func (r *Runner) terminal(id string, data []byte, err error) (res Result) {
 				Data:   data,
 				Status: StatusError,
 				Code:   failureCode,
-				Err:    fmt.Errorf("%w: reading the returned error: %v", ErrPanic, p),
+				Err:    fmt.Errorf("%w: reading the returned error: %s", ErrPanic, panicText(p)),
 			}
 		}
 	}()
@@ -911,8 +912,21 @@ func call(ctx context.Context, fn Func, progress func(Progress)) (data []byte, e
 	defer func() {
 		if p := recover(); p != nil {
 			data = nil
-			err = fmt.Errorf("%w: %v", ErrPanic, p)
+			err = fmt.Errorf("%w: %s", ErrPanic, panicText(p))
 		}
 	}()
 	return fn(ctx, progress)
+}
+
+// panicText renders a value a recover returned. The value is caller code, so
+// the render runs inside its own panic boundary: a value whose own render
+// poisons falls back to its type, rather than escaping the boundary that just
+// caught the first panic and ending the process.
+func panicText(p any) (text string) {
+	defer func() {
+		if inner := recover(); inner != nil {
+			text = fmt.Sprintf("unprintable %T panic value", p)
+		}
+	}()
+	return fmt.Sprint(p)
 }
