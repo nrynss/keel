@@ -91,6 +91,13 @@ type querier interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
+// readTx opens a read-only transaction on the reader pool, so a listing and
+// the document check before it read one snapshot. A document erased between
+// the two reads can then never list as an empty history.
+func (s *Store) readTx(ctx context.Context) (*sql.Tx, error) {
+	return s.db.Reader().BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+}
+
 // checkBody refuses an empty author or a body that is not valid JSON.
 func checkBody(op string, body []byte, author string) error {
 	if author == "" {
@@ -154,6 +161,9 @@ func (s *Store) Create(ctx context.Context, doc, owner string, body []byte, auth
 // Document reads the document's record. An unknown id reports
 // revision.ErrUnknownDocument.
 func (s *Store) Document(ctx context.Context, doc string) (revision.Document, error) {
+	if err := checkDoc("document", doc); err != nil {
+		return revision.Document{}, err
+	}
 	d, err := loadDocument(ctx, s.db.Reader(), doc)
 	if err != nil {
 		return revision.Document{}, fmt.Errorf("sqlitestore: document %s: %w", doc, err)
@@ -174,7 +184,7 @@ func loadDocument(ctx context.Context, q querier, doc string) (revision.Document
 	if err != nil {
 		return revision.Document{}, err
 	}
-	d.CreatedAt = time.Unix(0, created)
+	d.CreatedAt = time.Unix(0, created).UTC()
 	return d, nil
 }
 
@@ -240,10 +250,18 @@ func (s *Store) Commit(ctx context.Context, doc string, parent int64, body []byt
 // a long history lists cheaply; Get reads one body. An unknown id reports
 // revision.ErrUnknownDocument.
 func (s *Store) History(ctx context.Context, doc string) ([]revision.Revision, error) {
-	if _, err := loadDocument(ctx, s.db.Reader(), doc); err != nil {
+	if err := checkDoc("history", doc); err != nil {
+		return nil, err
+	}
+	tx, err := s.readTx(ctx)
+	if err != nil {
 		return nil, fmt.Errorf("sqlitestore: history %s: %w", doc, err)
 	}
-	rows, err := s.db.Reader().QueryContext(ctx,
+	defer func() { _ = tx.Rollback() }() // a read-only transaction has nothing to keep
+	if _, err := loadDocument(ctx, tx, doc); err != nil {
+		return nil, fmt.Errorf("sqlitestore: history %s: %w", doc, err)
+	}
+	rows, err := tx.QueryContext(ctx,
 		`SELECT number, parent, author, proposal, committed_at FROM revision_entry
 		WHERE document = ? ORDER BY number DESC`, doc)
 	if err != nil {
@@ -257,7 +275,7 @@ func (s *Store) History(ctx context.Context, doc string) ([]revision.Revision, e
 		if err := rows.Scan(&r.Number, &r.Parent, &r.Author, &r.Proposal, &at); err != nil {
 			return nil, fmt.Errorf("sqlitestore: history %s: %w", doc, err)
 		}
-		r.CommittedAt = time.Unix(0, at)
+		r.CommittedAt = time.Unix(0, at).UTC()
 		out = append(out, r)
 	}
 	if err := rows.Err(); err != nil {
@@ -270,7 +288,15 @@ func (s *Store) History(ctx context.Context, doc string) ([]revision.Revision, e
 // never committed or pruned, reports revision.ErrUnknownRevision. An unknown
 // id reports revision.ErrUnknownDocument.
 func (s *Store) Get(ctx context.Context, doc string, rev int64) (revision.Revision, error) {
-	r, err := loadRevision(ctx, s.db.Reader(), doc, rev, true)
+	if err := checkDoc("get", doc); err != nil {
+		return revision.Revision{}, err
+	}
+	tx, err := s.readTx(ctx)
+	if err != nil {
+		return revision.Revision{}, fmt.Errorf("sqlitestore: get %s@%d: %w", doc, rev, err)
+	}
+	defer func() { _ = tx.Rollback() }() // a read-only transaction has nothing to keep
+	r, err := loadRevision(ctx, tx, doc, rev, true)
 	if err != nil {
 		return revision.Revision{}, fmt.Errorf("sqlitestore: get %s@%d: %w", doc, rev, err)
 	}
@@ -282,8 +308,14 @@ func (s *Store) Get(ctx context.Context, doc string, rev int64) (revision.Revisi
 func loadRevision(ctx context.Context, q querier, doc string, rev int64, body bool) (revision.Revision, error) {
 	r := revision.Revision{Document: doc, Number: rev}
 	var at int64
+	// The body column is read only when the caller wants it, so a pin check
+	// on a large document never loads the document.
+	bodyColumn := "NULL"
+	if body {
+		bodyColumn = "body"
+	}
 	err := q.QueryRowContext(ctx,
-		`SELECT parent, author, proposal, body, committed_at FROM revision_entry
+		`SELECT parent, author, proposal, `+bodyColumn+`, committed_at FROM revision_entry
 		WHERE document = ? AND number = ?`, doc, rev).
 		Scan(&r.Parent, &r.Author, &r.Proposal, &r.Body, &at)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -295,10 +327,7 @@ func loadRevision(ctx context.Context, q querier, doc string, rev int64, body bo
 	if err != nil {
 		return revision.Revision{}, err
 	}
-	if !body {
-		r.Body = nil
-	}
-	r.CommittedAt = time.Unix(0, at)
+	r.CommittedAt = time.Unix(0, at).UTC()
 	return r, nil
 }
 
@@ -307,6 +336,9 @@ func loadRevision(ctx context.Context, q querier, doc string, rev int64, body bo
 // marks another revision reports revision.ErrPinTaken. A number the document
 // does not hold reports revision.ErrUnknownRevision.
 func (s *Store) Pin(ctx context.Context, doc string, rev int64, name string) (revision.Pin, error) {
+	if err := checkDoc("pin", doc); err != nil {
+		return revision.Pin{}, err
+	}
 	if name == "" {
 		return revision.Pin{}, fmt.Errorf("sqlitestore: pin: %w: name must not be empty", revision.ErrInvalid)
 	}
@@ -324,7 +356,7 @@ func (s *Store) Pin(ctx context.Context, doc string, rev int64, name string) (re
 		`SELECT number, pinned_at FROM revision_pin WHERE document = ? AND name = ?`, doc, name).Scan(&held, &at)
 	switch {
 	case err == nil && held == rev:
-		return revision.Pin{Name: name, Revision: rev, PinnedAt: time.Unix(0, at)}, nil
+		return revision.Pin{Name: name, Revision: rev, PinnedAt: time.Unix(0, at).UTC()}, nil
 	case err == nil:
 		return revision.Pin{}, fmt.Errorf("sqlitestore: pin %s@%d: %q marks %d: %w", doc, rev, name, held, revision.ErrPinTaken)
 	case !errors.Is(err, sql.ErrNoRows):
@@ -344,6 +376,9 @@ func (s *Store) Pin(ctx context.Context, doc string, rev int64, name string) (re
 // Unpin removes the pin name, so its revision may be pruned again. A name
 // the document holds no pin under reports revision.ErrUnknownPin.
 func (s *Store) Unpin(ctx context.Context, doc, name string) error {
+	if err := checkDoc("unpin", doc); err != nil {
+		return err
+	}
 	res, err := s.db.Writer().ExecContext(ctx,
 		`DELETE FROM revision_pin WHERE document = ? AND name = ?`, doc, name)
 	if err != nil {
@@ -362,10 +397,18 @@ func (s *Store) Unpin(ctx context.Context, doc, name string) error {
 // Pins lists the document's pins ordered by name. An unknown id reports
 // revision.ErrUnknownDocument.
 func (s *Store) Pins(ctx context.Context, doc string) ([]revision.Pin, error) {
-	if _, err := loadDocument(ctx, s.db.Reader(), doc); err != nil {
+	if err := checkDoc("pins", doc); err != nil {
+		return nil, err
+	}
+	tx, err := s.readTx(ctx)
+	if err != nil {
 		return nil, fmt.Errorf("sqlitestore: pins %s: %w", doc, err)
 	}
-	rows, err := s.db.Reader().QueryContext(ctx,
+	defer func() { _ = tx.Rollback() }() // a read-only transaction has nothing to keep
+	if _, err := loadDocument(ctx, tx, doc); err != nil {
+		return nil, fmt.Errorf("sqlitestore: pins %s: %w", doc, err)
+	}
+	rows, err := tx.QueryContext(ctx,
 		`SELECT name, number, pinned_at FROM revision_pin WHERE document = ? ORDER BY name`, doc)
 	if err != nil {
 		return nil, fmt.Errorf("sqlitestore: pins %s: %w", doc, err)
@@ -378,7 +421,7 @@ func (s *Store) Pins(ctx context.Context, doc string) ([]revision.Pin, error) {
 		if err := rows.Scan(&p.Name, &p.Revision, &at); err != nil {
 			return nil, fmt.Errorf("sqlitestore: pins %s: %w", doc, err)
 		}
-		p.PinnedAt = time.Unix(0, at)
+		p.PinnedAt = time.Unix(0, at).UTC()
 		out = append(out, p)
 	}
 	if err := rows.Err(); err != nil {
@@ -389,10 +432,14 @@ func (s *Store) Pins(ctx context.Context, doc string) ([]revision.Pin, error) {
 
 // Prune drops every revision older than the newest keep, and reports how
 // many it dropped. A pinned revision and the head are never dropped,
-// whatever keep says. A keep below one reports revision.ErrInvalid. Open
-// proposals made on a dropped revision stay open, and an accept still
-// answers with the conflict rule.
+// whatever keep says. A keep below one reports revision.ErrInvalid. The
+// count covers revisions only. Accepted and rejected proposals made on a
+// dropped revision go too, so neither table grows without bound. Open
+// proposals stay open, and an accept still answers with the conflict rule.
 func (s *Store) Prune(ctx context.Context, doc string, keep int) (int, error) {
+	if err := checkDoc("prune", doc); err != nil {
+		return 0, err
+	}
 	if keep < 1 {
 		return 0, fmt.Errorf("sqlitestore: prune %s: %w: keep must be at least 1", doc, revision.ErrInvalid)
 	}
@@ -414,6 +461,14 @@ func (s *Store) Prune(ctx context.Context, doc string, keep int) (int, error) {
 	}
 	n, err := res.RowsAffected()
 	if err != nil {
+		return 0, fmt.Errorf("sqlitestore: prune %s: %w", doc, err)
+	}
+	// A decided proposal made on a pruned revision is history nobody can
+	// act on, so it goes with the revisions and the table stays bounded.
+	// An open proposal stays, because a person has not decided it yet.
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM revision_proposal WHERE document = ? AND parent <= ? AND state <> ?`,
+		doc, d.Head-int64(keep), string(revision.ProposalOpen)); err != nil {
 		return 0, fmt.Errorf("sqlitestore: prune %s: %w", doc, err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -483,9 +538,9 @@ func scanProposal(row scanner) (revision.Proposal, error) {
 		return revision.Proposal{}, err
 	}
 	p.State = revision.ProposalState(state)
-	p.CreatedAt = time.Unix(0, created)
+	p.CreatedAt = time.Unix(0, created).UTC()
 	if decided != 0 {
-		p.DecidedAt = time.Unix(0, decided)
+		p.DecidedAt = time.Unix(0, decided).UTC()
 	}
 	return p, nil
 }
@@ -513,12 +568,20 @@ func (s *Store) Proposal(ctx context.Context, pid string) (revision.Proposal, er
 // Proposals lists the document's proposals newest first, in every state. An
 // unknown id reports revision.ErrUnknownDocument.
 func (s *Store) Proposals(ctx context.Context, doc string) ([]revision.Proposal, error) {
-	if _, err := loadDocument(ctx, s.db.Reader(), doc); err != nil {
+	if err := checkDoc("proposals", doc); err != nil {
+		return nil, err
+	}
+	tx, err := s.readTx(ctx)
+	if err != nil {
 		return nil, fmt.Errorf("sqlitestore: proposals %s: %w", doc, err)
 	}
-	rows, err := s.db.Reader().QueryContext(ctx,
+	defer func() { _ = tx.Rollback() }() // a read-only transaction has nothing to keep
+	if _, err := loadDocument(ctx, tx, doc); err != nil {
+		return nil, fmt.Errorf("sqlitestore: proposals %s: %w", doc, err)
+	}
+	rows, err := tx.QueryContext(ctx,
 		`SELECT `+proposalColumns+` FROM revision_proposal WHERE document = ?
-		ORDER BY created_at DESC, id DESC`, doc)
+		ORDER BY created_at DESC, rowid DESC`, doc)
 	if err != nil {
 		return nil, fmt.Errorf("sqlitestore: proposals %s: %w", doc, err)
 	}
@@ -614,9 +677,13 @@ func (s *Store) Reject(ctx context.Context, pid, author string) (revision.Propos
 // ForgetOwner removes every document of owner, with all its revisions, pins
 // and proposals. Erasure outranks a pin, so pinned revisions go too. An owner
 // with no documents reports an error matching revision.ErrUnknownDocument,
+// and an empty owner reports revision.ErrInvalid,
 // so an erase.Target maps it to erase.ErrGone and a repeated erase answers
 // the same way. A cancelled context removes nothing.
 func (s *Store) ForgetOwner(ctx context.Context, owner string) error {
+	if owner == "" {
+		return fmt.Errorf("sqlitestore: forget owner: %w: owner must not be empty", revision.ErrInvalid)
+	}
 	tx, err := s.db.BeginWrite(ctx)
 	if err != nil {
 		return fmt.Errorf("sqlitestore: forget owner: %w", err)

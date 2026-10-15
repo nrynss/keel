@@ -448,3 +448,161 @@ func TestCancelledContextStoresNothing(t *testing.T) {
 		t.Fatalf("cancelled commit moved the head to %d", d.Head)
 	}
 }
+
+// TestRacingAcceptsOfOneProposalCommitOnce pins that a proposal accepted
+// from two places at once becomes exactly one revision.
+func TestRacingAcceptsOfOneProposalCommitOnce(t *testing.T) {
+	s := openStore(t)
+	create(t, s, "doc", "o")
+	p, err := s.Propose(t.Context(), "doc", 1, []byte(`{}`), "m")
+	if err != nil {
+		t.Fatalf("propose: %v", err)
+	}
+	const racers = 8
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	won, closed := 0, 0
+	for range racers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := s.Accept(context.Background(), p.ID, "ana")
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case err == nil:
+				won++
+			case errors.Is(err, revision.ErrClosed):
+				closed++
+			default:
+				t.Errorf("accept: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+	if won != 1 || closed != racers-1 {
+		t.Fatalf("won %d, closed %d", won, closed)
+	}
+	if d, _ := s.Document(t.Context(), "doc"); d.Head != 2 {
+		t.Fatalf("head = %d, want 2", d.Head)
+	}
+}
+
+// TestCommitsAcrossTwoHandlesOnOneFileKeepTheRule pins the compare-and-set
+// when two processes, each with its own handle, write one file.
+func TestCommitsAcrossTwoHandlesOnOneFileKeepTheRule(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "revision.db")
+	var stores [2]*sqlitestore.Store
+	for i := range stores {
+		st, err := sqlitestore.Open(t.Context(), sqlitestore.Config{DB: openDB(t, path), Logger: slog.New(slog.DiscardHandler)})
+		if err != nil {
+			t.Fatalf("open %d: %v", i, err)
+		}
+		stores[i] = st
+	}
+	create(t, stores[0], "doc", "o")
+	const writers = 8
+	const rounds = 10
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	won := 0
+	for i := range writers {
+		wg.Add(1)
+		go func(st *sqlitestore.Store) {
+			defer wg.Done()
+			for range rounds {
+				d, err := st.Document(context.Background(), "doc")
+				if err != nil {
+					t.Errorf("document: %v", err)
+					return
+				}
+				_, err = st.Commit(context.Background(), "doc", d.Head, []byte(`{}`), "ana")
+				if err != nil && !errors.Is(err, revision.ErrConflict) {
+					t.Errorf("commit: %v", err)
+					return
+				}
+				if err == nil {
+					mu.Lock()
+					won++
+					mu.Unlock()
+				}
+			}
+		}(stores[i%2])
+	}
+	wg.Wait()
+	d, err := stores[1].Document(t.Context(), "doc")
+	if err != nil {
+		t.Fatalf("document: %v", err)
+	}
+	if d.Head != int64(won)+1 {
+		t.Fatalf("head %d after %d won commits, want %d", d.Head, won, won+1)
+	}
+	h, _ := stores[1].History(t.Context(), "doc")
+	for i, r := range h {
+		if r.Number != d.Head-int64(i) || r.Parent != r.Number-1 {
+			t.Fatalf("history %d = %+v, the chain has a gap or a fork", i, r)
+		}
+	}
+}
+
+// TestPruneDropsDecidedProposalsAndKeepsOpenOnes pins that pruning bounds
+// the proposal table without discarding an undecided suggestion.
+func TestPruneDropsDecidedProposalsAndKeepsOpenOnes(t *testing.T) {
+	s := openStore(t)
+	ctx := t.Context()
+	create(t, s, "doc", "o")
+	rejected, _ := s.Propose(ctx, "doc", 1, []byte(`{}`), "m")
+	open, _ := s.Propose(ctx, "doc", 1, []byte(`{}`), "m")
+	accepted, _ := s.Propose(ctx, "doc", 1, []byte(`{}`), "m")
+	if _, err := s.Reject(ctx, rejected.ID, "ana"); err != nil {
+		t.Fatalf("reject: %v", err)
+	}
+	if _, err := s.Accept(ctx, accepted.ID, "ana"); err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	commit(t, s, "doc", 2, `{}`)
+	if _, err := s.Prune(ctx, "doc", 1); err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+	list, _ := s.Proposals(ctx, "doc")
+	if len(list) != 1 || list[0].ID != open.ID {
+		t.Fatalf("proposals after prune = %+v, want only the open one", list)
+	}
+}
+
+// TestEmptyIDsAreInvalidEverywhere pins that an empty document or owner is
+// refused as input, never read as an absent row.
+func TestEmptyIDsAreInvalidEverywhere(t *testing.T) {
+	s := openStore(t)
+	ctx := t.Context()
+	checks := map[string]error{}
+	_, checks["Document"] = s.Document(ctx, "")
+	_, checks["History"] = s.History(ctx, "")
+	_, checks["Get"] = s.Get(ctx, "", 1)
+	_, checks["Pin"] = s.Pin(ctx, "", 1, "x")
+	checks["Unpin"] = s.Unpin(ctx, "", "x")
+	_, checks["Pins"] = s.Pins(ctx, "")
+	_, checks["Prune"] = s.Prune(ctx, "", 1)
+	_, checks["Proposals"] = s.Proposals(ctx, "")
+	checks["ForgetOwner"] = s.ForgetOwner(ctx, "")
+	for name, err := range checks {
+		if !errors.Is(err, revision.ErrInvalid) {
+			t.Errorf("%s with an empty id = %v, want ErrInvalid", name, err)
+		}
+	}
+}
+
+// TestStampsReadBackInUTC pins the location every read stamps, as the other
+// stores do.
+func TestStampsReadBackInUTC(t *testing.T) {
+	s := openStore(t)
+	create(t, s, "doc", "o")
+	r, err := s.Get(t.Context(), "doc", 1)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	d, _ := s.Document(t.Context(), "doc")
+	if r.CommittedAt.Location() != time.UTC || d.CreatedAt.Location() != time.UTC {
+		t.Fatalf("stamps not UTC: %v %v", r.CommittedAt.Location(), d.CreatedAt.Location())
+	}
+}

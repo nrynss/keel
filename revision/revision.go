@@ -21,6 +21,10 @@
 // document of an owner, and an erase.Target maps its unknown-owner answer to
 // erase.ErrGone.
 //
+// The store does not authorize. A method that names a document or a
+// proposal id acts on it whoever asks, so a handler checks Document.Owner,
+// or the Document field of a proposal, against the caller first.
+//
 // Merging two edits, diffing bodies and real-time collaboration are out of
 // scope. The sqlitestore package provides the store over SQLite.
 package revision
@@ -221,6 +225,7 @@ type Store interface {
 	Pins(ctx context.Context, doc string) ([]Pin, error)
 	// Prune drops revisions older than the newest keep, sparing every
 	// pinned revision and the head, and reports how many it dropped.
+	// Decided proposals made on a dropped revision go with it.
 	Prune(ctx context.Context, doc string, keep int) (int, error)
 	// Propose stores a proposal made on parent.
 	Propose(ctx context.Context, doc string, parent int64, body []byte, author string) (Proposal, error)
