@@ -18,6 +18,9 @@
 // connection, because SQLite admits one writer at a time and a second
 // connection could only ever return SQLITE_BUSY. The reader pool holds
 // several connections, each opened with query_only so a read can never write.
+// Every transaction on the writer pool begins IMMEDIATE, so a write that
+// reads first waits out a lock another handle on the file holds instead of
+// failing with SQLITE_BUSY mid-transaction.
 //
 // Migrations are namespaced. Each namespace keeps its own version table, so
 // Keel stores and the embedding application share one database file without
@@ -257,6 +260,13 @@ func dsn(abs string, timeout time.Duration, readOnly bool) string {
 	q.Set("_busy_timeout", strconv.FormatInt(ms, 10))
 	if readOnly {
 		q.Set("_query_only", "on")
+	} else {
+		// The writer pool only writes, so its transactions take the write
+		// lock at BEGIN. A deferred BEGIN that reads first must upgrade
+		// mid-transaction, and SQLite refuses that upgrade with SQLITE_BUSY
+		// at once when another handle on the file committed since the read,
+		// without waiting on the busy timeout. BEGIN IMMEDIATE waits instead.
+		q.Set("_txlock", "immediate")
 	}
 	return (&url.URL{Scheme: "file", Path: abs, RawQuery: q.Encode()}).String()
 }
@@ -264,6 +274,24 @@ func dsn(abs string, timeout time.Duration, readOnly bool) string {
 // Writer returns the write pool. It holds one connection, so concurrent
 // writers queue rather than race for the file lock.
 func (db *DB) Writer() *sql.DB { return db.writer }
+
+// BeginWrite opens a transaction on the write pool. Writer transactions begin
+// IMMEDIATE, so a write lock another handle on the file holds is waited out
+// inside BEGIN, under the busy timeout. SQLite reports SQLITE_BUSY from that
+// wait even when ctx ended it, so BeginWrite joins ctx's error into the
+// returned one and errors.Is still tells a cancelled or timed out write from
+// a contended one. Prefer it to Writer().BeginTx, which returns the driver's
+// error alone.
+func (db *DB) BeginWrite(ctx context.Context) (*sql.Tx, error) {
+	tx, err := db.writer.BeginTx(ctx, nil)
+	if err != nil {
+		if cerr := ctx.Err(); cerr != nil && !errors.Is(err, cerr) {
+			return nil, errors.Join(cerr, err)
+		}
+		return nil, err
+	}
+	return tx, nil
+}
 
 // Reader returns the read pool. Every connection carries query_only, so a
 // statement sent here can never write.
@@ -383,7 +411,7 @@ func (db *DB) applyMigration(ctx context.Context, table, namespace string, fsys 
 	if err != nil {
 		return fmt.Errorf("sqlite: migrate: read %s: %w: %w", name, ErrMigration, err)
 	}
-	tx, err := db.writer.BeginTx(ctx, nil)
+	tx, err := db.BeginWrite(ctx)
 	if err != nil {
 		return fmt.Errorf("sqlite: migrate: begin %s: %w: %w", name, ErrMigration, err)
 	}

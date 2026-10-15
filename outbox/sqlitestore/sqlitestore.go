@@ -148,7 +148,7 @@ func (s *Store) eachID(ctx context.Context, ids []string, stmt, what string) err
 	if len(ids) == 0 {
 		return nil
 	}
-	tx, err := s.db.Writer().BeginTx(ctx, nil)
+	tx, err := s.db.BeginWrite(ctx)
 	if err != nil {
 		return fmt.Errorf("sqlitestore: %s: %w", what, err)
 	}

@@ -1183,3 +1183,59 @@ func TestCancelledOpenLeavesTheSchemaAndRetrySucceeds(t *testing.T) {
 	t.Logf("failed opens=%d, reported the deadline=%d, left the ledger=%d, left the full schema=%d",
 		failed, deadlineFailed, leftLedger, leftFull)
 }
+
+// TestBookingsAcrossHandlesOnASharedFileAreNotLost guards issue #100 at the
+// store level. The read-then-write upgrade itself is reproduced in the sqlite
+// package's TestWriteTransactionsAcrossHandlesWaitOutTheLock. Two
+// handles over one file stand in for the cost store sharing its database with
+// other stores that write at the same time. Every reserve and settle must
+// wait out the other handle's write lock instead of failing with
+// "database is locked", so the spend booked equals the spend settled.
+func TestBookingsAcrossHandlesOnASharedFileAreNotLost(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cost.db")
+	var stores [2]*sqlitestore.Store
+	for i := range stores {
+		st, err := sqlitestore.Open(t.Context(), sqlitestore.Config{
+			DB: openDBBusy(t, path, 5*time.Second), Limit: 1_000_000, Logger: slog.New(slog.DiscardHandler),
+		})
+		if err != nil {
+			t.Fatalf("open cost store %d: %v", i, err)
+		}
+		stores[i] = st
+	}
+	const workers = 8
+	const perWorker = 15
+	errs := make([]error, workers)
+	var wg sync.WaitGroup
+	for i := range workers {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			st := stores[i%2]
+			for j := range perWorker {
+				r, err := st.Reserve(t.Context(), 10)
+				if err != nil {
+					errs[i] = fmt.Errorf("worker %d reserve %d: %w", i, j, err)
+					return
+				}
+				if err := st.Settle(t.Context(), r, 1); err != nil {
+					errs[i] = fmt.Errorf("worker %d settle %d: %w", i, j, err)
+					return
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	spent, err := stores[0].Spent(t.Context())
+	if err != nil {
+		t.Fatalf("spent: %v", err)
+	}
+	if want := cost.Price(workers * perWorker); spent != want {
+		t.Fatalf("spent = %d, want %d", spent, want)
+	}
+}
