@@ -202,16 +202,24 @@ func Retry(ctx context.Context, cfg Config, retryable Retryable, call Call) erro
 // call early. Note is therefore the caller's annotation for the exhaustion
 // case. An error retryable rejects, a nil error, and a nil retryable are
 // returned untouched. One attempt is singular.
+//
+// Note classifies err with cfg.Transient the way Retry does. An error
+// Transient claims spent the TransientAttempts budget, so it is reported with
+// that count as a transient fault, not as throttling. Any other retryable
+// error is reported against Attempts as still throttled.
 func Note(err error, cfg Config, retryable Retryable) error {
 	if err == nil || retryable == nil || !retryable(err) {
 		return err
 	}
-	n := cfg.attempts()
+	n, state := cfg.attempts(), "still throttled"
+	if cfg.Transient != nil && cfg.Transient(err) {
+		n, state = cfg.transientAttempts(), "still failing transiently"
+	}
 	word := "attempts"
 	if n == 1 {
 		word = "attempt"
 	}
-	return fmt.Errorf("still throttled after %d %s: %w", n, word, err)
+	return fmt.Errorf("%s after %d %s: %w", state, n, word, err)
 }
 
 // Gate caps how many paid calls run at once. The zero value and a nil Gate
