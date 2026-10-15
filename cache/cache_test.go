@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -134,6 +135,30 @@ func callAsync(c *cache.Cache, ctx context.Context, key string, maker cache.Make
 	return ch
 }
 
+// waitForJoiner blocks until some goroutine waits inside a single flight
+// for a make another caller leads. The arrived signal fires before a
+// caller enters GetOrMake, so releasing the leader on it alone let a slow
+// second caller reach the flight after it closed and make again. The wait
+// reads goroutine stacks, the one place the join is observable, and fails
+// the test after a generous bound instead of hanging.
+func waitForJoiner(t *testing.T) {
+	t.Helper()
+	buf := make([]byte, 1<<20)
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		n := runtime.Stack(buf, true)
+		for _, g := range strings.Split(string(buf[:n]), "\n\n") {
+			if strings.Contains(g, "sync.(*WaitGroup).Wait") && strings.Contains(g, "singleflight.(*Group).Do") {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no caller joined the flight")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 // blockingMaker returns a maker that records its calls and blocks on release
 // until the test opens it. It closes started the first time it runs, which
 // happens only after the flight for the key is registered.
@@ -181,7 +206,8 @@ func TestGetOrMakeRunsOneMakeForConcurrentCallers(t *testing.T) {
 	<-started // started closes inside the make, so the flight is registered
 	second := callAsync(c, t.Context(), key, maker, arrived)
 	<-arrived
-	<-arrived // both callers are on their way into GetOrMake
+	<-arrived        // both callers are on their way into GetOrMake
+	waitForJoiner(t) // the second caller waits on the first one's flight
 	close(release)
 
 	firstOut, secondOut := <-first, <-second
@@ -679,12 +705,15 @@ func TestNilStoreSharesOnlyConcurrentCalls(t *testing.T) {
 	}
 
 	release := make(chan struct{})
-	blocking := blockingMaker(&makes, "together", nil, release)
+	started := make(chan struct{})
+	blocking := blockingMaker(&makes, "together", started, release)
 	arrived := make(chan struct{}, 2)
 	left := callAsync(c, t.Context(), key, blocking, arrived)
+	<-started // the leader's flight is registered
 	right := callAsync(c, t.Context(), key, blocking, arrived)
 	<-arrived
 	<-arrived
+	waitForJoiner(t) // the second caller waits on the leader's flight
 	close(release)
 	if leftOut, rightOut := <-left, <-right; leftOut.err != nil || rightOut.err != nil {
 		t.Fatalf("GetOrMake errors without a store: %v, %v", leftOut.err, rightOut.err)
