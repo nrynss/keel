@@ -155,7 +155,7 @@ func TestCommitOnAStaleParentConflictsWithTheHead(t *testing.T) {
 			t.Fatalf("Commit on %d = %v", parent, err)
 		}
 	}
-	if h, _ := s.History(ctx, "doc"); len(h) != 2 {
+	if h, _, _ := s.History(ctx, "doc", revision.Page{}); len(h) != 2 {
 		t.Fatalf("a refused commit stored a revision: %+v", h)
 	}
 	if _, err := s.Commit(ctx, "missing", 0, []byte(`{}`), "a"); !errors.Is(err, revision.ErrUnknownDocument) {
@@ -200,7 +200,7 @@ func TestHistoryIsNewestFirstWithoutBodies(t *testing.T) {
 	create(t, s, "doc", "o")
 	commit(t, s, "doc", 1, `{"v":2}`)
 	commit(t, s, "doc", 2, `{"v":3}`)
-	h, err := s.History(t.Context(), "doc")
+	h, _, err := s.History(t.Context(), "doc", revision.Page{})
 	if err != nil {
 		t.Fatalf("history: %v", err)
 	}
@@ -212,7 +212,7 @@ func TestHistoryIsNewestFirstWithoutBodies(t *testing.T) {
 			t.Fatalf("history carried a body: %+v", r)
 		}
 	}
-	if _, err := s.History(t.Context(), "missing"); !errors.Is(err, revision.ErrUnknownDocument) {
+	if _, _, err := s.History(t.Context(), "missing", revision.Page{}); !errors.Is(err, revision.ErrUnknownDocument) {
 		t.Fatalf("History(missing) = %v", err)
 	}
 }
@@ -285,7 +285,7 @@ func TestPruneSparesPinsAndTheHead(t *testing.T) {
 	if err != nil || n != 4 {
 		t.Fatalf("prune = %d, %v, want 4", n, err)
 	}
-	h, _ := s.History(ctx, "doc")
+	h, _, _ := s.History(ctx, "doc", revision.Page{})
 	if len(h) != 2 || h[0].Number != 6 || h[1].Number != 2 {
 		t.Fatalf("history after prune = %+v", h)
 	}
@@ -389,11 +389,11 @@ func TestProposalsListNewestFirst(t *testing.T) {
 	create(t, s, "doc", "o")
 	a, _ := s.Propose(ctx, "doc", 1, []byte(`{"a":1}`), "m")
 	b, _ := s.Propose(ctx, "doc", 1, []byte(`{"b":1}`), "m")
-	list, err := s.Proposals(ctx, "doc")
+	list, _, err := s.Proposals(ctx, "doc", revision.Page{})
 	if err != nil || len(list) != 2 || list[0].ID != b.ID || list[1].ID != a.ID {
 		t.Fatalf("proposals = %+v, %v", list, err)
 	}
-	if _, err := s.Proposals(ctx, "missing"); !errors.Is(err, revision.ErrUnknownDocument) {
+	if _, _, err := s.Proposals(ctx, "missing", revision.Page{}); !errors.Is(err, revision.ErrUnknownDocument) {
 		t.Fatalf("Proposals(missing) = %v", err)
 	}
 }
@@ -537,7 +537,7 @@ func TestCommitsAcrossTwoHandlesOnOneFileKeepTheRule(t *testing.T) {
 	if d.Head != int64(won)+1 {
 		t.Fatalf("head %d after %d won commits, want %d", d.Head, won, won+1)
 	}
-	h, _ := stores[1].History(t.Context(), "doc")
+	h, _, _ := stores[1].History(t.Context(), "doc", revision.Page{Limit: revision.MaxLimit})
 	for i, r := range h {
 		if r.Number != d.Head-int64(i) || r.Parent != r.Number-1 {
 			t.Fatalf("history %d = %+v, the chain has a gap or a fork", i, r)
@@ -564,7 +564,7 @@ func TestPruneDropsDecidedProposalsAndKeepsOpenOnes(t *testing.T) {
 	if _, err := s.Prune(ctx, "doc", 1); err != nil {
 		t.Fatalf("prune: %v", err)
 	}
-	list, _ := s.Proposals(ctx, "doc")
+	list, _, _ := s.Proposals(ctx, "doc", revision.Page{})
 	if len(list) != 1 || list[0].ID != open.ID {
 		t.Fatalf("proposals after prune = %+v, want only the open one", list)
 	}
@@ -577,13 +577,13 @@ func TestEmptyIDsAreInvalidEverywhere(t *testing.T) {
 	ctx := t.Context()
 	checks := map[string]error{}
 	_, checks["Document"] = s.Document(ctx, "")
-	_, checks["History"] = s.History(ctx, "")
+	_, _, checks["History"] = s.History(ctx, "", revision.Page{})
 	_, checks["Get"] = s.Get(ctx, "", 1)
 	_, checks["Pin"] = s.Pin(ctx, "", 1, "x")
 	checks["Unpin"] = s.Unpin(ctx, "", "x")
 	_, checks["Pins"] = s.Pins(ctx, "")
 	_, checks["Prune"] = s.Prune(ctx, "", 1)
-	_, checks["Proposals"] = s.Proposals(ctx, "")
+	_, _, checks["Proposals"] = s.Proposals(ctx, "", revision.Page{})
 	checks["ForgetOwner"] = s.ForgetOwner(ctx, "")
 	for name, err := range checks {
 		if !errors.Is(err, revision.ErrInvalid) {

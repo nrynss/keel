@@ -21,6 +21,13 @@
 // document of an owner, and an erase.Target maps its unknown-owner answer to
 // erase.ErrGone.
 //
+// An application separates its users by owner. Documents lists one owner's
+// documents, and ForgetOwner erases them; the store keeps no other namespace.
+// History, Proposals and Documents return one page at a time, keyset paged so
+// a commit or a prune between pages never repeats a row. A Page or OwnerPage
+// carries the limit, DefaultLimit when unset and never above MaxLimit, and
+// the cursor the previous page returned.
+//
 // The store does not authorize. A method that names a document or a
 // proposal id acts on it whoever asks, so a handler checks Document.Owner,
 // or the Document field of a proposal, against the caller first.
@@ -122,6 +129,40 @@ func WriteConflict(w http.ResponseWriter, c *ConflictError) error {
 		conflictDetail{Document: c.Document, Parent: c.Parent, Head: c.Head})
 }
 
+// DefaultLimit is the page size a listing uses when the page names none.
+const DefaultLimit = 50
+
+// MaxLimit is the largest page size a listing accepts. A larger Limit
+// reports ErrInvalid rather than a silently shorter page.
+const MaxLimit = 500
+
+// Page selects one page of a listing numbered newest first, History and
+// Proposals. Paging is keyset: the next page starts below the last number
+// returned, so a commit or a prune between two pages never shifts a row onto
+// two pages or skips one that still exists.
+type Page struct {
+	// Limit is the most rows the page holds. Zero means DefaultLimit. A
+	// negative value or one above MaxLimit reports ErrInvalid.
+	Limit int
+	// Before returns only rows numbered below it. Zero starts at the
+	// newest row. A negative value reports ErrInvalid. Pass the next
+	// cursor a listing returned to read the page after it.
+	Before int64
+}
+
+// OwnerPage selects one page of an owner's documents, ordered by id
+// ascending. Paging is keyset on the id, so a document created or erased
+// between two pages never repeats a row. A document created with an id
+// before the cursor lands on an earlier page and is not seen.
+type OwnerPage struct {
+	// Limit is the most documents the page holds. Zero means DefaultLimit.
+	// A negative value or one above MaxLimit reports ErrInvalid.
+	Limit int
+	// After returns only ids that sort after it. Empty starts at the
+	// first id. Pass the next cursor Documents returned to read on.
+	After string
+}
+
 // Document is one document's record.
 type Document struct {
 	// ID identifies the document.
@@ -184,6 +225,10 @@ type Proposal struct {
 	ID string
 	// Document is the document the proposal is for.
 	Document string
+	// Seq numbers the document's proposals from 1 in the order they were
+	// made. A number is never reused, even after Prune drops a proposal,
+	// and Proposals pages on it.
+	Seq int64
 	// Parent is the revision the proposal was made on.
 	Parent int64
 	// Author is who proposed, such as an automated step.
@@ -210,18 +255,26 @@ type Store interface {
 	Create(ctx context.Context, doc, owner string, body []byte, author string) (Revision, error)
 	// Document reads the document's record.
 	Document(ctx context.Context, doc string) (Document, error)
+	// Documents lists one page of owner's documents by id, and the After
+	// cursor of the next page, or "" when this page is the last. This is
+	// how an application separates its users: every document has one
+	// owner, and the store keeps no namespace beyond it.
+	Documents(ctx context.Context, owner string, page OwnerPage) ([]Document, string, error)
 	// Commit stores body as the next revision when parent is the head, and
 	// otherwise refuses with a *ConflictError carrying the head.
 	Commit(ctx context.Context, doc string, parent int64, body []byte, author string) (Revision, error)
-	// History lists the document's revisions newest first, without bodies.
-	History(ctx context.Context, doc string) ([]Revision, error)
+	// History lists one page of the document's revisions newest first,
+	// without bodies, and the Before cursor of the next page, or 0 when
+	// this page is the last.
+	History(ctx context.Context, doc string, page Page) ([]Revision, int64, error)
 	// Get reads one revision with its body.
 	Get(ctx context.Context, doc string, rev int64) (Revision, error)
 	// Pin marks rev as an approved take under name.
 	Pin(ctx context.Context, doc string, rev int64, name string) (Pin, error)
 	// Unpin removes the pin name.
 	Unpin(ctx context.Context, doc, name string) error
-	// Pins lists the document's pins by name.
+	// Pins lists the document's pins by name. It is not paged, because a
+	// pin is a person's approval and a document holds a handful.
 	Pins(ctx context.Context, doc string) ([]Pin, error)
 	// Prune drops revisions older than the newest keep, sparing every
 	// pinned revision and the head, and reports how many it dropped.
@@ -231,8 +284,10 @@ type Store interface {
 	Propose(ctx context.Context, doc string, parent int64, body []byte, author string) (Proposal, error)
 	// Proposal reads one proposal.
 	Proposal(ctx context.Context, id string) (Proposal, error)
-	// Proposals lists the document's proposals newest first.
-	Proposals(ctx context.Context, doc string) ([]Proposal, error)
+	// Proposals lists one page of the document's proposals newest first,
+	// and the Before cursor of the next page, or 0 when this page is the
+	// last.
+	Proposals(ctx context.Context, doc string, page Page) ([]Proposal, int64, error)
 	// Accept commits an open proposal under the commit conflict rule.
 	Accept(ctx context.Context, id, author string) (Revision, error)
 	// Reject closes an open proposal without applying it.

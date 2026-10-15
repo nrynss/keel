@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"math"
 	"slices"
 	"time"
 
@@ -96,6 +97,35 @@ type querier interface {
 // the two reads can then never list as an empty history.
 func (s *Store) readTx(ctx context.Context) (*sql.Tx, error) {
 	return s.db.Reader().BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+}
+
+// pageLimit resolves a page's Limit, refusing a negative one or one above
+// revision.MaxLimit.
+func pageLimit(op string, limit int) (int, error) {
+	switch {
+	case limit == 0:
+		return revision.DefaultLimit, nil
+	case limit < 0 || limit > revision.MaxLimit:
+		return 0, fmt.Errorf("sqlitestore: %s: %w: limit %d is outside 1..%d", op, revision.ErrInvalid, limit, revision.MaxLimit)
+	}
+	return limit, nil
+}
+
+// numberedPage resolves a Page into the limit and the exclusive upper bound
+// a numbered listing reads below. Before zero reads from the top.
+func numberedPage(op string, page revision.Page) (int, int64, error) {
+	limit, err := pageLimit(op, page.Limit)
+	if err != nil {
+		return 0, 0, err
+	}
+	if page.Before < 0 {
+		return 0, 0, fmt.Errorf("sqlitestore: %s: %w: before %d is negative", op, revision.ErrInvalid, page.Before)
+	}
+	before := page.Before
+	if before == 0 {
+		before = math.MaxInt64
+	}
+	return limit, before, nil
 }
 
 // checkBody refuses an empty author or a body that is not valid JSON.
@@ -246,26 +276,33 @@ func (s *Store) Commit(ctx context.Context, doc string, parent int64, body []byt
 	return rev, nil
 }
 
-// History lists the document's revisions newest first. Bodies stay nil, so
-// a long history lists cheaply; Get reads one body. An unknown id reports
-// revision.ErrUnknownDocument.
-func (s *Store) History(ctx context.Context, doc string) ([]revision.Revision, error) {
+// History lists one page of the document's revisions newest first, and the
+// Before cursor of the next page, or 0 when this page is the last. Bodies
+// stay nil, so a long history lists cheaply; Get reads one body. Paging is
+// keyset on the revision number, so a commit or a prune between pages never
+// repeats or shifts a row. An unknown id reports revision.ErrUnknownDocument,
+// and a page outside its bounds reports revision.ErrInvalid.
+func (s *Store) History(ctx context.Context, doc string, page revision.Page) ([]revision.Revision, int64, error) {
 	if err := checkDoc("history", doc); err != nil {
-		return nil, err
+		return nil, 0, err
+	}
+	limit, before, err := numberedPage("history", page)
+	if err != nil {
+		return nil, 0, err
 	}
 	tx, err := s.readTx(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("sqlitestore: history %s: %w", doc, err)
+		return nil, 0, fmt.Errorf("sqlitestore: history %s: %w", doc, err)
 	}
 	defer func() { _ = tx.Rollback() }() // a read-only transaction has nothing to keep
 	if _, err := loadDocument(ctx, tx, doc); err != nil {
-		return nil, fmt.Errorf("sqlitestore: history %s: %w", doc, err)
+		return nil, 0, fmt.Errorf("sqlitestore: history %s: %w", doc, err)
 	}
+	// One row past the limit tells a last page from a full one.
 	rows, err := tx.QueryContext(ctx,
-		`SELECT number, parent, author, proposal, committed_at FROM revision_entry
-		WHERE document = ? ORDER BY number DESC`, doc)
+		historyPageQuery, doc, before, limit+1)
 	if err != nil {
-		return nil, fmt.Errorf("sqlitestore: history %s: %w", doc, err)
+		return nil, 0, fmt.Errorf("sqlitestore: history %s: %w", doc, err)
 	}
 	defer rows.Close() // the cursor is drained before return
 	var out []revision.Revision
@@ -273,15 +310,59 @@ func (s *Store) History(ctx context.Context, doc string) ([]revision.Revision, e
 		r := revision.Revision{Document: doc}
 		var at int64
 		if err := rows.Scan(&r.Number, &r.Parent, &r.Author, &r.Proposal, &at); err != nil {
-			return nil, fmt.Errorf("sqlitestore: history %s: %w", doc, err)
+			return nil, 0, fmt.Errorf("sqlitestore: history %s: %w", doc, err)
 		}
 		r.CommittedAt = time.Unix(0, at).UTC()
 		out = append(out, r)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("sqlitestore: history %s: %w", doc, err)
+		return nil, 0, fmt.Errorf("sqlitestore: history %s: %w", doc, err)
 	}
-	return out, nil
+	if len(out) > limit {
+		out = out[:limit]
+		return out, out[limit-1].Number, nil
+	}
+	return out, 0, nil
+}
+
+// Documents lists one page of owner's documents ordered by id, and the After
+// cursor of the next page, or "" when this page is the last. Per-user
+// separation in an application is by owner: the store keeps no namespace
+// beyond it, and it does not authorize, so the caller passes the owner it
+// has authenticated. An owner with no documents lists an empty page. An
+// empty owner or a page outside its bounds reports revision.ErrInvalid.
+func (s *Store) Documents(ctx context.Context, owner string, page revision.OwnerPage) ([]revision.Document, string, error) {
+	if owner == "" {
+		return nil, "", fmt.Errorf("sqlitestore: documents: %w: owner must not be empty", revision.ErrInvalid)
+	}
+	limit, err := pageLimit("documents", page.Limit)
+	if err != nil {
+		return nil, "", err
+	}
+	rows, err := s.db.Reader().QueryContext(ctx,
+		documentsPageQuery, owner, page.After, limit+1)
+	if err != nil {
+		return nil, "", fmt.Errorf("sqlitestore: documents: %w", err)
+	}
+	defer rows.Close() // the cursor is drained before return
+	var out []revision.Document
+	for rows.Next() {
+		var d revision.Document
+		var created int64
+		if err := rows.Scan(&d.ID, &d.Owner, &d.Head, &created); err != nil {
+			return nil, "", fmt.Errorf("sqlitestore: documents: %w", err)
+		}
+		d.CreatedAt = time.Unix(0, created).UTC()
+		out = append(out, d)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, "", fmt.Errorf("sqlitestore: documents: %w", err)
+	}
+	if len(out) > limit {
+		out = out[:limit]
+		return out, out[limit-1].ID, nil
+	}
+	return out, "", nil
 }
 
 // Get reads one revision with its body. A number the document does not hold,
@@ -506,12 +587,19 @@ func (s *Store) Propose(ctx context.Context, doc string, parent int64, body []by
 	if parent < 1 || parent > d.Head {
 		return revision.Proposal{}, fmt.Errorf("sqlitestore: propose %s on %d: %w", doc, parent, revision.ErrUnknownRevision)
 	}
-	p := revision.Proposal{ID: pid, Document: doc, Parent: parent, Author: author, Body: body,
+	// The counter lives on the document, so a number Prune frees is never
+	// handed out again and a cursor never names two proposals.
+	var seq int64
+	if err := tx.QueryRowContext(ctx,
+		`UPDATE revision_document SET proposals = proposals + 1 WHERE id = ? RETURNING proposals`, doc).Scan(&seq); err != nil {
+		return revision.Proposal{}, fmt.Errorf("sqlitestore: propose %s: %w", doc, err)
+	}
+	p := revision.Proposal{ID: pid, Document: doc, Seq: seq, Parent: parent, Author: author, Body: body,
 		State: revision.ProposalOpen, CreatedAt: now}
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO revision_proposal (id, document, parent, author, body, state, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		p.ID, doc, parent, author, body, string(p.State), now.UnixNano()); err != nil {
+		`INSERT INTO revision_proposal (id, document, seq, parent, author, body, state, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		p.ID, doc, seq, parent, author, body, string(p.State), now.UnixNano()); err != nil {
 		return revision.Proposal{}, fmt.Errorf("sqlitestore: propose %s: %w", doc, err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -520,8 +608,22 @@ func (s *Store) Propose(ctx context.Context, doc string, parent int64, body []by
 	return p, nil
 }
 
+// The paged listings' queries are named, so the plan test reads the very
+// statements the store runs.
+const (
+	// historyPageQuery reads one History page.
+	historyPageQuery = `SELECT number, parent, author, proposal, committed_at FROM revision_entry
+		WHERE document = ? AND number < ? ORDER BY number DESC LIMIT ?`
+	// documentsPageQuery reads one Documents page.
+	documentsPageQuery = `SELECT id, owner, head, created_at FROM revision_document
+		WHERE owner = ? AND id > ? ORDER BY id LIMIT ?`
+	// proposalsPageQuery reads one Proposals page.
+	proposalsPageQuery = `SELECT ` + proposalColumns + ` FROM revision_proposal WHERE document = ? AND seq < ?
+		ORDER BY seq DESC LIMIT ?`
+)
+
 // proposalColumns is the select list scanProposal reads.
-const proposalColumns = `id, document, parent, author, body, state, number, decided_by, created_at, decided_at`
+const proposalColumns = `id, document, seq, parent, author, body, state, accepted, decided_by, created_at, decided_at`
 
 // scanner is one row a proposal scans from.
 type scanner interface {
@@ -533,7 +635,7 @@ func scanProposal(row scanner) (revision.Proposal, error) {
 	var p revision.Proposal
 	var state string
 	var created, decided int64
-	if err := row.Scan(&p.ID, &p.Document, &p.Parent, &p.Author, &p.Body, &state,
+	if err := row.Scan(&p.ID, &p.Document, &p.Seq, &p.Parent, &p.Author, &p.Body, &state,
 		&p.Revision, &p.DecidedBy, &created, &decided); err != nil {
 		return revision.Proposal{}, err
 	}
@@ -565,39 +667,49 @@ func (s *Store) Proposal(ctx context.Context, pid string) (revision.Proposal, er
 	return p, nil
 }
 
-// Proposals lists the document's proposals newest first, in every state. An
-// unknown id reports revision.ErrUnknownDocument.
-func (s *Store) Proposals(ctx context.Context, doc string) ([]revision.Proposal, error) {
+// Proposals lists one page of the document's proposals newest first, in
+// every state, and the Before cursor of the next page, or 0 when this page is
+// the last. Paging is keyset on Seq. An unknown id reports
+// revision.ErrUnknownDocument, and a page outside its bounds reports
+// revision.ErrInvalid.
+func (s *Store) Proposals(ctx context.Context, doc string, page revision.Page) ([]revision.Proposal, int64, error) {
 	if err := checkDoc("proposals", doc); err != nil {
-		return nil, err
+		return nil, 0, err
+	}
+	limit, before, err := numberedPage("proposals", page)
+	if err != nil {
+		return nil, 0, err
 	}
 	tx, err := s.readTx(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("sqlitestore: proposals %s: %w", doc, err)
+		return nil, 0, fmt.Errorf("sqlitestore: proposals %s: %w", doc, err)
 	}
 	defer func() { _ = tx.Rollback() }() // a read-only transaction has nothing to keep
 	if _, err := loadDocument(ctx, tx, doc); err != nil {
-		return nil, fmt.Errorf("sqlitestore: proposals %s: %w", doc, err)
+		return nil, 0, fmt.Errorf("sqlitestore: proposals %s: %w", doc, err)
 	}
 	rows, err := tx.QueryContext(ctx,
-		`SELECT `+proposalColumns+` FROM revision_proposal WHERE document = ?
-		ORDER BY created_at DESC, rowid DESC`, doc)
+		proposalsPageQuery, doc, before, limit+1)
 	if err != nil {
-		return nil, fmt.Errorf("sqlitestore: proposals %s: %w", doc, err)
+		return nil, 0, fmt.Errorf("sqlitestore: proposals %s: %w", doc, err)
 	}
 	defer rows.Close() // the cursor is drained before return
 	var out []revision.Proposal
 	for rows.Next() {
 		p, err := scanProposal(rows)
 		if err != nil {
-			return nil, fmt.Errorf("sqlitestore: proposals %s: %w", doc, err)
+			return nil, 0, fmt.Errorf("sqlitestore: proposals %s: %w", doc, err)
 		}
 		out = append(out, p)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("sqlitestore: proposals %s: %w", doc, err)
+		return nil, 0, fmt.Errorf("sqlitestore: proposals %s: %w", doc, err)
 	}
-	return out, nil
+	if len(out) > limit {
+		out = out[:limit]
+		return out, out[limit-1].Seq, nil
+	}
+	return out, 0, nil
 }
 
 // decide claims an open proposal inside a write transaction and hands it to
@@ -641,7 +753,7 @@ func (s *Store) Accept(ctx context.Context, pid, author string) (revision.Revisi
 			return err
 		}
 		if _, err := tx.ExecContext(ctx,
-			`UPDATE revision_proposal SET state = ?, number = ?, decided_by = ?, decided_at = ? WHERE id = ?`,
+			`UPDATE revision_proposal SET state = ?, accepted = ?, decided_by = ?, decided_at = ? WHERE id = ?`,
 			string(revision.ProposalAccepted), r.Number, author, now.UnixNano(), p.ID); err != nil {
 			return err
 		}

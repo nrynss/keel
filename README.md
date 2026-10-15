@@ -57,7 +57,7 @@ else is pure Go, and `CGO_ENABLED=0` builds the whole module.
 | `fetch` | A user-supplied link fetched under an address policy enforced at dial time, with scheme, port, redirect, size, time and content type caps, and preview metadata read from the page |
 | `outbox` | Events written durably on this box first, replayed in insertion order to an app-supplied sink, with spent attempts counted and reported |
 | `providertask` | Provider tasks recorded by idempotency key, created once, polled to a verdict, driven by one process at a time under a lease, with a query window refusal and jittered backoff |
-| `revision` | Document history with compare-and-set commits that refuse a stale parent with the head, pinned approved takes that pruning spares, and proposals that apply only when a person accepts them |
+| `revision` | Document history with compare-and-set commits that refuse a stale parent with the head, pinned approved takes that pruning spares, proposals that apply only when a person accepts them, and keyset-paged listings of a document's history and proposals and of an owner's documents |
 | `identity` | Guest sessions resolved from a signed cookie or a bearer token, sign-in by emailed code or an external provider, guest upgrade with a conflict rule, and account deletion as one resumable job |
 
 The table lists the packages an application imports, and the paragraph below it names the SQLite
