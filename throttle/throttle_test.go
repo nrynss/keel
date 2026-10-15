@@ -156,6 +156,39 @@ func TestNote(t *testing.T) {
 	}
 }
 
+// TestNoteReportsTheBudgetTheErrorSpent pins issue #98: an error Transient
+// claims spent TransientAttempts, so Note reports that count as a transient
+// fault, while a refusal under the same config still reports Attempts.
+func TestNoteReportsTheBudgetTheErrorSpent(t *testing.T) {
+	isTransient := func(err error) bool { return errors.Is(err, errTransient) }
+	cfg := Config{Attempts: 4, TransientAttempts: 2, Backoff: time.Nanosecond, Max: time.Nanosecond,
+		Transient: isTransient}
+	calls := 0
+	err := Retry(context.Background(), cfg, retryable, func() error {
+		calls++
+		return errTransient
+	})
+	if calls != 2 {
+		t.Fatalf("calls = %d, want 2", calls)
+	}
+	noted := Note(err, cfg, retryable)
+	if !errors.Is(noted, errTransient) || noted.Error() != "still failing transiently after 2 attempts: transient" {
+		t.Fatalf("transient Note = %v", noted)
+	}
+	limited := Note(errLimited, cfg, retryable)
+	if !errors.Is(limited, errLimited) || limited.Error() != "still throttled after 4 attempts: limited" {
+		t.Fatalf("limited Note = %v", limited)
+	}
+	defaulted := Note(errTransient, Config{Transient: isTransient}, retryable)
+	if defaulted.Error() != "still failing transiently after 2 attempts: transient" {
+		t.Fatalf("default transient Note = %v", defaulted)
+	}
+	single := Note(errTransient, Config{Transient: isTransient, TransientAttempts: 1}, retryable)
+	if single.Error() != "still failing transiently after 1 attempt: transient" {
+		t.Fatalf("single transient Note = %v", single)
+	}
+}
+
 func TestJitterStaysInTheUpperHalf(t *testing.T) {
 	const d = 20 * time.Second
 	for i := 0; i < 200; i++ {
