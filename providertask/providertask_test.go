@@ -419,10 +419,12 @@ func TestDeadlineRefusalKeepsTheTaskResumable(t *testing.T) {
 	h := newHarness(t)
 	p := newFakeProvider(rendered{Link: "late"}, step{st: providertask.Status{State: providertask.StateRunning}})
 	cfg := h.config()
-	cfg.Deadline = 120 * time.Millisecond
-	cfg.PollBase = 20 * time.Millisecond
-	cfg.PollCeiling = 40 * time.Millisecond
-	_, err := providertask.Run(t.Context(), cfg, h.store, "slow", p.spec(nil))
+	// The deadline passes after the first poll, once the task is recorded,
+	// rather than on a wall clock that a loaded machine can spend before
+	// the create.
+	deadline := newManualDeadline(t)
+	cfg.Deadline = backstopDeadline
+	_, err := providertask.Run(deadline, cfg, h.store, "slow", passAfterStatus(deadline, p.spec(nil)))
 	if !errors.Is(err, providertask.ErrDeadline) {
 		t.Fatalf("err = %v, want ErrDeadline", err)
 	}
@@ -1004,11 +1006,10 @@ func TestJoinerTimesOutWithTaskPending(t *testing.T) {
 
 	// The leader holds the flight once its claim is on disk, so waiting
 	// for the row makes the joiner's join lose deterministically.
-	for i := 0; i < 500; i++ {
+	for wait := time.Now().Add(10 * time.Second); time.Now().Before(wait); time.Sleep(2 * time.Millisecond) {
 		if _, err := h.store.Get(t.Context(), "joined"); err == nil {
 			break
 		}
-		time.Sleep(2 * time.Millisecond)
 	}
 	if _, err := h.store.Get(t.Context(), "joined"); err != nil {
 		t.Fatalf("leader never claimed: %v", err)
