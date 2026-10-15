@@ -176,7 +176,7 @@ func (s *Store) Attempts(ctx context.Context, id string) ([]job.Record, error) {
 // erase.Target maps that unknown-id answer to erase.ErrGone without
 // importing this package.
 func (s *Store) Delete(ctx context.Context, id string) error {
-	tx, err := beginWrite(ctx, s.db)
+	tx, err := s.db.BeginWrite(ctx)
 	if err != nil {
 		return fmt.Errorf("sqlitestore: delete %s: %w", id, err)
 	}
@@ -215,7 +215,7 @@ func (s *Store) Delete(ctx context.Context, id string) error {
 // listing and one delete, never a scan in Go loops, so a periodic prune
 // costs the same as any other indexed pass.
 func (s *Store) PruneFinished(ctx context.Context, before time.Time) (int, error) {
-	tx, err := beginWrite(ctx, s.db)
+	tx, err := s.db.BeginWrite(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("sqlitestore: prune finished: %w", err)
 	}

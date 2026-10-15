@@ -746,3 +746,38 @@ func bump(ctx context.Context, db *DB) error {
 	}
 	return tx.Commit()
 }
+
+// TestBeginWriteReportsTheContextBehindAHeldLock pins that a write begin the
+// context ends while another handle holds the write lock reports the context
+// error, not the driver's SQLITE_BUSY alone.
+func TestBeginWriteReportsTheContextBehindAHeldLock(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "keel.db")
+	db := openTestDB(t, Config{Path: path, BusyTimeout: 300 * time.Millisecond})
+	mustExec(t, db.Writer(), "CREATE TABLE t (n INTEGER)")
+	other := openTestDB(t, Config{Path: path})
+	held, err := other.BeginWrite(context.Background())
+	if err != nil {
+		t.Fatalf("hold the write lock: %v", err)
+	}
+	defer func() { _ = held.Rollback() }() // the hold only exists to block the begin below
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	tx, err := db.BeginWrite(ctx)
+	if err == nil {
+		_ = tx.Rollback()
+		t.Fatal("BeginWrite behind a held lock succeeded")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("BeginWrite behind a held lock = %v, want context.DeadlineExceeded", err)
+	}
+	ok, err := db.BeginWrite(context.Background())
+	if err == nil {
+		_ = ok.Rollback()
+		t.Fatal("BeginWrite with no deadline got the lock another handle holds")
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		t.Fatalf("BeginWrite with a live context = %v, want the driver's busy error alone", err)
+	}
+}

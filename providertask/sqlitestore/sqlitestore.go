@@ -127,7 +127,7 @@ func (s *Store) Claim(ctx context.Context, key, owner string, now time.Time, ttl
 	if ttl <= 0 {
 		return providertask.Claim{}, false, fmt.Errorf("sqlitestore: claim %s: %w: ttl must be positive", key, ErrInvalid)
 	}
-	tx, err := beginWrite(ctx, s.db)
+	tx, err := s.db.BeginWrite(ctx)
 	if err != nil {
 		return providertask.Claim{}, false, fmt.Errorf("sqlitestore: claim %s: %w", key, err)
 	}
@@ -169,7 +169,7 @@ func (s *Store) TakeOver(ctx context.Context, key, owner string, now time.Time, 
 	if ttl <= 0 {
 		return 0, false, fmt.Errorf("sqlitestore: take over %s: %w: ttl must be positive", key, ErrInvalid)
 	}
-	tx, err := beginWrite(ctx, s.db)
+	tx, err := s.db.BeginWrite(ctx)
 	if err != nil {
 		return 0, false, fmt.Errorf("sqlitestore: take over %s: %w", key, err)
 	}

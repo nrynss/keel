@@ -76,7 +76,7 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 // CreateGuest writes the user row and its session row in one
 // transaction, so either both rows land or neither does.
 func (s *Store) CreateGuest(ctx context.Context, user identity.User, session identity.Session) error {
-	tx, err := beginWrite(ctx, s.db)
+	tx, err := s.db.BeginWrite(ctx)
 	if err != nil {
 		return fmt.Errorf("sqlitestore: create guest: %w", err)
 	}
@@ -165,7 +165,7 @@ func (s *Store) IdentityHolder(ctx context.Context, provider, subject string) (s
 // reports identity.ErrSendLimited, and the transaction then inserts
 // nothing.
 func (s *Store) PutCode(ctx context.Context, code identity.SignInCode, caps identity.SendCaps) error {
-	tx, err := beginWrite(ctx, s.db)
+	tx, err := s.db.BeginWrite(ctx)
 	if err != nil {
 		return fmt.Errorf("sqlitestore: put code: %w", err)
 	}
@@ -285,7 +285,7 @@ func (s *Store) sendWindow(ctx context.Context, query string, args ...any) (iden
 // identity, opens the fresh session for the target user, and revokes the
 // session that asked.
 func (s *Store) ResolveSignIn(ctx context.Context, in identity.SignInResolution) (identity.SignInTarget, error) {
-	tx, err := beginWrite(ctx, s.db)
+	tx, err := s.db.BeginWrite(ctx)
 	if err != nil {
 		return identity.SignInTarget{}, fmt.Errorf("sqlitestore: resolve sign-in: %w", err)
 	}
@@ -388,7 +388,7 @@ func resolveIdentity(ctx context.Context, tx *sql.Tx, in identity.SignInResoluti
 // sessions, and sessions and identities go before the user, because each
 // names the next.
 func (s *Store) DeleteUserRows(ctx context.Context, userID string) error {
-	tx, err := beginWrite(ctx, s.db)
+	tx, err := s.db.BeginWrite(ctx)
 	if err != nil {
 		return fmt.Errorf("sqlitestore: delete user rows %s: %w", userID, err)
 	}

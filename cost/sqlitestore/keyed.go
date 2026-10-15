@@ -76,7 +76,7 @@ func (k *KeyedBudget) Reserve(ctx context.Context, owner string, estimate cost.P
 		return Reservation{}, fmt.Errorf("sqlitestore: reserve %d: %w", estimate, cost.ErrNegativeEstimate)
 	}
 	now := k.store.now()
-	tx, err := beginWrite(ctx, k.store.db)
+	tx, err := k.store.db.BeginWrite(ctx)
 	if err != nil {
 		return Reservation{}, fmt.Errorf("sqlitestore: reserve: %w", err)
 	}
@@ -141,7 +141,7 @@ func (k *KeyedBudget) Settle(ctx context.Context, owner string, r Reservation, a
 	if owner == "" {
 		return emptyOwner("settle")
 	}
-	tx, err := beginWrite(ctx, k.store.db)
+	tx, err := k.store.db.BeginWrite(ctx)
 	if err != nil {
 		return fmt.Errorf("sqlitestore: settle: %w", err)
 	}
@@ -174,7 +174,7 @@ func (k *KeyedBudget) SettleOnce(ctx context.Context, owner string, r Reservatio
 	if owner == "" {
 		return false, emptyOwner("settle once")
 	}
-	tx, err := beginWrite(ctx, k.store.db)
+	tx, err := k.store.db.BeginWrite(ctx)
 	if err != nil {
 		return false, fmt.Errorf("sqlitestore: settle once: %w", err)
 	}
@@ -355,7 +355,7 @@ func (k *KeyedBudget) ForgetOwner(ctx context.Context, owner string) error {
 		return emptyOwner("forget owner")
 	}
 	now := k.store.now()
-	tx, err := beginWrite(ctx, k.store.db)
+	tx, err := k.store.db.BeginWrite(ctx)
 	if err != nil {
 		return fmt.Errorf("sqlitestore: forget owner: %w", err)
 	}

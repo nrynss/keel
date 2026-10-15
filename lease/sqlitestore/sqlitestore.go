@@ -314,7 +314,7 @@ func (s *Store) ExpiredOpen(ctx context.Context, now time.Time, limit int) ([]le
 // refused, or finishes after the erase. A cancelled context removes
 // nothing.
 func (s *Store) ForgetOwner(ctx context.Context, owner string) error {
-	tx, err := beginWrite(ctx, s.db)
+	tx, err := s.db.BeginWrite(ctx)
 	if err != nil {
 		return fmt.Errorf("sqlitestore: forget owner: %w", err)
 	}

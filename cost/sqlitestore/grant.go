@@ -42,7 +42,7 @@ func (s *Store) Grant(ctx context.Context, amount cost.Price, expiresAt time.Tim
 		return fmt.Errorf("sqlitestore: grant %d: %w: amount must not be negative", amount, ErrInvalid)
 	}
 	now := s.now()
-	tx, err := beginWrite(ctx, s.db)
+	tx, err := s.db.BeginWrite(ctx)
 	if err != nil {
 		return fmt.Errorf("sqlitestore: grant: %w", err)
 	}

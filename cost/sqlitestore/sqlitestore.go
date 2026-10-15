@@ -864,7 +864,7 @@ func (s *Store) Reserve(ctx context.Context, estimate cost.Price) (Reservation, 
 		return Reservation{}, fmt.Errorf("sqlitestore: reserve %d: %w", estimate, cost.ErrNegativeEstimate)
 	}
 	now := s.now()
-	tx, err := beginWrite(ctx, s.db)
+	tx, err := s.db.BeginWrite(ctx)
 	if err != nil {
 		return Reservation{}, fmt.Errorf("sqlitestore: reserve: %w", err)
 	}
@@ -911,7 +911,7 @@ func (s *Store) Reserve(ctx context.Context, estimate cost.Price) (Reservation, 
 // booked spend past the int64 range. A cancelled context stops the settle,
 // so nothing is booked.
 func (s *Store) Settle(ctx context.Context, r Reservation, actual cost.Price) error {
-	tx, err := beginWrite(ctx, s.db)
+	tx, err := s.db.BeginWrite(ctx)
 	if err != nil {
 		return fmt.Errorf("sqlitestore: settle: %w", err)
 	}
@@ -938,7 +938,7 @@ func (s *Store) Settle(ctx context.Context, r Reservation, actual cost.Price) er
 // when actual would push the booked spend past the int64 range. A cancelled
 // context stops the settle, so nothing is booked.
 func (s *Store) SettleOnce(ctx context.Context, r Reservation, actual cost.Price, kind, ref string) (bool, error) {
-	tx, err := beginWrite(ctx, s.db)
+	tx, err := s.db.BeginWrite(ctx)
 	if err != nil {
 		return false, fmt.Errorf("sqlitestore: settle once: %w", err)
 	}

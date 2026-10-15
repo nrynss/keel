@@ -275,6 +275,24 @@ func dsn(abs string, timeout time.Duration, readOnly bool) string {
 // writers queue rather than race for the file lock.
 func (db *DB) Writer() *sql.DB { return db.writer }
 
+// BeginWrite opens a transaction on the write pool. Writer transactions begin
+// IMMEDIATE, so a write lock another handle on the file holds is waited out
+// inside BEGIN, under the busy timeout. SQLite reports SQLITE_BUSY from that
+// wait even when ctx ended it, so BeginWrite joins ctx's error into the
+// returned one and errors.Is still tells a cancelled or timed out write from
+// a contended one. Prefer it to Writer().BeginTx, which returns the driver's
+// error alone.
+func (db *DB) BeginWrite(ctx context.Context) (*sql.Tx, error) {
+	tx, err := db.writer.BeginTx(ctx, nil)
+	if err != nil {
+		if cerr := ctx.Err(); cerr != nil && !errors.Is(err, cerr) {
+			return nil, errors.Join(cerr, err)
+		}
+		return nil, err
+	}
+	return tx, nil
+}
+
 // Reader returns the read pool. Every connection carries query_only, so a
 // statement sent here can never write.
 func (db *DB) Reader() *sql.DB { return db.reader }
@@ -393,14 +411,8 @@ func (db *DB) applyMigration(ctx context.Context, table, namespace string, fsys 
 	if err != nil {
 		return fmt.Errorf("sqlite: migrate: read %s: %w: %w", name, ErrMigration, err)
 	}
-	tx, err := db.writer.BeginTx(ctx, nil)
+	tx, err := db.BeginWrite(ctx)
 	if err != nil {
-		// The writer begins IMMEDIATE, so a wait the context ended still
-		// surfaces as SQLITE_BUSY. Joining the context error keeps a
-		// cancelled migration distinguishable from a contended one.
-		if cerr := ctx.Err(); cerr != nil && !errors.Is(err, cerr) {
-			err = errors.Join(cerr, err)
-		}
 		return fmt.Errorf("sqlite: migrate: begin %s: %w: %w", name, ErrMigration, err)
 	}
 	defer func() { _ = tx.Rollback() }() // a committed transaction rolls back to a no-op

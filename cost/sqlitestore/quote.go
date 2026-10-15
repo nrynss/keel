@@ -98,7 +98,7 @@ func (s *Store) Quote(ctx context.Context, owner string, estimate cost.Price, tt
 		return cost.Quote{}, fmt.Errorf("sqlitestore: quote: %w: ttl must be positive", ErrInvalid)
 	}
 	now := s.now()
-	tx, err := beginWrite(ctx, s.db)
+	tx, err := s.db.BeginWrite(ctx)
 	if err != nil {
 		return cost.Quote{}, fmt.Errorf("sqlitestore: quote: %w", err)
 	}
@@ -350,7 +350,7 @@ func (s *Store) runClaimed(ctx context.Context, quoteID string, work cost.Work, 
 // refusal.
 func (s *Store) claimQuote(ctx context.Context, quoteID string, current cost.Price, repriced bool) (claim quoteClaim, done bool, usage cost.Usage, err error) {
 	now := s.now()
-	tx, err := beginWrite(ctx, s.db)
+	tx, err := s.db.BeginWrite(ctx)
 	if err != nil {
 		return quoteClaim{}, false, cost.Usage{}, fmt.Errorf("sqlitestore: claim quote %s: %w", quoteID, err)
 	}
@@ -480,7 +480,7 @@ func (s *Store) claimQuote(ctx context.Context, quoteID string, current cost.Pri
 // past its claim, so the outcome survives either way.
 func (s *Store) settleQuote(ctx context.Context, claim quoteClaim, settled cost.Price, measured bool) error {
 	now := s.now()
-	tx, err := beginWrite(ctx, s.db)
+	tx, err := s.db.BeginWrite(ctx)
 	if err != nil {
 		return fmt.Errorf("sqlitestore: settle quote %s: %w", claim.quoteID, err)
 	}
@@ -558,7 +558,7 @@ func (s *Store) settleQuote(ctx context.Context, claim quoteClaim, settled cost.
 // must not wait on a live request. A quote the sweep already took, or a
 // hold that already lapsed, frees nothing and that is not an error.
 func (s *Store) abandonQuote(ctx context.Context, claim quoteClaim) error {
-	tx, err := beginWrite(ctx, s.db)
+	tx, err := s.db.BeginWrite(ctx)
 	if err != nil {
 		return fmt.Errorf("sqlitestore: abandon quote %s: %w", claim.quoteID, err)
 	}
@@ -583,7 +583,7 @@ func (s *Store) abandonQuote(ctx context.Context, claim quoteClaim) error {
 // Its confirm window is the one the refused quote had.
 func (s *Store) freshQuote(ctx context.Context, old quoteRow, price cost.Price) (cost.Quote, error) {
 	now := s.now()
-	tx, err := beginWrite(ctx, s.db)
+	tx, err := s.db.BeginWrite(ctx)
 	if err != nil {
 		return cost.Quote{}, fmt.Errorf("sqlitestore: fresh quote: %w", err)
 	}
