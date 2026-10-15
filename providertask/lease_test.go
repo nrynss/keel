@@ -280,8 +280,11 @@ func TestDeadlineWithoutVerdictReleasesTheLease(t *testing.T) {
 	cfgA.Meter = meter
 	cfgA.Estimate = 10
 	cfgA.Coordinator = coordinatorA
-	cfgA.Deadline = 60 * time.Millisecond
-	_, errA := providertask.Run(t.Context(), cfgA, h.store, "release", pA.spec(nil))
+	// The deadline passes after the first poll, so the task is recorded
+	// and the Run is inside its poll loop when it does.
+	deadline := newManualDeadline(t)
+	cfgA.Deadline = backstopDeadline
+	_, errA := providertask.Run(deadline, cfgA, h.store, "release", passAfterStatus(deadline, pA.spec(nil)))
 	if !errors.Is(errA, providertask.ErrDeadline) {
 		t.Fatalf("leader error = %v, want ErrDeadline", errA)
 	}
@@ -706,9 +709,14 @@ func TestRenewErrorKeepsTheDrive(t *testing.T) {
 // another process took the lease between the claim and the check.
 type foreignRowStore struct {
 	providertask.Store
+	// onGet, when set, runs before every read.
+	onGet func()
 }
 
 func (s *foreignRowStore) Get(ctx context.Context, key string) (providertask.Claim, error) {
+	if s.onGet != nil {
+		s.onGet()
+	}
 	claim, err := s.Store.Get(ctx, key)
 	if err != nil {
 		return claim, err
@@ -728,18 +736,22 @@ func TestStaleTokenCheckSkipsTheSettle(t *testing.T) {
 	budget, ledger := meterOf(t, 1000)
 	meter := mustMeter(t, budget, ledger)
 
-	rogue := &foreignRowStore{Store: h.store}
+	// The first read is the fencing check, after the result is in hand.
+	// The deadline passes there, so the fenced drive falls back to the
+	// wait loop and the passed deadline ends that wait with the pending
+	// refusal. A wall-clock deadline here raced the claim, the reservation
+	// and the create on a loaded machine.
+	deadline := newManualDeadline(t)
+	rogue := &foreignRowStore{Store: h.store, onGet: deadline.pass}
 	cfgA := cfg
 	cfgA.Meter = meter
 	cfgA.Estimate = 10
 	cfgA.Coordinator = providertask.NewCoordinator()
-	// The fenced drive falls back to the wait loop, and a short deadline
-	// ends that wait with the pending refusal.
-	cfgA.Deadline = 50 * time.Millisecond
+	cfgA.Deadline = backstopDeadline
 	p := newFakeProvider(rendered{Link: "done"},
 		step{st: providertask.Status{State: providertask.StateSucceeded}},
 	)
-	_, err := providertask.Run(t.Context(), cfgA, rogue, "fenced-check", p.spec(nil))
+	_, err := providertask.Run(deadline, cfgA, rogue, "fenced-check", p.spec(nil))
 	if !errors.Is(err, providertask.ErrTaskPending) {
 		t.Fatalf("Run error = %v, want ErrTaskPending, the fenced drive waits", err)
 	}
@@ -768,7 +780,12 @@ func TestDeadlineOutsideThePollReleasesTheLease(t *testing.T) {
 				step{st: providertask.Status{State: providertask.StateSucceeded}},
 			)
 			spec := p.spec(nil)
+			// The deadline passes once the Run is inside the phase under
+			// test, after the task id is recorded. A wall-clock deadline
+			// here could pass during the create on a loaded machine.
+			deadline := newManualDeadline(t)
 			block := func(ctx context.Context) error {
+				deadline.pass()
 				<-ctx.Done()
 				return ctx.Err()
 			}
@@ -785,9 +802,9 @@ func TestDeadlineOutsideThePollReleasesTheLease(t *testing.T) {
 			cfgA.Meter = meter
 			cfgA.Estimate = 10
 			cfgA.Coordinator = providertask.NewCoordinator()
-			cfgA.Deadline = 60 * time.Millisecond
+			cfgA.Deadline = backstopDeadline
 			key := "outside-" + phase
-			_, errA := providertask.Run(t.Context(), cfgA, h.store, key, spec)
+			_, errA := providertask.Run(deadline, cfgA, h.store, key, spec)
 			if !errors.Is(errA, context.DeadlineExceeded) {
 				t.Fatalf("leader error = %v, want the context deadline", errA)
 			}
