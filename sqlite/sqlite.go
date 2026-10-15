@@ -18,6 +18,9 @@
 // connection, because SQLite admits one writer at a time and a second
 // connection could only ever return SQLITE_BUSY. The reader pool holds
 // several connections, each opened with query_only so a read can never write.
+// Every transaction on the writer pool begins IMMEDIATE, so a write that
+// reads first waits out a lock another handle on the file holds instead of
+// failing with SQLITE_BUSY mid-transaction.
 //
 // Migrations are namespaced. Each namespace keeps its own version table, so
 // Keel stores and the embedding application share one database file without
@@ -257,6 +260,13 @@ func dsn(abs string, timeout time.Duration, readOnly bool) string {
 	q.Set("_busy_timeout", strconv.FormatInt(ms, 10))
 	if readOnly {
 		q.Set("_query_only", "on")
+	} else {
+		// The writer pool only writes, so its transactions take the write
+		// lock at BEGIN. A deferred BEGIN that reads first must upgrade
+		// mid-transaction, and SQLite refuses that upgrade with SQLITE_BUSY
+		// at once when another handle on the file committed since the read,
+		// without waiting on the busy timeout. BEGIN IMMEDIATE waits instead.
+		q.Set("_txlock", "immediate")
 	}
 	return (&url.URL{Scheme: "file", Path: abs, RawQuery: q.Encode()}).String()
 }
@@ -385,6 +395,12 @@ func (db *DB) applyMigration(ctx context.Context, table, namespace string, fsys 
 	}
 	tx, err := db.writer.BeginTx(ctx, nil)
 	if err != nil {
+		// The writer begins IMMEDIATE, so a wait the context ended still
+		// surfaces as SQLITE_BUSY. Joining the context error keeps a
+		// cancelled migration distinguishable from a contended one.
+		if cerr := ctx.Err(); cerr != nil && !errors.Is(err, cerr) {
+			err = errors.Join(cerr, err)
+		}
 		return fmt.Errorf("sqlite: migrate: begin %s: %w: %w", name, ErrMigration, err)
 	}
 	defer func() { _ = tx.Rollback() }() // a committed transaction rolls back to a no-op

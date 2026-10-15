@@ -682,3 +682,67 @@ func TestBackupClassifiesDestinationError(t *testing.T) {
 		t.Fatalf("unwritable destination error = %v, want the os error reachable", err)
 	}
 }
+
+// TestWriteTransactionsAcrossHandlesWaitOutTheLock pins issue #100. Two
+// handles over one file each hold their own writer connection. A transaction
+// that reads before it writes must take the write lock at BEGIN, so it waits
+// on the busy timeout. A deferred BEGIN upgrades mid-transaction, and SQLite
+// refuses that upgrade with SQLITE_BUSY at once when another handle committed
+// since the read, without honouring the busy timeout.
+func TestWriteTransactionsAcrossHandlesWaitOutTheLock(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "keel.db")
+	handles := [2]*DB{openTestDB(t, Config{Path: path}), openTestDB(t, Config{Path: path})}
+	mustExec(t, handles[0].Writer(), "CREATE TABLE counter (id INTEGER PRIMARY KEY, n INTEGER NOT NULL)")
+	mustExec(t, handles[0].Writer(), "INSERT INTO counter (id, n) VALUES (1, 0)")
+
+	const workers = 8
+	const perWorker = 25
+	errs := make([]error, workers)
+	var wg sync.WaitGroup
+	for i := range workers {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			db := handles[i%2]
+			for j := range perWorker {
+				if err := bump(ctx, db); err != nil {
+					errs[i] = fmt.Errorf("worker %d bump %d: %w", i, j, err)
+					return
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	var n int
+	if err := handles[1].Reader().QueryRowContext(ctx, "SELECT n FROM counter WHERE id = 1").Scan(&n); err != nil {
+		t.Fatalf("read counter: %v", err)
+	}
+	if want := workers * perWorker; n != want {
+		t.Fatalf("counter = %d, want %d", n, want)
+	}
+}
+
+// bump reads the counter and writes it back one higher in one transaction,
+// the read-then-write shape a budget booking has.
+func bump(ctx context.Context, db *DB) error {
+	tx, err := db.Writer().BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }() // a committed transaction rolls back to a no-op
+	var n int
+	if err := tx.QueryRowContext(ctx, "SELECT n FROM counter WHERE id = 1").Scan(&n); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, "UPDATE counter SET n = ? WHERE id = 1", n+1); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
