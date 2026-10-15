@@ -236,3 +236,41 @@ func TestProposalSeqIsNeverReusedAndPages(t *testing.T) {
 		t.Fatalf("proposal seqs = %v", seqs)
 	}
 }
+
+// TestPruneKeepsProposalsAPinOrASurvivingRevisionStillNames pins that a
+// decided proposal goes only when its parent revision is gone and no
+// surviving revision was accepted from it.
+func TestPruneKeepsProposalsAPinOrASurvivingRevisionStillNames(t *testing.T) {
+	s := openStore(t)
+	ctx := t.Context()
+	create(t, s, "doc", "o")
+	onPinned, _ := s.Propose(ctx, "doc", 1, []byte(`{}`), "m")
+	if _, err := s.Reject(ctx, onPinned.ID, "ana"); err != nil {
+		t.Fatalf("reject: %v", err)
+	}
+	if _, err := s.Pin(ctx, "doc", 1, "take"); err != nil {
+		t.Fatalf("pin: %v", err)
+	}
+	grow(t, s, "doc", 3)
+	onDropped, _ := s.Propose(ctx, "doc", 2, []byte(`{}`), "m")
+	if _, err := s.Reject(ctx, onDropped.ID, "ana"); err != nil {
+		t.Fatalf("reject: %v", err)
+	}
+	accepted, _ := s.Propose(ctx, "doc", 3, []byte(`{}`), "m")
+	head, err := s.Accept(ctx, accepted.ID, "ana")
+	if err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	if _, err := s.Prune(ctx, "doc", 1); err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+	if _, err := s.Proposal(ctx, onPinned.ID); err != nil {
+		t.Errorf("proposal on the pinned revision went: %v", err)
+	}
+	if _, err := s.Proposal(ctx, head.Proposal); err != nil {
+		t.Errorf("the head names proposal %s, which went: %v", head.Proposal, err)
+	}
+	if _, err := s.Proposal(ctx, onDropped.ID); !errors.Is(err, revision.ErrUnknownProposal) {
+		t.Errorf("proposal on a dropped revision = %v, want it pruned", err)
+	}
+}

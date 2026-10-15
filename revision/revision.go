@@ -278,7 +278,8 @@ type Store interface {
 	Pins(ctx context.Context, doc string) ([]Pin, error)
 	// Prune drops revisions older than the newest keep, sparing every
 	// pinned revision and the head, and reports how many it dropped.
-	// Decided proposals made on a dropped revision go with it.
+	// Decided proposals whose parent was dropped go with it, unless the
+	// revision an accept made from one survives.
 	Prune(ctx context.Context, doc string, keep int) (int, error)
 	// Propose stores a proposal made on parent.
 	Propose(ctx context.Context, doc string, parent int64, body []byte, author string) (Proposal, error)

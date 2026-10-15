@@ -514,8 +514,10 @@ func (s *Store) Pins(ctx context.Context, doc string) ([]revision.Pin, error) {
 // Prune drops every revision older than the newest keep, and reports how
 // many it dropped. A pinned revision and the head are never dropped,
 // whatever keep says. A keep below one reports revision.ErrInvalid. The
-// count covers revisions only. Accepted and rejected proposals made on a
-// dropped revision go too, so neither table grows without bound. Open
+// count covers revisions only. Accepted and rejected proposals whose parent
+// revision was dropped go too, unless the revision an accept made still
+// exists, so neither table grows without bound and no surviving revision
+// names a missing proposal. Open
 // proposals stay open, and an accept still answers with the conflict rule.
 func (s *Store) Prune(ctx context.Context, doc string, keep int) (int, error) {
 	if err := checkDoc("prune", doc); err != nil {
@@ -544,12 +546,17 @@ func (s *Store) Prune(ctx context.Context, doc string, keep int) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("sqlitestore: prune %s: %w", doc, err)
 	}
-	// A decided proposal made on a pruned revision is history nobody can
-	// act on, so it goes with the revisions and the table stays bounded.
-	// An open proposal stays, because a person has not decided it yet.
+	// A decided proposal whose parent revision is gone is history nobody
+	// can act on, so it goes and the table stays bounded. The test is the
+	// parent row itself, so a proposal made on a pinned revision survives
+	// with it. A proposal an accept turned into a revision that still
+	// exists stays too, so Revision.Proposal never names a missing row. An
+	// open proposal stays, because a person has not decided it yet.
 	if _, err := tx.ExecContext(ctx,
-		`DELETE FROM revision_proposal WHERE document = ? AND parent <= ? AND state <> ?`,
-		doc, d.Head-int64(keep), string(revision.ProposalOpen)); err != nil {
+		`DELETE FROM revision_proposal WHERE document = ? AND state <> ?
+		AND NOT EXISTS (SELECT 1 FROM revision_entry e WHERE e.document = revision_proposal.document AND e.number = revision_proposal.parent)
+		AND NOT EXISTS (SELECT 1 FROM revision_entry e WHERE e.document = revision_proposal.document AND e.number = revision_proposal.accepted)`,
+		doc, string(revision.ProposalOpen)); err != nil {
 		return 0, fmt.Errorf("sqlitestore: prune %s: %w", doc, err)
 	}
 	if err := tx.Commit(); err != nil {
