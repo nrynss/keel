@@ -1,5 +1,7 @@
 // Package ffmpeg runs the ffmpeg and ffprobe binaries and reads what they
-// report about an audio file.
+// report about an audio file. RunTo and ProbeTo hand a command's standard
+// output to the caller, so a package above this one, such as probe, parses
+// the tools' own reports while the errors stay the ones this package maps.
 //
 // ffmpeg is a runtime binary rather than a Go dependency, so a Tools value
 // names the two executables. An empty field resolves the bare name on the
@@ -86,6 +88,23 @@ func Command(ctx context.Context, bin string, args ...string) *exec.Cmd {
 // cancelled context returns the context error.
 func Run(ctx context.Context, tools Tools, args ...string) error {
 	return run(ctx, tools.ffmpegPath(), args, nil)
+}
+
+// RunTo executes ffmpeg with args and writes its standard output to stdout,
+// for a command that prints what it measured, such as a filter told to
+// print to standard output. It reports errors exactly as Run does. A nil
+// stdout discards the output, as Run does.
+func RunTo(ctx context.Context, tools Tools, stdout io.Writer, args ...string) error {
+	return run(ctx, tools.ffmpegPath(), args, stdout)
+}
+
+// ProbeTo executes ffprobe with args and writes its standard output to
+// stdout, for a caller that reads ffprobe's own report, such as its JSON. A
+// missing binary returns ErrNotFound, a non-zero exit returns ErrFailed, and
+// a cancelled context returns the context error. A nil stdout discards the
+// output.
+func ProbeTo(ctx context.Context, tools Tools, stdout io.Writer, args ...string) error {
+	return run(ctx, tools.ffprobePath(), args, stdout)
 }
 
 // run executes bin with args. A non-nil stdout receives standard output. It
