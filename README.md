@@ -39,6 +39,7 @@ else is pure Go, and `CGO_ENABLED=0` builds the whole module.
 | `photo` | Normalises an uploaded photo: EXIF orientation applied to the pixels, metadata stripped, resized under side and pixel caps, re-encoded under a byte cap |
 | `sqlite` | One SQLite file with WAL and synchronous FULL, so an acknowledged write survives a power cut once the file's creation window has passed, plus a writer handle, a read-only reader pool, namespaced migrations and online backup |
 | `ffmpeg` | ffmpeg and ffprobe bound to a context, with a bounded wait on shutdown |
+| `probe` | A media file's streams read in one typed call, with rotation and variable frame rate stated explicitly, scene cuts at a set threshold, stills at chosen times, and the audio extracted to a deterministic WAV |
 | `duration` | WAV and MP3 length read from the bytes themselves, for a runtime that ships ffmpeg without ffprobe |
 | `cost` | Prices in the minor units of one denomination, USD nanodollars by default or a provider's credit, a ledger of charges that name their unit, budgets that refuse before a call, keyed budgets that divide one pool by owner, grants that lapse, and a meter that drives an in-memory or a durable budget and records each settle in an app-chosen charge sink |
 | `cache` | Content-addressed reuse of paid generations, keyed on a canonical hash of the request, with one make per key across concurrent callers, age expiry, and optional caching of permanent refusals |
@@ -49,6 +50,7 @@ else is pure Go, and `CGO_ENABLED=0` builds the whole module.
 | `book` | An illustrated PDF of image pages and captions, with the font, margins and page size injected |
 | `erase` | A delete that finishes, fanned out over consumer targets with per-target progress, restart-safe resume, and a stuck report that names what is owed |
 | `edl` | A cut list rendered into one audio file, with merged ranges, crossfades or cuts at the joins, and two-pass loudness normalisation |
+| `fit` | A take stretched or squeezed into a time slot without changing pitch, within bounded ratios, padded with silence at the end when it runs short, and refused with the ratio it would need when it runs long |
 | `mix` | Clips placed on named tracks at offsets with gain and fades, an optional looping bed that ducks under keyed tracks, optional two-pass loudness, a pure filter graph builder, byte-identical renders on the pinned ffmpeg, and a mux under a video's copied picture |
 | `bed` | A looping music bed mixed under a finished video, with gain and an end fade anchored to a known duration |
 | `waveform` | A still plus audio rendered to one video, with the waveform drawn over the scaled and padded still |
@@ -600,6 +602,28 @@ code it checked. The deletion runs as one `job` that fans the erasure out over t
 app registers and removes the user row last, so a restart resumes what is left. Every answer
 travels the `wire` envelope with stable codes, so screens branch on codes and never on wording.
 
+### Read what a clip holds before you plan an edit
+
+```go
+media, err := probe.Probe(ctx, tools, "clip.mp4")
+video, _ := media.Video()
+w, h := video.DisplaySize()                          // the frame a player shows
+cuts, err := probe.Scenes(ctx, tools, "clip.mp4", 0) // 0 is DefaultSceneThreshold, 0.4
+stills, err := probe.Frames(ctx, tools, "clip.mp4", cuts, probe.Size{Width: 320}, dir)
+format, err := probe.ExtractAudio(ctx, tools, "clip.mp4", "speech.wav", probe.Format{SampleRate: 16000, Channels: 1})
+```
+
+`probe` reads every stream of a file in one call: codec, duration, bit rate, sample rate and
+channel layout for audio, and width, height, frame rate and rotation for video. Rotation is the
+clockwise turn a player applies, so `DisplaySize` swaps the sides for a quarter turn. A clip whose
+frame gaps differ is marked `VariableFrameRate`, and its `FrameRate` is then the mean over the
+whole stream, so nothing silently assumes a constant rate. `Media.Duration` and the first audio
+stream agree with `ffmpeg.Duration` and `ffmpeg.AudioFormat`. `Scenes` returns the cut times, at
+millisecond precision, where the scene score passes the threshold. `Frames` writes one PNG per
+time, and `ExtractAudio` writes the first audio stream as 16-bit PCM WAV with the encoder's
+bitexact flags, so the same input gives the same bytes on ffmpeg 9.0.1. Pin that version, as the
+Install section says.
+
 ### Render a cut list into one audio file
 
 ```go
@@ -614,6 +638,25 @@ Loudness normalises in two passes: the first measures through the loudnorm filte
 applies the numbers the tool itself wrote; `mix` shares this code. Pin ffmpeg 9.0.1 for this package, as the Install
 section says: the duration and loudness pins assert exactly on that version. Every invocation
 carries the caller's context, so a cancelled render stops the child.
+
+### Fit a take into a time slot
+
+```go
+res, err := fit.Fit(ctx, tools, "line-12.wav", "line-12-fitted.wav", slot, fit.Bounds{})
+var tooLong *fit.RatioError
+if errors.As(err, &tooLong) {
+	// tooLong.Ratio is what the take would need. Resynthesize, or widen the bounds.
+}
+```
+
+`fit` changes a take's tempo without changing its pitch, so it fills a dubbing or voiceover slot.
+The ratio is the take's length over the slot's length. `Bounds` defaults to 0.8 for the slowest
+ratio and 1.25 for the fastest. A take that would need a ratio above the fastest is refused with
+a `*RatioError` and nothing is written; the library never trims speech. A take shorter than the
+slot is slowed as far as the slowest bound allows, and the rest is padded with silence at the
+end. The output then holds exactly the slot's sample count at the source rate. `AtempoChain` is
+the pure function that splits a large ratio into atempo stages of 0.5 to 2. `Result.Duration` is
+measured from the written file. Pin ffmpeg 9.0.1, as the Install section says.
 
 ### Place clips on a timeline and render one mix
 

@@ -381,3 +381,55 @@ func TestDurationHonoursDeadline(t *testing.T) {
 	}
 	assertPeerGone(t, conn)
 }
+
+// TestRunToHandsOverStandardOutput checks that RunTo and ProbeTo deliver
+// what each tool prints, that a nil writer discards it, and that a failure
+// still maps to ErrFailed with the output kept apart from the error.
+func TestRunToHandsOverStandardOutput(t *testing.T) {
+	requireFFmpeg(t)
+	t.Run("ffmpeg", func(t *testing.T) {
+		var out strings.Builder
+		err := RunTo(t.Context(), Tools{}, &out, "-hide_banner", "-f", "lavfi",
+			"-i", "anullsrc=r=8000:cl=mono", "-t", "0.01", "-f", "s16le", "-")
+		if err != nil {
+			t.Fatalf("RunTo failed: %v", err)
+		}
+		if out.Len() != 160 {
+			t.Errorf("RunTo wrote %d bytes, want 160 (80 samples of 2 bytes)", out.Len())
+		}
+	})
+	t.Run("ffprobe", func(t *testing.T) {
+		var out strings.Builder
+		err := ProbeTo(t.Context(), Tools{}, &out, "-v", "error",
+			"-show_entries", "stream=sample_rate", "-of", "csv=p=0", fixturePath(t, "tone-48k.wav"))
+		if err != nil {
+			t.Fatalf("ProbeTo failed: %v", err)
+		}
+		if got := strings.TrimSpace(out.String()); got != "48000" {
+			t.Errorf("ProbeTo wrote %q, want 48000", got)
+		}
+	})
+	t.Run("nil writer", func(t *testing.T) {
+		if err := ProbeTo(t.Context(), Tools{}, nil, "-v", "error", fixturePath(t, "tone-48k.wav")); err != nil {
+			t.Fatalf("ProbeTo with a nil writer failed: %v", err)
+		}
+	})
+	t.Run("failure", func(t *testing.T) {
+		var out strings.Builder
+		if err := RunTo(t.Context(), Tools{}, &out, "-invalid_option_unknown_flag"); !errors.Is(err, ErrFailed) {
+			t.Fatalf("RunTo error = %v, want ErrFailed", err)
+		}
+		if err := ProbeTo(t.Context(), Tools{}, &out, fixturePath(t, "random-20m.bin")); !errors.Is(err, ErrFailed) {
+			t.Fatalf("ProbeTo error = %v, want ErrFailed", err)
+		}
+	})
+	t.Run("missing binary", func(t *testing.T) {
+		missing := filepath.Join(t.TempDir(), "no-such-binary")
+		if err := RunTo(t.Context(), Tools{FFmpeg: missing}, nil, "-version"); !errors.Is(err, ErrNotFound) {
+			t.Errorf("RunTo error = %v, want ErrNotFound", err)
+		}
+		if err := ProbeTo(t.Context(), Tools{FFprobe: missing}, nil, "-version"); !errors.Is(err, ErrNotFound) {
+			t.Errorf("ProbeTo error = %v, want ErrNotFound", err)
+		}
+	})
+}
