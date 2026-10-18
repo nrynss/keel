@@ -21,8 +21,13 @@ import (
 // Every Hold the account hands out carries the reservation's ID, amount and
 // expiry, exactly the fields Reserve returns in a Reservation. The account
 // reserves, settles and releases through Reserve, Settle, SettleOnce and
-// Release, so it meets every rule those methods document.
+// Release, so it meets every rule those methods document. A nil store
+// returns a nil account, so cost.NewContextMeter refuses it with
+// cost.ErrNilAccount rather than failing at the first call.
 func (s *Store) Account() cost.ContextAccount {
+	if s == nil {
+		return nil
+	}
 	return storeAccount{store: s}
 }
 

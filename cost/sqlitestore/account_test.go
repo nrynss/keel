@@ -358,3 +358,13 @@ func TestStoreAccountHoldMatchesTheReservation(t *testing.T) {
 		t.Errorf("reserved after release = %d, want 0", got)
 	}
 }
+
+// TestNilStoreAccountIsRefused pins that a nil store hands out a nil
+// account, so the meter constructor refuses it instead of a later call
+// failing on it.
+func TestNilStoreAccountIsRefused(t *testing.T) {
+	var store *sqlitestore.Store
+	if _, err := cost.NewContextMeter(store.Account(), cost.NewLedger()); !errors.Is(err, cost.ErrNilAccount) {
+		t.Errorf("NewContextMeter(nil store's account) error = %v, want ErrNilAccount", err)
+	}
+}

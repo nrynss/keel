@@ -240,6 +240,17 @@ owner under a global ceiling, so one owner cannot spend another owner's headroom
 granted pool by owner exactly as it divides dollars. Each owner reserves and settles through its own account from `Owner`.
 A `cost.Meter` runs one paid call against an account: it reserves the estimate, runs the work,
 and settles the measured price. It frees the reservation on every failure up to the settle.
+A call that reports no usage settles at its estimate and says so in the returned `Usage`. The
+settle lands in a `cost.ChargeSink`. The in-memory `cost.Ledger` is one sink, and the
+`cost/sqlitestore` store is another. An application with its own spend store writes the
+one-method sink itself. A charge the sink cannot record is the one failure past the settle.
+`Meter.Call` reports it as `cost.ErrUnrecordedCharge`, with a zero `Usage`, so a figure no
+store backs is never shown as booked. A call that must settle once per reference passes
+`cost.Once` to `Meter.Call`. The account then books at most once per kind and reference pair,
+and the sink sees only the charge that booked. A resume or a retry of the same work leaves the
+books exactly as the first run wrote them. A reference that legitimately carries several charges
+calls `Call` without it.
+
 The account is a `cost.ContextAccount`, which takes the call's context and hands back a
 `cost.Hold`, and `cost.NewContextMeter` builds the meter over it. The durable store backs a
 meter that way, with no hand-written reserve, settle and release:
@@ -255,16 +266,7 @@ so a caller that cancels after the work ran still gets its booking and a cancell
 frees its hold at once. An in-memory budget offers the same shape through `Budget.Account` and
 `KeyedBudget.OwnerAccount`. The older `cost.Account` interface takes no context and returns no
 handle, so no durable budget can implement it. It is deprecated and still works with `NewMeter`.
-A call that reports no usage settles at its estimate and says so in the returned `Usage`. The
-settle lands in a `cost.ChargeSink`. The in-memory `cost.Ledger` is one sink, and the
-`cost/sqlitestore` store is another. An application with its own spend store writes the
-one-method sink itself. A charge the sink cannot record is the one failure past the settle.
-`Meter.Call` reports it as `cost.ErrUnrecordedCharge`, with a zero `Usage`, so a figure no
-store backs is never shown as booked. A call that must settle once per reference passes
-`cost.Once` to `Meter.Call`. The account then books at most once per kind and reference pair,
-and the sink sees only the charge that booked. A resume or a retry of the same work leaves the
-books exactly as the first run wrote them. A reference that legitimately carries several charges
-calls `Call` without it.
+
 `KeyedBudget.ForgetOwner`
 removes an owner's budget, reservations and settle history after its live reservations finish.
 

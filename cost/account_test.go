@@ -3,6 +3,7 @@ package cost
 import (
 	"context"
 	"errors"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -65,7 +66,7 @@ func (a *recordingAccount) Reserve(ctx context.Context, estimate Price) (Hold, e
 	}
 	a.mu.Lock()
 	a.next++
-	h := Hold{ID: "hold-" + string(rune('0'+a.next)), Amount: estimate, ExpiresAt: time.Unix(1_700_000_000, 0)}
+	h := Hold{ID: "hold-" + strconv.Itoa(a.next), Amount: estimate, ExpiresAt: time.Unix(1_700_000_000, 0)}
 	a.mu.Unlock()
 	a.record(ctx, accountStep{op: "reserve", hold: h})
 	return h, nil
@@ -421,6 +422,9 @@ func TestNewContextMeterRefusesNilParts(t *testing.T) {
 	}
 	if _, err := NewContextMeter(&recordingAccount{}, (*Ledger)(nil)); !errors.Is(err, ErrNilSink) {
 		t.Errorf("NewContextMeter(account, typed nil) error = %v, want ErrNilSink", err)
+	}
+	if _, err := NewContextMeter((*Budget)(nil).Account(), NewLedger()); !errors.Is(err, ErrNilAccount) {
+		t.Errorf("NewContextMeter(nil budget's account, sink) error = %v, want ErrNilAccount", err)
 	}
 }
 

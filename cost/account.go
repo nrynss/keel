@@ -6,12 +6,13 @@ import (
 )
 
 // Hold is one outstanding reservation a ContextAccount handed out. Reserve
-// returns it, and the caller passes the same value back to exactly one of
-// Settle, SettleOnce or Release. The account alone gives ID its meaning, so
-// a caller never builds a Hold of its own and never edits one it was given.
-// The fields are exported so a durable account can carry its row identity
-// and expiry through the value, and so a test can read what a reserve
-// committed.
+// returns it, and the caller passes the same value back to Settle,
+// SettleOnce or Release until one of them frees it. A settle that fails
+// frees nothing, so the hold then goes back through Release. The account
+// alone gives ID its meaning, so a caller never builds a Hold of its own and
+// never edits one it was given. The fields are exported so a durable account
+// can carry its row identity and expiry through the value, and so a test can
+// read what a reserve committed.
 type Hold struct {
 	// ID identifies the hold within its account. An account that needs no
 	// identity, such as the in-memory Budget, leaves it empty.
@@ -50,14 +51,17 @@ type ContextAccount interface {
 	// It fails when the estimate would pass the account's ceiling, and a
 	// failed reserve holds nothing.
 	Reserve(ctx context.Context, estimate Price) (Hold, error)
-	// Settle books the price the call actually cost and frees the hold.
+	// Settle books the price the call actually cost and frees the hold. A
+	// settle that fails books nothing and leaves the hold standing, so the
+	// caller can still release it.
 	Settle(ctx context.Context, h Hold, actual Price) error
 	// SettleOnce books the price the call actually cost at most once per
 	// kind and reference pair, and frees the hold. A pair that settled
 	// before books nothing, frees the hold, and reports booked false. A
 	// settle without a reference reports an error matching
-	// ErrEmptyReference and frees nothing, because an empty reference
-	// would collapse a kind's once settles onto one pair.
+	// ErrEmptyReference, because an empty reference would collapse a
+	// kind's once settles onto one pair. That refusal and every other
+	// failure book nothing and leave the hold standing, as Settle does.
 	SettleOnce(ctx context.Context, h Hold, actual Price, kind, ref string) (booked bool, err error)
 	// Release frees a hold the call never spent. An error means the hold
 	// may still stand until the account's own expiry frees it. A durable
@@ -73,8 +77,13 @@ type ContextAccount interface {
 // budget, so its holds and its bookings show in Spent, Reserved and
 // Remaining exactly as those made through the budget's own methods do. The
 // context is not consulted, because an in-memory booking does no I/O, and
-// every Hold the account returns carries an empty ID and the zero expiry.
+// every Hold the account returns carries an empty ID and the zero expiry. A
+// nil budget returns a nil account, so NewContextMeter refuses it with
+// ErrNilAccount rather than failing at the first call.
 func (b *Budget) Account() ContextAccount {
+	if b == nil {
+		return nil
+	}
 	return memoryAccount{account: b}
 }
 
