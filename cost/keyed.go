@@ -206,7 +206,8 @@ func (k *KeyedBudget) Remaining(owner string) (Price, error) {
 	return o.Remaining()
 }
 
-// Owner returns one owner's account, shaped for NewMeter. It reports
+// Owner returns one owner's account, shaped for NewMeter. OwnerAccount
+// returns the same owner's account in the ContextAccount shape. It reports
 // ErrUnknownOwner when no ceiling was set for owner, so a mistyped owner
 // stops before a call runs. The account reserves and settles against the
 // owner's ceiling and against the global one, exactly as this budget's own

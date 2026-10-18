@@ -190,3 +190,40 @@ func ExampleMeter() {
 	// $0.10 false
 	// $0.22
 }
+
+// ExampleNewContextMeter drives a budget through the context shape a
+// durable budget also speaks, so the same code runs over an in-memory
+// budget in a test and a cost/sqlitestore Store in production.
+func ExampleNewContextMeter() {
+	budget, err := cost.NewBudget(cost.USD(1.00))
+	if err != nil {
+		fmt.Println("budget failed:", err)
+		return
+	}
+	ledger := cost.NewLedger()
+	meter, err := cost.NewContextMeter(budget.Account(), ledger)
+	if err != nil {
+		fmt.Println("meter failed:", err)
+		return
+	}
+
+	usage, err := meter.Call(context.Background(), cost.USD(0.10), "tts", "job-1",
+		func(context.Context) (cost.Usage, error) {
+			return cost.Usage{Price: cost.USD(0.08), Measured: true}, nil
+		})
+	if err != nil {
+		fmt.Println("call failed:", err)
+		return
+	}
+	remaining, err := budget.Remaining()
+	if err != nil {
+		fmt.Println("remaining failed:", err)
+		return
+	}
+
+	fmt.Println(usage.Price, budget.Reserved())
+	fmt.Println(remaining)
+	// Output:
+	// $0.08 $0.00
+	// $0.92
+}
