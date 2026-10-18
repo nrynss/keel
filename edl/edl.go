@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/nrynss/keel/ffmpeg"
+	"github.com/nrynss/keel/internal/loudness"
 )
 
 // ErrNoSegments reports an empty cut list. A render needs at least one kept
@@ -100,7 +101,7 @@ func Render(ctx context.Context, tools ffmpeg.Tools, src string, cfg Config, dst
 	if dst == "" {
 		return ErrNoDestination
 	}
-	if cfg.Target != 0 && (cfg.Target < -70 || cfg.Target > -5) {
+	if !loudness.ValidTarget(cfg.Target) {
 		return ErrInvalidTarget
 	}
 

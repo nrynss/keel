@@ -49,6 +49,7 @@ else is pure Go, and `CGO_ENABLED=0` builds the whole module.
 | `book` | An illustrated PDF of image pages and captions, with the font, margins and page size injected |
 | `erase` | A delete that finishes, fanned out over consumer targets with per-target progress, restart-safe resume, and a stuck report that names what is owed |
 | `edl` | A cut list rendered into one audio file, with merged ranges, crossfades or cuts at the joins, and two-pass loudness normalisation |
+| `mix` | Clips placed on named tracks at offsets with gain and fades, an optional looping bed that ducks under keyed tracks, optional two-pass loudness, a pure filter graph builder, byte-identical renders on the pinned ffmpeg, and a mux under a video's copied picture |
 | `bed` | A looping music bed mixed under a finished video, with gain and an end fade anchored to a known duration |
 | `waveform` | A still plus audio rendered to one video, with the waveform drawn over the scaled and padded still |
 | `lease` | Paid sessions with a time cap, a quota, a caller supplied kill switch, settle at close, provider reconciliation, and reclaim of abandoned rows |
@@ -610,9 +611,35 @@ err := edl.Render(ctx, tools, src, edl.Config{Crossfade: 2 * time.Second}, dst,
 that touch or overlap merge first, so no zero length range reaches the filter graph. A join
 carries the configured crossfade when both neighbours are long enough, and a hard cut otherwise.
 Loudness normalises in two passes: the first measures through the loudnorm filter, and the second
-applies the numbers the tool itself wrote. Pin ffmpeg 9.0.1 for this package, as the Install
+applies the numbers the tool itself wrote; `mix` shares this code. Pin ffmpeg 9.0.1 for this package, as the Install
 section says: the duration and loudness pins assert exactly on that version. Every invocation
 carries the caller's context, so a cancelled render stops the child.
+
+### Place clips on a timeline and render one mix
+
+```go
+tl := mix.Timeline{
+	Tracks: []mix.Track{
+		{Name: "dialogue", Clips: []mix.Clip{{Source: "line-12.wav", Length: 2 * time.Second, Offset: 3 * time.Second, FadeOut: 50 * time.Millisecond}}},
+		{Name: "fx", Clips: []mix.Clip{{Source: "door.wav", In: 200 * time.Millisecond, Length: time.Second, Offset: time.Second, Gain: -6}}},
+	},
+	Bed: &mix.Bed{Source: "score.mp3", Gain: -12, DuckOn: []string{"dialogue"}},
+}
+err := mix.Render(ctx, tools, mix.Config{Normalize: true, Target: -16}, tl, "mix.wav")
+err = mix.Mux(ctx, tools, "picture.mp4", "mix.wav", "final.mp4")
+```
+
+`mix` lays clips over each other at offsets, where `edl` joins ranges of one source end to end.
+Each clip takes a range of its source, a constant gain in decibels, and fades at either end. Clips
+sum into their track and the tracks sum into the mix without normalisation. A bed loops under the
+whole timeline and ducks through a sidechain compressor keyed on the named tracks. The duck
+defaults are -30 dBFS, ratio 8, 20 ms attack and 400 ms release. `Normalize` runs the same two
+loudness passes as `edl`, from shared code. `Build` returns the filter graph as a pure function of
+the sorted, validated timeline, and every time in it is counted in samples. The same timeline
+renders byte-identical audio on ffmpeg 9.0.1. That promise is for that pinned version only,
+since another build may resample or encode differently. `Mux` puts the mix under a video with a
+stream copy of the picture. `bed` stays the simple helper for one music file under a finished
+video.
 
 ### Mix a music bed under a finished video
 
