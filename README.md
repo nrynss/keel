@@ -39,6 +39,7 @@ else is pure Go, and `CGO_ENABLED=0` builds the whole module.
 | `photo` | Normalises an uploaded photo: EXIF orientation applied to the pixels, metadata stripped, resized under side and pixel caps, re-encoded under a byte cap |
 | `sqlite` | One SQLite file with WAL and synchronous FULL, so an acknowledged write survives a power cut once the file's creation window has passed, plus a writer handle, a read-only reader pool, namespaced migrations and online backup |
 | `ffmpeg` | ffmpeg and ffprobe bound to a context, with a bounded wait on shutdown |
+| `probe` | A media file's streams read in one typed call, with rotation and variable frame rate stated explicitly, scene cuts at a set threshold, stills at chosen times, and the audio extracted to a deterministic WAV |
 | `duration` | WAV and MP3 length read from the bytes themselves, for a runtime that ships ffmpeg without ffprobe |
 | `cost` | Prices in the minor units of one denomination, USD nanodollars by default or a provider's credit, a ledger of charges that name their unit, budgets that refuse before a call, keyed budgets that divide one pool by owner, grants that lapse, and a meter that records each settle in an app-chosen charge sink |
 | `cache` | Content-addressed reuse of paid generations, keyed on a canonical hash of the request, with one make per key across concurrent callers, age expiry, and optional caching of permanent refusals |
@@ -581,6 +582,28 @@ Deleting an account needs a code typed while it is still live, and the verificat
 code it checked. The deletion runs as one `job` that fans the erasure out over the targets the
 app registers and removes the user row last, so a restart resumes what is left. Every answer
 travels the `wire` envelope with stable codes, so screens branch on codes and never on wording.
+
+### Read what a clip holds before you plan an edit
+
+```go
+media, err := probe.Probe(ctx, tools, "clip.mp4")
+video, _ := media.Video()
+w, h := video.DisplaySize()                          // the frame a player shows
+cuts, err := probe.Scenes(ctx, tools, "clip.mp4", 0) // 0 is DefaultSceneThreshold, 0.4
+stills, err := probe.Frames(ctx, tools, "clip.mp4", cuts, probe.Size{Width: 320}, dir)
+format, err := probe.ExtractAudio(ctx, tools, "clip.mp4", "speech.wav", probe.Format{SampleRate: 16000, Channels: 1})
+```
+
+`probe` reads every stream of a file in one call: codec, duration, bit rate, sample rate and
+channel layout for audio, and width, height, frame rate and rotation for video. Rotation is the
+clockwise turn a player applies, so `DisplaySize` swaps the sides for a quarter turn. A clip whose
+frame gaps differ is marked `VariableFrameRate`, and its `FrameRate` is then the mean over the
+whole stream, so nothing silently assumes a constant rate. `Media.Duration` and the first audio
+stream agree with `ffmpeg.Duration` and `ffmpeg.AudioFormat`. `Scenes` returns the cut times, at
+millisecond precision, where the scene score passes the threshold. `Frames` writes one PNG per
+time, and `ExtractAudio` writes the first audio stream as 16-bit PCM WAV with the encoder's
+bitexact flags, so the same input gives the same bytes on ffmpeg 9.0.1. Pin that version, as the
+Install section says.
 
 ### Render a cut list into one audio file
 
