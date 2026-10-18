@@ -49,6 +49,7 @@ else is pure Go, and `CGO_ENABLED=0` builds the whole module.
 | `book` | An illustrated PDF of image pages and captions, with the font, margins and page size injected |
 | `erase` | A delete that finishes, fanned out over consumer targets with per-target progress, restart-safe resume, and a stuck report that names what is owed |
 | `edl` | A cut list rendered into one audio file, with merged ranges, crossfades or cuts at the joins, and two-pass loudness normalisation |
+| `fit` | A take stretched or squeezed into a time slot without changing pitch, within bounded ratios, padded with silence at the end when it runs short, and refused with the ratio it would need when it runs long |
 | `bed` | A looping music bed mixed under a finished video, with gain and an end fade anchored to a known duration |
 | `waveform` | A still plus audio rendered to one video, with the waveform drawn over the scaled and padded still |
 | `lease` | Paid sessions with a time cap, a quota, a caller supplied kill switch, settle at close, provider reconciliation, and reclaim of abandoned rows |
@@ -596,6 +597,25 @@ Loudness normalises in two passes: the first measures through the loudnorm filte
 applies the numbers the tool itself wrote. Pin ffmpeg 9.0.1 for this package, as the Install
 section says: the duration and loudness pins assert exactly on that version. Every invocation
 carries the caller's context, so a cancelled render stops the child.
+
+### Fit a take into a time slot
+
+```go
+res, err := fit.Fit(ctx, tools, "line-12.wav", "line-12-fitted.wav", slot, fit.Bounds{})
+var tooLong *fit.RatioError
+if errors.As(err, &tooLong) {
+	// tooLong.Ratio is what the take would need. Resynthesize, or widen the bounds.
+}
+```
+
+`fit` changes a take's tempo without changing its pitch, so it fills a dubbing or voiceover slot.
+The ratio is the take's length over the slot's length. `Bounds` defaults to 0.8 for the slowest
+ratio and 1.25 for the fastest. A take that would need a ratio above the fastest is refused with
+a `*RatioError` and nothing is written; the library never trims speech. A take shorter than the
+slot is slowed as far as the slowest bound allows, and the rest is padded with silence at the
+end. The output then holds exactly the slot's sample count at the source rate. `AtempoChain` is
+the pure function that splits a large ratio into atempo stages of 0.5 to 2. `Result.Duration` is
+measured from the written file. Pin ffmpeg 9.0.1, as the Install section says.
 
 ### Mix a music bed under a finished video
 
