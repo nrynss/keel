@@ -40,7 +40,7 @@ else is pure Go, and `CGO_ENABLED=0` builds the whole module.
 | `sqlite` | One SQLite file with WAL and synchronous FULL, so an acknowledged write survives a power cut once the file's creation window has passed, plus a writer handle, a read-only reader pool, namespaced migrations and online backup |
 | `ffmpeg` | ffmpeg and ffprobe bound to a context, with a bounded wait on shutdown |
 | `duration` | WAV and MP3 length read from the bytes themselves, for a runtime that ships ffmpeg without ffprobe |
-| `cost` | Prices in the minor units of one denomination, USD nanodollars by default or a provider's credit, a ledger of charges that name their unit, budgets that refuse before a call, keyed budgets that divide one pool by owner, grants that lapse, and a meter that records each settle in an app-chosen charge sink |
+| `cost` | Prices in the minor units of one denomination, USD nanodollars by default or a provider's credit, a ledger of charges that name their unit, budgets that refuse before a call, keyed budgets that divide one pool by owner, grants that lapse, and a meter that drives an in-memory or a durable budget and records each settle in an app-chosen charge sink |
 | `cache` | Content-addressed reuse of paid generations, keyed on a canonical hash of the request, with one make per key across concurrent callers, age expiry, and optional caching of permanent refusals |
 | `throttle` | Retry of a paid call that failed for a reason a wait can clear, with full-jitter backoff, provider retry-after hints, separate attempt budgets, pacing of call starts under a per-minute cap shared by name, and an optional cap on how many calls run at once |
 | `flag` | Runtime flags an operator flips without a restart, read through to the store with a declared default for a missing row |
@@ -240,6 +240,21 @@ owner under a global ceiling, so one owner cannot spend another owner's headroom
 granted pool by owner exactly as it divides dollars. Each owner reserves and settles through its own account from `Owner`.
 A `cost.Meter` runs one paid call against an account: it reserves the estimate, runs the work,
 and settles the measured price. It frees the reservation on every failure up to the settle.
+The account is a `cost.ContextAccount`, which takes the call's context and hands back a
+`cost.Hold`, and `cost.NewContextMeter` builds the meter over it. The durable store backs a
+meter that way, with no hand-written reserve, settle and release:
+
+```go
+meter, err := cost.NewContextMeter(store.Account(), store)
+account, err := sqlitestore.NewKeyedBudget(store).Owner(ctx, "team-a")
+teamMeter, err := cost.NewContextMeter(account, store)
+```
+
+The settle, the release and the charge run on a context detached from the call's cancellation,
+so a caller that cancels after the work ran still gets its booking and a cancelled call still
+frees its hold at once. An in-memory budget offers the same shape through `Budget.Account` and
+`KeyedBudget.OwnerAccount`. The older `cost.Account` interface takes no context and returns no
+handle, so no durable budget can implement it. It is deprecated and still works with `NewMeter`.
 A call that reports no usage settles at its estimate and says so in the returned `Usage`. The
 settle lands in a `cost.ChargeSink`. The in-memory `cost.Ledger` is one sink, and the
 `cost/sqlitestore` store is another. An application with its own spend store writes the

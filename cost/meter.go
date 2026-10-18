@@ -21,10 +21,18 @@ var ErrNegativePrice = errors.New("cost: negative measured price")
 // account, so the condition is a missing record, not an unrun call.
 var ErrUnrecordedCharge = errors.New("cost: unrecorded charge")
 
-// Account is the budget side a meter drives. A Budget is an account on its
-// own, and a KeyedBudget hands out one account per owner through Owner. The
-// spending methods mean exactly what they mean on Budget, so both kinds of
-// budget drive a meter identically.
+// Account is the in-memory budget shape a meter drives. A Budget is an
+// account on its own, and a KeyedBudget hands out one account per owner
+// through Owner. The spending methods mean exactly what they mean on Budget,
+// so both kinds of budget drive a meter identically. NewMeter still accepts
+// every Account and drives it through the same settle rules a
+// ContextAccount meets.
+//
+// Deprecated: Account takes no context and returns no handle, so a durable
+// budget such as the cost/sqlitestore Store cannot implement it. Implement
+// ContextAccount instead and build the meter with NewContextMeter. A Budget
+// offers that shape through Budget.Account, and a KeyedBudget offers it per
+// owner through KeyedBudget.OwnerAccount.
 type Account interface {
 	// Denomination reports the unit the account's prices count. The meter
 	// stamps every charge it records with it, so a report never shows a
@@ -114,10 +122,12 @@ func Once() CallOption {
 // settle, and Call reports it as ErrUnrecordedCharge. A Call that passes
 // Once settles at most once per kind and reference pair, which is how a
 // resume of settled work books nothing again. Build one with
-// NewMeter. Call is safe for concurrent use, because every method it drives
-// is.
+// NewContextMeter over a ContextAccount, or with NewMeter over an in-memory
+// Account. Both constructors return the same Meter, so the settle rules are
+// written once. Call is safe for concurrent use, because every method it
+// drives is.
 type Meter struct {
-	account Account
+	account ContextAccount
 	sink    ChargeSink
 	denom   Denomination
 }
@@ -133,12 +143,28 @@ func isNilValue(v any) bool {
 	return r.Kind() == reflect.Pointer && r.IsNil()
 }
 
-// NewMeter returns a Meter that bounds every call by account and records
-// every settled charge in sink. It reports ErrNilAccount or ErrNilSink when
-// one of them is nil. Nil covers an interface holding a nil pointer as well
-// as a plain nil, because a meter that could not bound or record a call
-// would only pretend to.
+// NewMeter returns a Meter that bounds every call by an in-memory account
+// and records every settled charge in sink. It drives account through the
+// same path NewContextMeter builds, so the two meters settle, release and
+// record identically. It reports ErrNilAccount or ErrNilSink when one of
+// them is nil. Nil covers an interface holding a nil pointer as well as a
+// plain nil, because a meter that could not bound or record a call would
+// only pretend to.
 func NewMeter(account Account, sink ChargeSink) (*Meter, error) {
+	if isNilValue(account) {
+		return nil, ErrNilAccount
+	}
+	return NewContextMeter(memoryAccount{account: account}, sink)
+}
+
+// NewContextMeter returns a Meter that bounds every call by account and
+// records every settled charge in sink. The account takes the call's
+// context and hands back a Hold, so a durable budget such as the
+// cost/sqlitestore Store backs a meter as directly as an in-memory one. It
+// reports ErrNilAccount or ErrNilSink when one of them is nil. Nil covers an
+// interface holding a nil pointer as well as a plain nil, because a meter
+// that could not bound or record a call would only pretend to.
+func NewContextMeter(account ContextAccount, sink ChargeSink) (*Meter, error) {
 	if isNilValue(account) {
 		return nil, ErrNilAccount
 	}
@@ -170,7 +196,6 @@ func NewMeter(account Account, sink ChargeSink) (*Meter, error) {
 // final for that reference. Without Once, Call is unchanged, so a
 // reference that legitimately carries several charges keeps booking every
 // one.
-// legitimately carries several charges keeps booking every one.
 //
 // Every failure on the way to the settle frees the reservation, so a call
 // that books nothing leaves nothing held. A context that finishes mid-call
@@ -184,7 +209,16 @@ func NewMeter(account Account, sink ChargeSink) (*Meter, error) {
 // is booked, so the reservation stays consumed. Call reports
 // ErrUnrecordedCharge with the sink's error and the zero usage, because a
 // figure no record backs is not a result.
-func (m *Meter) Call(ctx context.Context, estimate Price, kind, ref string, work Work, opts ...CallOption) (Usage, error) {
+//
+// Only the reserve and the work see ctx as it is. The settle, the release
+// and the sink record run on a context detached from ctx's cancellation
+// and deadline, carrying its values, because by then the money is spent or
+// the hold must go back. A caller that cancels just after the work returns
+// therefore still gets its booking and its charge, and a cancelled call
+// still frees its hold on a durable account rather than leaving it to
+// expire. A release the account fails is joined to the error Call reports,
+// so a hold that may still stand until its expiry is never silent.
+func (m *Meter) Call(ctx context.Context, estimate Price, kind, ref string, work Work, opts ...CallOption) (usage Usage, err error) {
 	if err := ctx.Err(); err != nil {
 		return Usage{}, err
 	}
@@ -194,21 +228,31 @@ func (m *Meter) Call(ctx context.Context, estimate Price, kind, ref string, work
 			opt(&settings)
 		}
 	}
-	if err := m.account.Reserve(estimate); err != nil {
+	hold, err := m.account.Reserve(ctx, estimate)
+	if err != nil {
 		return Usage{}, err
 	}
+	// detached carries ctx's values without its cancellation, because every
+	// step past the work books money already spent or frees a hold that
+	// must go back.
+	detached := context.WithoutCancel(ctx)
 	// booked lifts the release off the one path that already settled, so
 	// the settle consuming the reservation is never followed by a second
 	// release that would eat another caller's hold. A panic in work skips
 	// the assignment below, so unwinding runs the release and the panic
-	// continues past it on its own.
+	// continues past it on its own. A release failure joins the error Call
+	// returns. On the panic path there is no error to join it to, and the
+	// hold's own expiry is what frees a durable hold the release missed.
 	booked := false
 	defer func() {
-		if !booked {
-			m.account.Release(estimate)
+		if booked {
+			return
+		}
+		if rerr := m.account.Release(detached, hold); rerr != nil && err != nil {
+			err = errors.Join(err, fmt.Errorf("cost: release hold: %w", rerr))
 		}
 	}()
-	usage, err := work(ctx)
+	usage, err = work(ctx)
 	if err != nil {
 		return Usage{}, err
 	}
@@ -224,9 +268,9 @@ func (m *Meter) Call(ctx context.Context, estimate Price, kind, ref string, work
 	// the flag below still lifts the deferred release off a consumed hold.
 	var settled bool
 	if settings.once {
-		settled, err = m.account.SettleOnce(estimate, price, kind, ref)
+		settled, err = m.account.SettleOnce(detached, hold, price, kind, ref)
 	} else {
-		err = m.account.Settle(estimate, price)
+		err = m.account.Settle(detached, hold, price)
 		settled = err == nil
 	}
 	if err != nil {
@@ -239,7 +283,7 @@ func (m *Meter) Call(ctx context.Context, estimate Price, kind, ref string, work
 		// fact, the same shape a joiner reports for work it did not settle.
 		return Usage{}, nil
 	}
-	if err := m.sink.Add(ctx, Charge{Kind: kind, Units: 1, UnitPrice: price, Ref: ref, Denomination: m.denom}); err != nil {
+	if err := m.sink.Add(detached, Charge{Kind: kind, Units: 1, UnitPrice: price, Ref: ref, Denomination: m.denom}); err != nil {
 		return Usage{}, fmt.Errorf("%w: %w", ErrUnrecordedCharge, err)
 	}
 	return Usage{Price: price, Measured: usage.Measured}, nil

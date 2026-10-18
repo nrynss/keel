@@ -6,7 +6,14 @@
 // a total that would mix denominations. A ChargeSink is where a settled
 // charge lands, and the Ledger is the in-memory one. A Budget bounds the
 // spend of a sequence of calls, and a KeyedBudget gives each of several
-// owners a share of one pool under a global ceiling. A budget settles a
+// owners a share of one pool under a global ceiling. A Meter runs one paid
+// call against a ContextAccount: it reserves, runs the work, settles what
+// the work measured, frees the hold on every failure, and records the
+// charge in its sink. A ContextAccount takes the call's context and hands
+// back a Hold, so a durable budget such as the cost/sqlitestore Store backs
+// a meter through NewContextMeter exactly as an in-memory Budget does. The
+// older Account shape, which takes no context and returns no handle, is
+// deprecated and still drives a meter through NewMeter. A budget settles a
 // call once per kind and reference pair through SettleOnce, and a Meter
 // call that passes Once stops a repeated reference from booking twice. A
 // Quote names the price of one action a person confirms, and a QuoteRefusal
