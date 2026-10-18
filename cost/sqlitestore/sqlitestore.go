@@ -98,7 +98,12 @@
 // ledger arithmetic itself stays in the cost package, and every total is
 // summed through a cost.Ledger so the overflow rule never drifts. The Store
 // satisfies cost.ChargeSink, so a cost.Meter can record its settled charges
-// straight into the durable ledger.
+// straight into the durable ledger. Store.Account and KeyedBudget.Owner hand
+// out the durable budget as a cost.ContextAccount, so cost.NewContextMeter
+// drives it too. The meter then owns the reserve, the settle, the release on
+// every failure and panic, the settle once per pair, and the booking that
+// still lands when the call's context is cancelled after the work ran, and
+// no application writes that sequence by hand.
 package sqlitestore
 
 import (

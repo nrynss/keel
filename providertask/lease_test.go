@@ -82,14 +82,14 @@ func (s *finishCaptureStore) finishErrs() []error {
 // hold a driver between the settle and the booking while the world moves
 // around it. Later settles pass straight through.
 type gatedAccount struct {
-	cost.Account
+	cost.ContextAccount
 	entered chan struct{}
 	gate    chan struct{}
 	armed   atomic.Bool
 }
 
-func newGatedAccount(a cost.Account) *gatedAccount {
-	g := &gatedAccount{Account: a, entered: make(chan struct{}), gate: make(chan struct{})}
+func newGatedAccount(a cost.ContextAccount) *gatedAccount {
+	g := &gatedAccount{ContextAccount: a, entered: make(chan struct{}), gate: make(chan struct{})}
 	g.armed.Store(true)
 	return g
 }
@@ -108,12 +108,12 @@ func plantLeader(t *testing.T, store providertask.Store, key string, now time.Ti
 	}
 }
 
-func (a *gatedAccount) SettleOnce(reserved, actual cost.Price, kind, ref string) (bool, error) {
+func (a *gatedAccount) SettleOnce(ctx context.Context, h cost.Hold, actual cost.Price, kind, ref string) (bool, error) {
 	if a.armed.CompareAndSwap(true, false) {
 		close(a.entered)
 		<-a.gate
 	}
-	return a.Account.SettleOnce(reserved, actual, kind, ref)
+	return a.ContextAccount.SettleOnce(ctx, h, actual, kind, ref)
 }
 
 // waitTicks polls until the probe returns true, and fails the test at the
@@ -405,10 +405,10 @@ func TestStalledLeaderWithStaleTokenBooksNothing(t *testing.T) {
 	coordinatorA := providertask.NewCoordinator()
 	coordinatorB := providertask.NewCoordinator()
 	budget, ledger := meterOf(t, 1000)
-	gated := newGatedAccount(budget)
-	meter, err := cost.NewMeter(gated, ledger)
+	gated := newGatedAccount(budget.Account())
+	meter, err := cost.NewContextMeter(gated, ledger)
 	if err != nil {
-		t.Fatalf("NewMeter: %v", err)
+		t.Fatalf("NewContextMeter: %v", err)
 	}
 
 	p := newFakeProvider(rendered{Link: "fenced"},
